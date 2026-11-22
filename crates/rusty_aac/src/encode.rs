@@ -33,10 +33,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 // ---------------------------------------------------------------------------
 // Bit writer — MSB-first, the mirror of the decoder's `BitReader`.
 // ---------------------------------------------------------------------------
+///
+/// Bits gather in a 64-bit accumulator and leave it 32 at a time, so a write is
+/// a shift, an or and (every fourth byte) one 4-byte store, not a loop over its
+/// bits: the per-bit writer it replaced, with its bit-by-bit `append`, was 6% of
+/// encoding.
 pub struct BitWriter {
     buf: Vec<u8>,
-    cur: u8,
-    nbits: u8,
+    /// The pending bits, in the low `nbits` bits (higher bits are stale).
+    acc: u64,
+    /// Pending bit count, always below 32 between calls.
+    nbits: u32,
 }
 
 impl BitWriter {
@@ -44,34 +51,45 @@ impl BitWriter {
     pub fn new() -> Self {
         Self {
             buf: Vec::new(),
-            cur: 0,
+            acc: 0,
             nbits: 0,
         }
     }
 
-    /// Append the low `n` bits of `val`, most-significant bit first.
+    /// Append the low `n` bits of `val` (`n <= 32`), most-significant bit first.
+    #[inline]
     pub fn write(&mut self, val: u32, n: u32) {
-        for i in (0..n).rev() {
-            self.cur = (self.cur << 1) | ((val >> i) & 1) as u8;
-            self.nbits += 1;
-            if self.nbits == 8 {
-                self.buf.push(self.cur);
-                self.cur = 0;
-                self.nbits = 0;
-            }
+        debug_assert!(n <= 32, "BitWriter::write takes at most 32 bits");
+        let mask = (1u64 << n) - 1;
+        // `nbits < 32` and `n <= 32`, so the pending bits still fit in 64.
+        self.acc = (self.acc << n) | (u64::from(val) & mask);
+        self.nbits += n;
+        if self.nbits >= 32 {
+            self.nbits -= 32;
+            self.buf
+                .extend_from_slice(&((self.acc >> self.nbits) as u32).to_be_bytes());
         }
     }
 
+    #[inline]
     pub fn write_bool(&mut self, b: bool) {
         self.write(u32::from(b), 1);
     }
 
     /// Append everything `other` holds, bit for bit.
     pub fn append(&mut self, other: &Self) {
-        for &byte in &other.buf {
-            self.write(u32::from(byte), 8);
+        if self.nbits == 0 {
+            self.buf.extend_from_slice(&other.buf);
+        } else {
+            let mut words = other.buf.chunks_exact(4);
+            for w in &mut words {
+                self.write(u32::from_be_bytes([w[0], w[1], w[2], w[3]]), 32);
+            }
+            for &byte in words.remainder() {
+                self.write(u32::from(byte), 8);
+            }
         }
-        self.write(u32::from(other.cur), u32::from(other.nbits));
+        self.write(other.acc as u32, other.nbits);
     }
 
     /// Total bits written so far.
@@ -83,9 +101,13 @@ impl BitWriter {
     /// Pad to a byte boundary with zero bits and return the bytes.
     #[must_use]
     pub fn into_bytes(mut self) -> Vec<u8> {
-        if self.nbits != 0 {
-            self.cur <<= 8 - self.nbits;
-            self.buf.push(self.cur);
+        let mut n = self.nbits;
+        while n >= 8 {
+            n -= 8;
+            self.buf.push((self.acc >> n) as u8);
+        }
+        if n != 0 {
+            self.buf.push((self.acc << (8 - n)) as u8);
         }
         self.buf
     }
@@ -1378,11 +1400,221 @@ impl Xpow {
     }
 }
 
+/// Codeword lengths of every spectral codebook, packed so ONE walk over a band
+/// prices all eleven books at once (`codec-eliminate-redundancy` move #4).
+///
+/// The books come in pairs that share a tuple index (1/2, 3/4, 5/6, 7/8, 9/10:
+/// same `dim`, `lav` and signedness, different code lengths), and every
+/// unsigned dim-2 book (7..=11) can be indexed by the magnitudes clamped to 16.
+/// So per tuple one index and one or two table loads add every eligible book's
+/// codeword length into 16-bit lanes of an integer accumulator. A lane can hold
+/// any band: the longest codeword is 19 bits and a call sees at most 1024 tuples
+/// (19 456 < 65 536), so lanes never carry into each other.
+///
+/// A book whose `lav` cannot hold a tuple stores 0 in its lane there; such a book
+/// is never consulted, because a band is only priced with books whose `lav`
+/// covers the band's peak.
+struct CostTables {
+    /// Books 1 | 2 << 16 at the signed dim-4 index `27a + 9b + 3c + d + 40`.
+    s12: [u32; 81],
+    /// Books 3 | 4 << 16 at the unsigned dim-4 index `27|a| + 9|b| + 3|c| + |d|`.
+    u34: [u32; 81],
+    /// Books 5 | 6 << 16 at the signed dim-2 index `9a + b + 40`.
+    s56: [u32; 81],
+    /// Books 7 | 8 << 16 | 9 << 32 | 10 << 48 at `17 min(|a|,16) + min(|b|,16)`.
+    u7_10: [u64; 289],
+    /// Book 11 at the same index.
+    u11: [u32; 289],
+}
+
+fn cost_tables() -> &'static CostTables {
+    static T: OnceLock<CostTables> = OnceLock::new();
+    T.get_or_init(|| {
+        let len = |cb: u8, tuple: &[i32]| -> u64 {
+            tuple_index(&CODEBOOKS[cb as usize], tuple)
+                .map_or(0, |i| u64::from(spectral_book(cb).code(i as usize).1))
+        };
+        let mut t = CostTables {
+            s12: [0; 81],
+            u34: [0; 81],
+            s56: [0; 81],
+            u7_10: [0; 289],
+            u11: [0; 289],
+        };
+        for i in 0..81i32 {
+            let d = [i / 27, i / 9 % 3, i / 3 % 3, i % 3];
+            let signed = d.map(|x| x - 1);
+            t.s12[i as usize] = (len(1, &signed) | len(2, &signed) << 16) as u32;
+            t.u34[i as usize] = (len(3, &d) | len(4, &d) << 16) as u32;
+            let pair = [i / 9 - 4, i % 9 - 4];
+            t.s56[i as usize] = (len(5, &pair) | len(6, &pair) << 16) as u32;
+        }
+        for i in 0..289i32 {
+            let pair = [i / 17, i % 17];
+            t.u7_10[i as usize] =
+                len(7, &pair) | len(8, &pair) << 16 | len(9, &pair) << 32 | len(10, &pair) << 48;
+            t.u11[i as usize] = len(11, &pair) as u32;
+        }
+        t
+    })
+}
+
+/// Every book's bit cost over the tuples added so far ([`CostTables`] lanes,
+/// plus the sign bits every unsigned book pays and book 11's escapes), and the
+/// peak magnitude that decides which books may code the band.
+#[derive(Default)]
+struct BandCost {
+    a12: u32,
+    a34: u32,
+    a56: u32,
+    a7_10: u64,
+    a11: u32,
+    /// Non-zero coefficients: one sign bit each in every unsigned book.
+    nz: u32,
+    /// Book 11's escape sequences.
+    esc: u32,
+    /// The largest magnitude seen.
+    maxq: u32,
+}
+
+impl BandCost {
+    /// The dim-2 books over `q` (an even number of coefficients), and the peak.
+    ///
+    /// Books 5/6 are indexed by the values clamped to their `lav` so the index is
+    /// always in range; where a value exceeds 4 the lane is never read (the band's
+    /// peak then rules books 5/6 out), so the clamp changes no cost that is used.
+    #[inline(always)]
+    fn add2(&mut self, t: &CostTables, q: &[i32]) {
+        for p in q.chunks_exact(2) {
+            let (a, b) = (p[0].unsigned_abs(), p[1].unsigned_abs());
+            self.maxq = self.maxq.max(a).max(b);
+            self.a56 += t.s56[(9 * p[0].clamp(-4, 4) + p[1].clamp(-4, 4) + 40) as usize];
+            let i = (17 * a.min(16) + b.min(16)) as usize;
+            self.a7_10 += t.u7_10[i];
+            self.a11 += t.u11[i];
+            self.nz += u32::from(a != 0) + u32::from(b != 0);
+        }
+    }
+
+    /// The dim-4 books over `q` (a multiple of 4 coefficients), only valid once
+    /// the peak is known to be at most 2 (book 1/2 lanes only at most 1).
+    #[inline(always)]
+    fn add4(&mut self, t: &CostTables, q: &[i32]) {
+        let books12 = self.maxq <= 1;
+        for c in q.chunks_exact(4) {
+            if books12 {
+                let i = 27 * c[0] + 9 * c[1] + 3 * c[2] + c[3] + 40;
+                self.a12 += t.s12[i as usize];
+            }
+            let u = 27 * c[0].unsigned_abs()
+                + 9 * c[1].unsigned_abs()
+                + 3 * c[2].unsigned_abs()
+                + c[3].unsigned_abs();
+            self.a34 += t.u34[u as usize];
+        }
+    }
+
+    /// Book 11's escape sequences over `q` (magnitudes of 16 and up).
+    #[cold]
+    fn add_esc(&mut self, q: &[i32]) {
+        for &c in q {
+            let m = c.unsigned_abs();
+            if m >= 16 {
+                self.esc += escape_bits(m) as u32;
+            }
+        }
+    }
+
+    /// The cheapest eligible book for a band of `width` coefficients per window,
+    /// and its bits: books tried in order 1..=11, a later book winning only when
+    /// strictly cheaper (the per-book search's tie-break). Eligible are the books
+    /// whose `lav` holds the peak (the `lav`s rise with the book number, so they
+    /// are a suffix) and whose `dim` divides the width.
+    fn best(&self, width: usize) -> (u8, usize) {
+        let lane = |v: u64, k: u32| (v >> (16 * k)) & 0xffff;
+        let nz = u64::from(self.nz);
+        let (a12, a34, a56) = (
+            u64::from(self.a12),
+            u64::from(self.a34),
+            u64::from(self.a56),
+        );
+        let cost: [u64; 12] = [
+            0,
+            lane(a12, 0),
+            lane(a12, 1),
+            lane(a34, 0) + nz,
+            lane(a34, 1) + nz,
+            lane(a56, 0),
+            lane(a56, 1),
+            lane(self.a7_10, 0) + nz,
+            lane(self.a7_10, 1) + nz,
+            lane(self.a7_10, 2) + nz,
+            lane(self.a7_10, 3) + nz,
+            u64::from(self.a11) + nz + u64::from(self.esc),
+        ];
+        let mut first = match self.maxq {
+            1 => 1,
+            2 => 3,
+            3 | 4 => 5,
+            5..=7 => 7,
+            8..=12 => 9,
+            _ => 11,
+        };
+        if width % 4 != 0 {
+            first = first.max(5);
+        }
+        let mut best = (ESC_HCB, usize::MAX);
+        if width % 2 != 0 {
+            return best;
+        }
+        for (cb, &bits) in cost.iter().enumerate().skip(first) {
+            if (bits as usize) < best.1 {
+                best = (cb as u8, bits as usize);
+            }
+        }
+        best
+    }
+}
+
 /// The cheapest representable spectral codebook for one SFB's coefficients, and
 /// its bit cost. ZERO for a silent band; dim-4 books only for 4-aligned bands.
 /// Books whose LAV can't hold the band's peak are skipped up front (only the
 /// escape book covers arbitrarily large values).
+///
+/// One walk prices every book ([`BandCost`]). The per-book search it replaced
+/// ([`best_codebook_for_band_ref`], kept as the test oracle) re-walked the band
+/// once per candidate book through an out-of-line [`spectral_bits`] per tuple,
+/// and was 75% of all encoder instructions.
 fn best_codebook_for_band(quant: &[i32], s: usize, e: usize) -> (u8, usize) {
+    let q = &quant[s..e];
+    if q.len() % 2 != 0 {
+        // No book can code an odd band; only its silence matters (cold: every
+        // AAC band width is a multiple of 4).
+        return if q.iter().all(|&v| v == 0) {
+            (ZERO_HCB, 0)
+        } else {
+            (ESC_HCB, usize::MAX)
+        };
+    }
+    let t = cost_tables();
+    let mut cost = BandCost::default();
+    cost.add2(t, q);
+    if cost.maxq == 0 {
+        return (ZERO_HCB, 0);
+    }
+    if cost.maxq <= 2 && q.len() % 4 == 0 {
+        cost.add4(t, q);
+    }
+    if cost.maxq >= 16 {
+        cost.add_esc(q);
+    }
+    cost.best(q.len())
+}
+
+/// The per-book search [`best_codebook_for_band`] replaced: the oracle its tests
+/// compare against.
+#[cfg(test)]
+fn best_codebook_for_band_ref(quant: &[i32], s: usize, e: usize) -> (u8, usize) {
     let maxq = quant[s..e]
         .iter()
         .map(|&q| q.unsigned_abs())
@@ -1875,6 +2107,7 @@ fn quantize_band_scalar(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i32]) 
 /// writes `out[i..i + 4]` for `i + 4 <= out.len()`; the tail is safe indexing.
 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn quantize_band_avx2(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i32]) {
     use std::arch::x86_64::*;
     let n = out.len();
@@ -2052,13 +2285,8 @@ fn code_core(xp: &Xpow, swb: &[u16], sf: &[i32], quant: &mut [i32]) -> (Vec<u8>,
     work::bump_code_frame();
     let num_swb = swb.len() - 1;
     work::bump_quant_bands((swb.len() - 1) as u64);
-    let scale = scale_table();
     let prof_q = prof::scope(Stage::EncQuant);
-    for sfb in 0..num_swb {
-        let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
-        let sc = scale[sf[sfb].clamp(0, 255) as usize];
-        quantize_band(&xp.pow[s..e], &xp.sign[s..e], sc, &mut quant[s..e]);
-    }
+    quantize_frame(xp, swb, sf, quant);
     drop(prof_q);
     let _prof_cb = prof::scope(Stage::EncCodebook);
     let mut max_sfb = 0usize;
@@ -2078,6 +2306,61 @@ fn code_core(xp: &Xpow, swb: &[u16], sf: &[i32], quant: &mut [i32]) -> (Vec<u8>,
     // global_gain(8) + ics_info(~11) + 3 flag bits + sections + scalefactors + spectrum.
     let body = 8 + 11 + 3 + section_bits(&cbs) + sf_bits + spec_bits;
     (cbs, body, max_sfb)
+}
+
+/// Quantize every band of a long frame at its scalefactor into `quant`, each
+/// band exactly as [`quantize_band`] does. One ISA dispatch per frame: with
+/// AVX2 the band loop runs inside [`quantize_bands_avx2`], so the per-band
+/// dispatch, call and constant setup (the rate loop quantizes ~690K bands per
+/// 18 s of stereo) are paid once.
+fn quantize_frame(xp: &Xpow, swb: &[u16], sf: &[i32], quant: &mut [i32]) {
+    let scale = scale_table();
+    let num_swb = swb.len() - 1;
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    {
+        // The opt-in AVX-512 kernel stays on the per-band path.
+        #[cfg(feature = "simd-avx512")]
+        let avx512 = has_avx512();
+        #[cfg(not(feature = "simd-avx512"))]
+        let avx512 = false;
+        if !avx512 && has_avx2() {
+            // SAFETY: AVX2 detected at runtime; `quantize_bands_avx2` cuts each
+            // band out of `pow`, `sign` and `quant` with checked slicing, so
+            // every kernel call gets three slices of one length.
+            unsafe { quantize_bands_avx2(&xp.pow, &xp.sign, swb, sf, scale, quant) };
+            prof::count(Kernel::Quantize, true, usize::from(swb[num_swb] - swb[0]));
+            return;
+        }
+    }
+    for sfb in 0..num_swb {
+        let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+        let sc = scale[sf[sfb].clamp(0, 255) as usize];
+        quantize_band(&xp.pow[s..e], &xp.sign[s..e], sc, &mut quant[s..e]);
+    }
+}
+
+/// The band loop of [`quantize_frame`] compiled for AVX2, so
+/// [`quantize_band_avx2`] inlines into it.
+///
+/// # Safety
+///
+/// AVX2 must be available. Bounds are checked: each band is sliced out of
+/// `pow`, `sign` and `out` with safe indexing before the kernel sees it.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_bands_avx2(
+    pow: &[f64],
+    sign: &[i32],
+    swb: &[u16],
+    sf: &[i32],
+    scale: &[f64; 256],
+    out: &mut [i32],
+) {
+    for sfb in 0..swb.len() - 1 {
+        let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+        let sc = scale[sf[sfb].clamp(0, 255) as usize];
+        quantize_band_avx2(&pow[s..e], &sign[s..e], sc, &mut out[s..e]);
+    }
 }
 
 /// Owned-buffer wrapper over [`code_core`] for the one-shot callers (final coding).
@@ -2358,6 +2641,78 @@ fn pns_bands(
     out
 }
 
+/// The bits [`spectral_emit`] writes for every whole `dim`-tuple of `q` with
+/// spectral book `cb` (1..=11; every tuple representable, magnitudes at most
+/// `MAX_QUANT`), in fewer writes: the book and its table are looked up once per
+/// band, each codeword goes out together with its sign bits as one write (at
+/// most 19 + 4 bits), and each escape sequence as one write (`2N + 5 <= 21`
+/// bits for `N <= 8`). `spectral_emit` stays the per-tuple reference.
+///
+/// Each book gets its own instance of the loop ([`emit_book`]), so the tuple
+/// index is straight-line arithmetic on constants instead of
+/// [`tuple_index`]'s run-time `dim`/`lav` walk.
+fn emit_band(w: &mut BitWriter, cb: u8, q: &[i32]) {
+    let book = spectral_book(cb);
+    match cb {
+        1 | 2 => emit_book::<4, false, 1, false>(w, book, q),
+        3 | 4 => emit_book::<4, true, 2, false>(w, book, q),
+        5 | 6 => emit_book::<2, false, 4, false>(w, book, q),
+        7 | 8 => emit_book::<2, true, 7, false>(w, book, q),
+        9 | 10 => emit_book::<2, true, 12, false>(w, book, q),
+        11 => emit_book::<2, true, 16, true>(w, book, q),
+        _ => panic!("not a spectral codebook: {cb}"),
+    }
+}
+
+/// [`emit_band`] for one book shape: `DIM`-tuples, magnitudes plus sign bits
+/// when `UNSIGNED`, values up to `LAV` (book 11, `ESC`, clamps to `LAV` and
+/// escape-codes the rest). An unrepresentable tuple panics, as
+/// [`spectral_emit`] does.
+fn emit_book<const DIM: usize, const UNSIGNED: bool, const LAV: u32, const ESC: bool>(
+    w: &mut BitWriter,
+    book: &crate::huffman::HuffBook,
+    q: &[i32],
+) {
+    let modulo = if UNSIGNED { LAV + 1 } else { 2 * LAV + 1 };
+    for t in q.chunks_exact(DIM) {
+        let mut idx = 0u32;
+        for &c in t {
+            let mag = c.unsigned_abs();
+            assert!(ESC || mag <= LAV, "representable tuple");
+            let digit = if !UNSIGNED {
+                (c + LAV as i32) as u32
+            } else if ESC {
+                mag.min(LAV)
+            } else {
+                mag
+            };
+            idx = idx * modulo + digit;
+        }
+        let (code, len) = book.code(idx as usize);
+        let (mut val, mut n) = (code, u32::from(len));
+        if UNSIGNED {
+            for &c in t {
+                if c != 0 {
+                    val = (val << 1) | u32::from(c < 0);
+                    n += 1;
+                }
+            }
+        }
+        w.write(val, n);
+        if ESC {
+            for &c in t {
+                let m = c.unsigned_abs();
+                if m >= LAV {
+                    // N ones, a zero, then N + 4 bits of m - 2^(N+4) (ISO §4.6.3.3).
+                    let e = m.ilog2() - 4;
+                    let prefix = ((1u32 << e) - 1) << 1;
+                    w.write((prefix << (e + 4)) | (m - (1 << (e + 4))), 2 * e + 5);
+                }
+            }
+        }
+    }
+}
+
 /// `spectral_data`: per regular SFB, code coefficient tuples with the band's book.
 fn write_spectrum(w: &mut BitWriter, quant: &[i32], cbs: &[u8], swb: &[u16]) {
     for (sfb, &cb) in cbs.iter().enumerate() {
@@ -2366,13 +2721,8 @@ fn write_spectrum(w: &mut BitWriter, quant: &[i32], cbs: &[u8], swb: &[u16]) {
         if cb == ZERO_HCB || cb >= NOISE_HCB {
             continue;
         }
-        let dim = CODEBOOKS[cb as usize].dim as usize;
         let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
-        let mut i = s;
-        while i + dim <= e {
-            spectral_emit(cb as usize, &quant[i..i + dim], w);
-            i += dim;
-        }
+        emit_band(w, cb, &quant[s..e]);
     }
 }
 
@@ -2892,7 +3242,54 @@ fn assign_sequences(transient: &[bool]) -> Vec<WindowSequence> {
 /// Cheapest codebook (and its bit cost) for one SFB across all short windows of a
 /// single group, matched to how the decoder reads it (per-SFB codebook, per-window
 /// coefficients).
+///
+/// The same one-walk pricing as [`best_codebook_for_band`], accumulated over the
+/// group's windows; [`best_codebook_short_ref`], the per-book search it
+/// replaced, is the test oracle.
 fn best_codebook_short(
+    quant: &[i32],
+    swb: &[u16],
+    sfb: usize,
+    win0: usize,
+    nwin: usize,
+) -> (u8, usize) {
+    let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+    let band = |win: usize| &quant[win * SHORT_HALF + s..win * SHORT_HALF + e];
+    let wins = win0..win0 + nwin;
+    if (e - s) % 2 != 0 {
+        // No book can code an odd band (cold: every AAC band width is a
+        // multiple of 4).
+        return if wins.clone().all(|w| band(w).iter().all(|&v| v == 0)) {
+            (ZERO_HCB, 0)
+        } else {
+            (ESC_HCB, usize::MAX)
+        };
+    }
+    let t = cost_tables();
+    let mut cost = BandCost::default();
+    for win in wins.clone() {
+        cost.add2(t, band(win));
+    }
+    if cost.maxq == 0 {
+        return (ZERO_HCB, 0);
+    }
+    if cost.maxq <= 2 && (e - s) % 4 == 0 {
+        for win in wins.clone() {
+            cost.add4(t, band(win));
+        }
+    }
+    if cost.maxq >= 16 {
+        for win in wins {
+            cost.add_esc(band(win));
+        }
+    }
+    cost.best(e - s)
+}
+
+/// The per-book search [`best_codebook_short`] replaced: the oracle its tests
+/// compare against.
+#[cfg(test)]
+fn best_codebook_short_ref(
     quant: &[i32],
     swb: &[u16],
     sfb: usize,
@@ -3391,15 +3788,10 @@ fn write_spectrum_short(
             if cb == ZERO_HCB {
                 continue;
             }
-            let dim = CODEBOOKS[cb as usize].dim as usize;
             let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
             for win in w0..w0 + nwin {
                 let base = win * SHORT_HALF;
-                let mut i = s;
-                while i + dim <= e {
-                    spectral_emit(cb as usize, &quant[base + i..base + i + dim], w);
-                    i += dim;
-                }
+                emit_band(w, cb, &quant[base + s..base + e]);
             }
         }
     }
@@ -5929,6 +6321,110 @@ mod tests {
     /// the AVX2/scalar `min(round(v), MAX)`. The intrinsics can't run on a non-AVX-512
     /// host, but the identity they rely on — for the quantizer's always-nonnegative
     /// input — is checkable in scalar, so the untested path's *math* is pinned here.
+    /// A small deterministic generator for the codebook-cost oracle tests: bands
+    /// whose peak lands in every book tier (0, 1, 2, 3-4, 5-7, 8-12, 13-15, the
+    /// escape range up to `MAX_QUANT`), mixed with zeros, at every width the
+    /// tables use plus odd and non-4-aligned ones.
+    fn random_band(seed: &mut u64, width: usize) -> Vec<i32> {
+        let mut next = || {
+            *seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (*seed >> 33) as u32
+        };
+        let peak = [0u32, 1, 2, 4, 7, 12, 15, 16, 40, 300, MAX_QUANT as u32][next() as usize % 11];
+        (0..width)
+            .map(|_| {
+                let r = next();
+                if r % 3 == 0 || peak == 0 {
+                    0
+                } else {
+                    let m = (r >> 2) % (peak + 1);
+                    if r & 2 == 0 {
+                        m as i32
+                    } else {
+                        -(m as i32)
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// The walk-once codebook cost must pick the same book at the same bit count
+    /// as the per-book search it replaced, for long bands and for short-window
+    /// groups.
+    #[test]
+    fn codebook_cost_matches_per_book_search() {
+        let mut seed = 0x5eed_u64;
+        for width in [2usize, 4, 6, 8, 12, 16, 20, 28, 32, 48, 64, 96, 3] {
+            for _ in 0..4000 {
+                let band = random_band(&mut seed, width);
+                assert_eq!(
+                    best_codebook_for_band(&band, 0, width),
+                    best_codebook_for_band_ref(&band, 0, width),
+                    "width {width} band {band:?}"
+                );
+            }
+        }
+    }
+
+    /// The short-window search over a group of windows (each window's band at its
+    /// own `SHORT_HALF` stride) against the per-book search it replaced.
+    #[test]
+    fn short_codebook_cost_matches_per_book_search() {
+        let mut seed = 0x5407_u64;
+        // Long-window and short-window band edges, plus a non-4-aligned and an
+        // odd band, so the dim-4 and no-book cases are reached too.
+        let swb: [u16; 10] = [0, 4, 8, 16, 28, 44, 60, 66, 69, 128];
+        for _ in 0..3000 {
+            let mut quant = vec![0i32; FRAME_LEN];
+            for w in 0..8 {
+                let band = random_band(&mut seed, SHORT_HALF);
+                quant[w * SHORT_HALF..(w + 1) * SHORT_HALF].copy_from_slice(&band);
+            }
+            for sfb in 0..swb.len() - 1 {
+                for (w0, nwin) in [(0, 8), (0, 1), (2, 3), (5, 3), (7, 1)] {
+                    assert_eq!(
+                        best_codebook_short(&quant, &swb, sfb, w0, nwin),
+                        best_codebook_short_ref(&quant, &swb, sfb, w0, nwin),
+                        "sfb {sfb} windows {w0}+{nwin}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The frame-level quantizer (one dispatch, the band loop inside the AVX2
+    /// function) equals the scalar per-band quantizer on every band, with
+    /// scalefactors spanning and exceeding the clamped 0..=255 range.
+    #[test]
+    fn quantize_frame_matches_per_band_scalar() {
+        let swb = swb_offsets(true, 4); // 44.1 kHz long bands
+        let mut seed = 0x9e37_u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as u32
+        };
+        for _ in 0..50 {
+            let spec: Vec<f32> = (0..FRAME_LEN)
+                .map(|_| (next() as f32 / u32::MAX as f32 - 0.25) * 40_000.0)
+                .collect();
+            let xp = Xpow::new(&spec);
+            let sf: Vec<i32> = (1..swb.len()).map(|_| next() as i32 % 300 - 20).collect();
+            let mut got = vec![0i32; FRAME_LEN];
+            quantize_frame(&xp, swb, &sf, &mut got);
+            let mut want = vec![0i32; FRAME_LEN];
+            for sfb in 0..swb.len() - 1 {
+                let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+                let sc = scale_table()[sf[sfb].clamp(0, 255) as usize];
+                quantize_band_scalar(&xp.pow[s..e], &xp.sign[s..e], sc, &mut want[s..e]);
+            }
+            assert_eq!(got, want);
+        }
+    }
+
     /// The quantize twins must equal the scalar oracle exactly — including at the
     /// adversarial rounding points (the double just below each `k + 0.5`, where
     /// `v + 0.5` rounds UP in f64 and a naive `floor(v + 0.5)` overshoots), at the
@@ -6050,6 +6546,84 @@ mod tests {
         w.write(0b1111, 4);
         assert_eq!(w.bit_len(), 8);
         assert_eq!(w.into_bytes(), vec![0b1011_1111]);
+    }
+
+    /// `emit_band` writes exactly the bits of `spectral_emit` tuple by tuple, for
+    /// every book, with bands whose peak the book can hold (escapes up to
+    /// `MAX_QUANT` for book 11), at a random starting bit alignment.
+    #[test]
+    fn emit_band_matches_spectral_emit() {
+        let mut seed = 0xe417_u64;
+        for cb in 1..=11u8 {
+            let meta = &CODEBOOKS[cb as usize];
+            let lav = if meta.esc {
+                MAX_QUANT as u32
+            } else {
+                u32::from(meta.lav)
+            };
+            let mut done = 0;
+            while done < 2000 {
+                let band = random_band(&mut seed, 32);
+                if band.iter().any(|q| q.unsigned_abs() > lav) {
+                    continue;
+                }
+                done += 1;
+                let lead = (seed >> 40) as u32 % 32;
+                let (mut a, mut b) = (BitWriter::new(), BitWriter::new());
+                a.write(0x5a5a_5a5a, lead);
+                b.write(0x5a5a_5a5a, lead);
+                emit_band(&mut a, cb, &band);
+                for t in band.chunks_exact(meta.dim as usize) {
+                    spectral_emit(cb as usize, t, &mut b);
+                }
+                assert_eq!(a.bit_len(), b.bit_len(), "cb {cb} band {band:?}");
+                assert_eq!(a.into_bytes(), b.into_bytes(), "cb {cb} band {band:?}");
+            }
+        }
+    }
+
+    /// The word-buffered writer against a one-bool-per-bit reference: random
+    /// widths 0..=32 (with junk above the width), interleaved appends of writers
+    /// at every alignment, `bit_len` after every step, and the padded bytes.
+    #[test]
+    fn bitwriter_matches_bit_vector() {
+        fn pack(bits: &[bool]) -> Vec<u8> {
+            bits.chunks(8)
+                .map(|c| {
+                    c.iter()
+                        .enumerate()
+                        .fold(0u8, |b, (i, &x)| b | (u8::from(x) << (7 - i)))
+                })
+                .collect()
+        }
+        let mut seed = 0xb17_u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 32) as u32
+        };
+        for _ in 0..300 {
+            let (mut w, mut bits) = (BitWriter::new(), Vec::new());
+            for _ in 0..(next() % 200) {
+                if next() % 8 == 0 {
+                    let (mut o, mut obits) = (BitWriter::new(), Vec::new());
+                    for _ in 0..(next() % 20) {
+                        let (v, n) = (next(), next() % 33);
+                        o.write(v, n);
+                        obits.extend((0..n).rev().map(|i| (v >> i) & 1 == 1));
+                    }
+                    w.append(&o);
+                    bits.extend(obits);
+                } else {
+                    let (v, n) = (next(), next() % 33);
+                    w.write(v, n);
+                    bits.extend((0..n).rev().map(|i| (v >> i) & 1 == 1));
+                }
+                assert_eq!(w.bit_len(), bits.len());
+            }
+            assert_eq!(w.into_bytes(), pack(&bits));
+        }
     }
 
     #[test]

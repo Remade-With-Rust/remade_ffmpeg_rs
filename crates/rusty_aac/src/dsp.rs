@@ -127,7 +127,71 @@ pub fn mdct(time: &[f32]) -> Vec<f32> {
 /// a power of two and equal `im.len()`. Pure in-house `f64` — the fast MDCT's engine.
 /// Uses precomputed per-stage twiddles (`tw_c`/`tw_s`, flattened over stages) so a
 /// transform is pure multiply-add — no runtime trig or twiddle recurrence.
-fn fft(re: &mut [f64], im: &mut [f64], tw_c: &[f64], tw_s: &[f64]) {
+///
+/// The bit reversal is the plan's precomputed swap list, the one-butterfly first
+/// stage has no inner loop, and each later stage walks its blocks as split
+/// halves so the butterfly loop has no aliasing for the compiler to fear. Every
+/// butterfly computes exactly [`fft_ref`]'s products, sums and stores in its
+/// order (no reassociation, no FMA), so the result is bit-identical
+/// (`fft_matches_reference_bit_exact`).
+fn fft(re: &mut [f64], im: &mut [f64], tw_c: &[f64], tw_s: &[f64], swaps: &[(u32, u32)]) {
+    let n = re.len();
+    let im = &mut im[..n];
+    for &(i, j) in swaps {
+        re.swap(i as usize, j as usize);
+        im.swap(i as usize, j as usize);
+    }
+    if n < 2 {
+        return;
+    }
+    // First stage (len 2): one butterfly per block, twiddle `tw[0]`.
+    let (cr, ci) = (tw_c[0], tw_s[0]);
+    for (r, i) in re.chunks_exact_mut(2).zip(im.chunks_exact_mut(2)) {
+        let tr = cr * r[1] - ci * i[1];
+        let ti = cr * i[1] + ci * r[1];
+        r[1] = r[0] - tr;
+        i[1] = i[0] - ti;
+        r[0] += tr;
+        i[0] += ti;
+    }
+    let mut off = 1usize;
+    let mut len = 4usize;
+    while len <= n {
+        let half = len / 2;
+        let (wc, ws) = (&tw_c[off..off + half], &tw_s[off..off + half]);
+        for (rb, ib) in re.chunks_exact_mut(len).zip(im.chunks_exact_mut(len)) {
+            let (ra, rb) = rb.split_at_mut(half);
+            let (ia, ib) = ib.split_at_mut(half);
+            let lanes = ra.iter_mut().zip(rb).zip(ia.iter_mut().zip(ib));
+            for (((ar, br), (ai, bi)), (&cr, &ci)) in lanes.zip(wc.iter().zip(ws)) {
+                let tr = cr * *br - ci * *bi;
+                let ti = cr * *bi + ci * *br;
+                *br = *ar - tr;
+                *bi = *ai - ti;
+                *ar += tr;
+                *ai += ti;
+            }
+        }
+        off += half;
+        len <<= 1;
+    }
+}
+
+/// The bit-reversal permutation of an `n`-point transform as its swaps
+/// (`i < rev(i)` only), in the order the reference loop performs them.
+fn bitrev_swaps(n: usize) -> Vec<(u32, u32)> {
+    let bits = n.trailing_zeros();
+    (1..n)
+        .filter_map(|i| {
+            let j = ((i as u32).reverse_bits() >> (32 - bits)) as usize;
+            (i < j).then_some((i as u32, j as u32))
+        })
+        .collect()
+}
+
+/// The straightforward FFT [`fft`] restructures: the bit-exactness oracle.
+#[cfg(test)]
+fn fft_ref(re: &mut [f64], im: &mut [f64], tw_c: &[f64], tw_s: &[f64]) {
     let n = re.len();
     // Bit-reversal permutation.
     let mut j = 0usize;
@@ -176,6 +240,8 @@ struct MdctTwiddles {
     post_s: Vec<f64>,
     fft_c: Vec<f64>,
     fft_s: Vec<f64>,
+    /// The M-point FFT's bit-reversal swaps.
+    swaps: Vec<(u32, u32)>,
 }
 
 impl MdctTwiddles {
@@ -214,6 +280,7 @@ impl MdctTwiddles {
             post_s,
             fft_c,
             fft_s,
+            swaps: bitrev_swaps(m),
         }
     }
 }
@@ -272,7 +339,7 @@ pub fn mdct_fast(x: &[f32]) -> Vec<f32> {
         re.set_len(m);
         im.set_len(m);
     }
-    fft(&mut re, &mut im, &tw.fft_c, &tw.fft_s);
+    fft(&mut re, &mut im, &tw.fft_c, &tw.fft_s, &tw.swaps);
     // Post-rotate W = V·e^{-iπp/L}; X[2p]=Re(W), X[L-1-2p]=-Im(W); output scaled ×2.
     let mut out = Vec::<f32>::with_capacity(l);
     let op = out.spare_capacity_mut();
@@ -316,7 +383,7 @@ pub fn imdct_fast(spec: &[f32]) -> Vec<f32> {
         re[p] = yr * tw.pre_c[p] + yi * tw.pre_s[p];
         im[p] = yi * tw.pre_c[p] - yr * tw.pre_s[p];
     }
-    fft(&mut re, &mut im, &tw.fft_c, &tw.fft_s);
+    fft(&mut re, &mut im, &tw.fft_c, &tw.fft_s, &tw.swaps);
     // z = D·X (the core produces 2·D·X; the ×2 and the spec's 2/N fold into 1/N).
     let scale = 1.0 / n as f64;
     let mut z = vec![0f64; l];
@@ -670,12 +737,57 @@ impl Radix2Fft {
     /// `s + 2·half <= n` and `j + 4 <= half`, and twiddles `stw[half - 2 + j .. +4]`
     /// with `2·half - 2 <= stw.len() = n - 2`. The `half == 2` stage reads and
     /// writes `buf[s..s+4]` for `s + 4 <= n` and the twiddles `stw[0..2]`.
+    ///
+    /// For `n >= 8` the first three stages run fused, eight points at a time
+    /// held in two registers (the stage-3 butterflies of a block of eight only
+    /// pair its two halves), so those stages cost one load and one store per
+    /// four points instead of three of each. Every butterfly is the same
+    /// arithmetic as the unfused stages; only the round trips through memory
+    /// (exact for `f32`) are gone. The fused pass reads and writes
+    /// `buf[s..s + 8]` for `s + 8 <= n` and the twiddles `stw[0..6]`.
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     #[target_feature(enable = "avx")]
     unsafe fn run_avx(&self, buf: &mut [[f32; 2]], permuted: bool) {
         use std::arch::x86_64::*;
         let n = self.n;
         let p = buf.as_mut_ptr().cast::<f32>();
+        if n >= 8 {
+            if !permuted {
+                for &(i, j) in &self.swaps {
+                    buf.swap(i as usize, j as usize);
+                }
+            }
+            let p = buf.as_mut_ptr().cast::<f32>();
+            let tw = self.stw.as_ptr().cast::<f32>();
+            let w2 = _mm_loadu_ps(tw);
+            let (wr2, wi2) = (_mm_moveldup_ps(w2), _mm_movehdup_ps(w2));
+            let w4 = _mm256_loadu_ps(tw.add(4));
+            let (wr4, wi4) = (_mm256_moveldup_ps(w4), _mm256_movehdup_ps(w4));
+            // Stages 1 and 2 on four points in one register: the first stage as
+            // below, then the half-2 butterflies between its two 128-bit halves.
+            let stage12 = |q: *const f32| {
+                let x = _mm256_loadu_ps(q);
+                let y = _mm256_castpd_ps(_mm256_permute_pd::<0b0101>(_mm256_castps_pd(x)));
+                let r = _mm256_blend_ps::<0b1100_1100>(_mm256_add_ps(x, y), _mm256_sub_ps(y, x));
+                let a = _mm256_castps256_ps128(r);
+                let b = _mm256_extractf128_ps::<1>(r);
+                let bs = _mm_permute_ps::<0b10_11_00_01>(b);
+                let t = _mm_addsub_ps(_mm_mul_ps(b, wr2), _mm_mul_ps(bs, wi2));
+                _mm256_set_m128(_mm_sub_ps(a, t), _mm_add_ps(a, t))
+            };
+            let mut s = 0;
+            while s < n {
+                let a = stage12(p.add(2 * s));
+                let b = stage12(p.add(2 * s + 8));
+                let bs = _mm256_permute_ps::<0b10_11_00_01>(b);
+                let t = _mm256_addsub_ps(_mm256_mul_ps(b, wr4), _mm256_mul_ps(bs, wi4));
+                _mm256_storeu_ps(p.add(2 * s), _mm256_add_ps(a, t));
+                _mm256_storeu_ps(p.add(2 * s + 8), _mm256_sub_ps(a, t));
+                s += 8;
+            }
+            self.stages_avx(p, 8);
+            return;
+        }
         if n >= 4 {
             if !permuted {
                 for &(i, j) in &self.swaps {
@@ -697,7 +809,21 @@ impl Radix2Fft {
         } else {
             self.permute_and_first_stage(buf, permuted);
         }
-        let mut half = 2;
+        self.stages_avx(p, 2);
+    }
+
+    /// The radix-2 stages of [`Self::run_avx`] from half-length `half` up.
+    ///
+    /// # Safety
+    /// AVX must be available, and `p` must point at the `n = self.n` complex
+    /// values (`2n` floats) of the transform; the stages before `half` have
+    /// run. Bounds as in `run_avx`.
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx")]
+    #[inline]
+    unsafe fn stages_avx(&self, p: *mut f32, mut half: usize) {
+        use std::arch::x86_64::*;
+        let n = self.n;
         while half < n {
             if half == 2 {
                 // Two butterflies per 128-bit op; both twiddles are the same in
@@ -895,8 +1021,36 @@ impl Pow2Dct4 {
     pub(crate) fn dct4(&self, x: &[f32], out: &mut [f32], scratch: &mut [[f32; 2]]) {
         let m = self.l / 2;
         let v = &mut scratch[..m];
+        // The QMF synthesis runs this twice per slot (~243K calls on HE v1), so
+        // both rotations take the SSE twins the IMDCT already uses (four
+        // entries per trip, the scalar's exact products and sums).
+        #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+        if m % 4 == 0 {
+            let (x, out) = (&x[..self.l], &mut out[..self.l]);
+            // SAFETY: SSE is baseline on x86-64. `x` is exactly `l = 2m` long,
+            // `v` and `pre` exactly `m`, `m % 4 == 0` (`rotate_in_sse`'s
+            // contract); viewing the initialised `v` as `MaybeUninit` only lets
+            // the twin overwrite it, which it does for every element.
+            unsafe {
+                let vu =
+                    &mut *(std::ptr::from_mut::<[[f32; 2]]>(v) as *mut [MaybeUninit<[f32; 2]>]);
+                self.rotate_in_sse(x, vu);
+            }
+            self.fft.run(v);
+            // SAFETY: SSE is baseline; `v` and `post` hold `m` entries, `out`
+            // exactly `2m`, `m % 4 == 0` (`dct4_post_sse`'s contract).
+            unsafe { self.dct4_post_sse(v, out) };
+            return;
+        }
         self.rotate_in(x, v);
         self.fft.run(v);
+        self.dct4_post_scalar(v, out);
+    }
+
+    /// The post-rotation of [`Self::dct4`], scalar (the oracle for the SSE
+    /// twin, and the path on other targets).
+    #[inline(always)]
+    fn dct4_post_scalar(&self, v: &[[f32; 2]], out: &mut [f32]) {
         // out[2q] comes from v[q]; out[2q+1] = out[L-1-2p] from v[p], p = m-1-q.
         let post = v.iter().zip(&self.post);
         for ((o, (&[vr, vi], &[c, s])), (&[ur, ui], &[uc, us])) in out[..self.l]
@@ -1040,6 +1194,51 @@ impl Pow2Dct4 {
         }
     }
 
+    /// SSE twin of [`Self::dct4_post_scalar`], four `q` per trip: the same two
+    /// products and one sum/difference per lane, no FMA (bit-identical,
+    /// checked in `imdct_rotations_sse_match_scalar`). The loads and shuffles are
+    /// [`Self::post_sse`]'s; only the arithmetic differs (no sign flip or scale).
+    ///
+    /// # Safety
+    /// `v.len() == self.post.len() == m`, `out.len() == 2m`, `m % 4 == 0`. A
+    /// trip at `q` reads `v/post[q..q+4]` and `v/post[m-4-q..m-q]` and writes
+    /// `out[2q..2q+8]`.
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    #[inline(always)]
+    unsafe fn dct4_post_sse(&self, v: &[[f32; 2]], out: &mut [f32]) {
+        use std::arch::x86_64::*;
+        let m = self.l / 2;
+        debug_assert!(v.len() == m && self.post.len() == m && out.len() == 2 * m && m % 4 == 0);
+        let vp = v.as_ptr().cast::<f32>();
+        let pp = self.post.as_ptr().cast::<f32>();
+        let op = out.as_mut_ptr();
+        let mut q = 0;
+        while q < m {
+            let v0 = _mm_loadu_ps(vp.add(2 * q));
+            let v1 = _mm_loadu_ps(vp.add(2 * q + 4));
+            let vr = _mm_shuffle_ps::<0b10_00_10_00>(v0, v1);
+            let vi = _mm_shuffle_ps::<0b11_01_11_01>(v0, v1);
+            let p0 = _mm_loadu_ps(pp.add(2 * q));
+            let p1 = _mm_loadu_ps(pp.add(2 * q + 4));
+            let c = _mm_shuffle_ps::<0b10_00_10_00>(p0, p1);
+            let s = _mm_shuffle_ps::<0b11_01_11_01>(p0, p1);
+            // Mirrored entries m-1-q, m-2-q, m-3-q, m-4-q.
+            let u0 = _mm_loadu_ps(vp.add(2 * (m - 4 - q)));
+            let u1 = _mm_loadu_ps(vp.add(2 * (m - 2 - q)));
+            let ur = _mm_shuffle_ps::<0b00_10_00_10>(u1, u0);
+            let ui = _mm_shuffle_ps::<0b01_11_01_11>(u1, u0);
+            let w0 = _mm_loadu_ps(pp.add(2 * (m - 4 - q)));
+            let w1 = _mm_loadu_ps(pp.add(2 * (m - 2 - q)));
+            let uc = _mm_shuffle_ps::<0b00_10_00_10>(w1, w0);
+            let us = _mm_shuffle_ps::<0b01_11_01_11>(w1, w0);
+            let a = _mm_add_ps(_mm_mul_ps(vr, c), _mm_mul_ps(vi, s));
+            let b = _mm_sub_ps(_mm_mul_ps(ur, us), _mm_mul_ps(ui, uc));
+            _mm_storeu_ps(op.add(2 * q), _mm_unpacklo_ps(a, b));
+            _mm_storeu_ps(op.add(2 * q + 4), _mm_unpackhi_ps(a, b));
+            q += 4;
+        }
+    }
+
     /// The pre-restructure indexed forms, kept as the bit-exact oracle.
     #[cfg(test)]
     fn dct4_reference(&self, x: &[f32], out: &mut [f32]) {
@@ -1149,6 +1348,36 @@ pub fn kbd_window(n: usize, alpha: f64) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The restructured f64 FFT is the reference loop's arithmetic in the same
+    /// order: bit for bit equal on random input at every size up to 1024
+    /// (including the MDCT's 64 and 512), with the MDCT plans' own twiddles.
+    #[test]
+    fn fft_matches_reference_bit_exact() {
+        let mut seed = 0xff7_u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5) * 6.0e4
+        };
+        for bits in 0..=10 {
+            let m = 1usize << bits;
+            let tw = MdctTwiddles::build(4 * m);
+            let swaps = bitrev_swaps(m);
+            for _ in 0..20 {
+                let re: Vec<f64> = (0..m).map(|_| next()).collect();
+                let im: Vec<f64> = (0..m).map(|_| next()).collect();
+                let (mut r1, mut i1, mut r2, mut i2) = (re.clone(), im.clone(), re, im);
+                fft(&mut r1, &mut i1, &tw.fft_c, &tw.fft_s, &swaps);
+                fft_ref(&mut r2, &mut i2, &tw.fft_c, &tw.fft_s);
+                for k in 0..m {
+                    assert_eq!(r1[k].to_bits(), r2[k].to_bits(), "m={m} re[{k}]");
+                    assert_eq!(i1[k].to_bits(), i2[k].to_bits(), "m={m} im[{k}]");
+                }
+            }
+        }
+    }
 
     /// The fast FFT-based MDCT must match the direct O(N²) oracle at both block
     /// sizes, on raw and encoder-scaled (×32768) input.
@@ -1498,6 +1727,19 @@ mod imdct_rotation_twins {
                 assert!(
                     oa.iter().zip(&ob).all(|(p, q)| p.to_bits() == q.to_bits()),
                     "post l={l}"
+                );
+                // The DCT-IV's own post-rotation twin.
+                #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+                // SAFETY: SSE is baseline; `va` holds m entries, `oa` 2m, m % 4 == 0.
+                unsafe {
+                    plan.dct4_post_sse(&va, &mut oa);
+                }
+                #[cfg(not(all(feature = "simd", target_arch = "x86_64")))]
+                plan.dct4_post_scalar(&va, &mut oa);
+                plan.dct4_post_scalar(&va, &mut ob);
+                assert!(
+                    oa.iter().zip(&ob).all(|(p, q)| p.to_bits() == q.to_bits()),
+                    "dct4 post l={l}"
                 );
             }
         }

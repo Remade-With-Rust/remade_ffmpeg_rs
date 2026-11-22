@@ -670,3 +670,25 @@ fn data_len_for_size(size: IntSize) -> Option<usize> {
     let row_bytes = min_row_bytes(size)?;
     compute_data_len(size, row_bytes.get())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::try_zeroed;
+
+    /// `try_zeroed` hands back exactly `len` zero bytes that the `Vec` owns
+    /// (length and capacity `len`), an empty buffer for 0, and `None` for
+    /// requests no allocator can meet.
+    #[test]
+    fn try_zeroed_is_an_owned_zeroed_buffer() {
+        for len in [1usize, 3, 4096, 3 * 1024 * 1024 + 7] {
+            let mut v = try_zeroed(len).unwrap();
+            assert_eq!((v.len(), v.capacity()), (len, len));
+            assert!(v.iter().all(|&b| b == 0), "len {len}");
+            v.push(9);
+            assert_eq!(v[len], 9);
+        }
+        assert!(try_zeroed(0).unwrap().is_empty());
+        assert!(try_zeroed(isize::MAX as usize).is_none());
+        assert!(try_zeroed(usize::MAX).is_none());
+    }
+}

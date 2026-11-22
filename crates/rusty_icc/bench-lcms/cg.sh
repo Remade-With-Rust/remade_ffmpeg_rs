@@ -14,6 +14,7 @@ export PATH=$HOME/.cargo/bin:$PATH
 export RUSTUP_TOOLCHAIN=1.95.0
 export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
 export RUSTY_ICC_FOGRA39=${RUSTY_ICC_FOGRA39:-/root/iccbench/CoatedFOGRA39.icc}
+export RUSTY_ICC_FOGRA39_V4=${RUSTY_ICC_FOGRA39_V4:-/root/iccbench/CoatedFOGRA39-v4.icc}
 if ! cargo build --release --example icc_ir >/tmp/icc_ir_build.log 2>&1; then
   grep -E "^(error|warning)" -A12 /tmp/icc_ir_build.log || tail -30 /tmp/icc_ir_build.log
   echo "BUILD FAILED"
@@ -23,11 +24,8 @@ grep -E "^warning" -A6 /tmp/icc_ir_build.log || true
 BIN=target/release/examples/icc_ir
 OUT=/root/iccbench/cg
 mkdir -p "$OUT"
-MODES=${*:-p3u8 p3u16 fogu8 fog16 labf32 labinf32 build3 build4 parse \
-p3f32 lin2020f32 fogf32 fogrgbf32 v4f32 v4inf32 prof32 toprof32 prooff32 \
-grayu8 togray16 prou8 v4u8 cgatsu8 labu8 lab16in proofu8 gamutu8 \
-smallp3u8 smallfogu8 smallfog16 smallp3f32 \
-buildp3 buildgray buildlab buildv4 buildproof buildbpc first16 parsev4}
+# Every mode the binary knows unless some are named.
+MODES=${*:-$("$BIN" x 2>&1 | sed -n "s/^modes: //p")}
 echo "binary $(stat -c %y $BIN | cut -d. -f1) $(sha256sum $BIN | cut -c1-12)"
 JOBS=${CG_JOBS:-8}
 one() {

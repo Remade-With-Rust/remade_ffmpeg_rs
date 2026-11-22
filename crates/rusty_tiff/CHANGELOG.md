@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_tiff-v0.1.4...rusty_tiff-v0.1.5) - 2026-11-22
+
+### Fixed
+
+- *(rusty_tiff)* keep the inflate error's own message on damaged Deflate chunks
+
+### Other
+
+- *(rusty_tiff)* direct tile reads give one-buffer readers to the band path
+- *(rusty_tiff)* direct tile reads build their row buffers with less per row
+- *(rusty_tiff)* one read per band of back-to-back uncompressed tiles
+- *(rusty_tiff)* tile bands append their rows from an out-of-line loop
+- *(rusty_tiff)* wide uncompressed 16-bit tiles read straight into the image
+
 ## [0.1.4](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_tiff-v0.1.3...rusty_tiff-v0.1.4) - 2026-11-21
 
 ### Other

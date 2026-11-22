@@ -32,20 +32,27 @@
 //! # Ok::<(), rusty_icc::Error>(())
 //! ```
 //!
-//! The library forbids `unsafe`, has no dependencies, and never declares a
-//! global allocator.
+//! The library has no dependencies and never declares a global allocator.
+//! `unsafe` is denied everywhere except one private module of x86-64 AVX2
+//! kernels (`simd`), each with its scalar twin as oracle and fallback; the
+//! public API is safe.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 mod bytes;
 pub mod color;
 mod curve;
 mod error;
+mod fast;
 mod lut;
 mod md5;
 mod pipeline;
 mod profile;
+// The crate's only `unsafe`: AVX2 kernels behind runtime feature detection
+// (see the module's header for the audit rules).
+#[allow(unsafe_code)]
+mod simd;
 mod tag;
 mod transform;
 
@@ -56,4 +63,4 @@ pub use profile::{ColorSpace, Header, Profile, ProfileClass, TagSignature};
 pub use tag::{LocalizedString, Tag};
 #[doc(hidden)]
 pub use transform::SampleKind;
-pub use transform::{GamutCheck, Intent, Layout, Options, Sample, Transform};
+pub use transform::{GamutCheck, Intent, Layout, Options, Precision, Sample, Transform};

@@ -149,7 +149,7 @@ impl Writer {
         self.buf.resize(self.buf.len() + n, 0);
     }
     pub(crate) fn pad4(&mut self) {
-        while self.buf.len() % 4 != 0 {
+        while !self.buf.len().is_multiple_of(4) {
             self.buf.push(0);
         }
     }

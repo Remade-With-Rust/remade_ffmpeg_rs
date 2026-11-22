@@ -617,7 +617,7 @@ impl Profile {
 
     // ---------------------------------------------------------- constructors
 
-    fn blank(class: ProfileClass, color_space: ColorSpace, pcs: ColorSpace) -> Self {
+    pub(crate) fn blank(class: ProfileClass, color_space: ColorSpace, pcs: ColorSpace) -> Self {
         Self {
             header: Header {
                 cmm: [0; 4],

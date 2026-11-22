@@ -5,11 +5,12 @@
 //! are comparable with it.
 
 use crate::color::{
-    lab_to_xyz, mat_inv, mat_mul, mat_vec, xyz_to_lab, Lab, Mat3, Xyz, D50, IDENTITY,
+    lab_to_xyz, mat_inv, mat_mul, mat_vec, xyz_to_lab, xyz_to_lab_in_line, Lab, Mat3, Xyz, D50,
+    IDENTITY,
 };
 use crate::curve::{clamp01, Curve, FwdSeg, InvCurve, InvSeg, Sampled};
 use crate::error::{Error, Result};
-use crate::lut::{make_trilinear, ClutEval, FixedClut, Lut, Stage};
+use crate::lut::{make_trilinear, Clut3Ref, ClutEval, FixedClut, Lut, Stage};
 use crate::profile::{ColorSpace, Profile, ProfileClass};
 use crate::transform::Intent;
 
@@ -25,6 +26,31 @@ const LAB_V2_TO_V4: f64 = 65535.0 / 65280.0;
 pub(crate) enum Pcs {
     Xyz,
     Lab,
+}
+
+/// The `f32` value of every 8-bit sample, `f32::from(k) / 255.0` (how float
+/// pixels decoded from 8-bit data arrive).
+pub(crate) static U8_POINTS: [f32; 256] = {
+    let mut t = [0.0f32; 256];
+    let mut k = 0;
+    while k < 256 {
+        t[k] = k as f32 / 255.0;
+        k += 1;
+    }
+    t
+};
+
+/// The 8-bit sample whose [`U8_POINTS`] value `x` is, if it is one.
+#[inline(always)]
+pub(crate) fn u8_point(x: f32) -> Option<usize> {
+    // `x * 255` lands within an ulp of `k` for the point of `k`, so the
+    // rounded value is the only candidate; the bit comparison settles it
+    // (and rejects `-0.0`, NaN and everything between the points).
+    let k = (x * 255.0 + 0.5) as i32 as usize;
+    match U8_POINTS.get(k) {
+        Some(p) if p.to_bits() == x.to_bits() => Some(k),
+        _ => None,
+    }
 }
 
 /// One pipeline operation over up to 16 channels.
@@ -830,9 +856,145 @@ impl SegChain {
             let r = mat_vec(m, v);
             v = [r[0] + off[0], r[1] + off[1], r[2] + off[2]];
         }
-        let v = v.map(clamp01);
+        // No clamp of `v` here, though the chain clamps before its inverse
+        // curves: every inverse evaluation clamps its input first, and the
+        // clamp is idempotent (NaN to 0, -0.0 kept), so a second one is the
+        // first's value.
         let [i0, i1, i2] = &self.inverse;
         [i0.eval(v[0]), i1.eval(v[1]), i2.eval(v[2])]
+    }
+
+    /// The device curves of one colour: the values [`SegChain::eval`]
+    /// starts from.
+    #[inline(always)]
+    pub(crate) fn curves(&self, x: [f64; 3]) -> [f64; 3] {
+        let [c0, c1, c2] = &self.curves;
+        [c0.eval(x[0]), c1.eval(x[1]), c2.eval(x[2])]
+    }
+
+    /// [`SegChain::eval`] after the device curves: `v` holds the values
+    /// they give for the colour.
+    #[inline(always)]
+    pub(crate) fn rest(&self, mut v: [f64; 3]) -> [f64; 3] {
+        for (m, off) in &self.affines[..self.maps] {
+            let r = mat_vec(m, v);
+            v = [r[0] + off[0], r[1] + off[1], r[2] + off[2]];
+        }
+        // No clamp of `v` here, though the chain clamps before its inverse
+        // curves: every inverse evaluation clamps its input first, and the
+        // clamp is idempotent (NaN to 0, -0.0 kept), so a second one is the
+        // first's value.
+        let [i0, i1, i2] = &self.inverse;
+        [i0.eval(v[0]), i1.eval(v[1]), i2.eval(v[2])]
+    }
+}
+
+/// A chain from an RGB matrix/TRC profile into a Lab-PCS LUT output profile
+/// (sRGB to a CMYK printer: the common float CMYK row), viewed for a
+/// straight-line evaluation per colour: the operations [`run`] performs for
+/// the ops it borrows, in the same order (so every result is the same),
+/// without the per-op dispatch, the stage calls, the 128-byte copy of the
+/// colour array per CLUT lookup and the tests on the CLUT's shape. The ops
+/// are: three function-3 curves, one or two XYZ affine maps, the Lab
+/// encoding (with the legacy 16-bit scale, if any), the LUT's input tables,
+/// its CLUT (three inputs, `N` outputs, trilinear as every Lab-indexed
+/// output CLUT is), its output tables and the final clamp.
+pub(crate) struct LutOutChain<'a, const N: usize> {
+    pub(crate) curves: &'a [FwdSeg; 3],
+    pub(crate) affines: [(Mat3, [f64; 3]); 2],
+    pub(crate) maps: usize,
+    /// Per map: `true` when it is a diagonal matrix with non-zero offsets
+    /// (black-point compensation), applied as three products and sums.
+    diagonal: [bool; 2],
+    /// The legacy 16-bit Lab scale, or 1 without one (both in `0..=1`).
+    pub(crate) lab_scale: Option<f64>,
+    pub(crate) pre: &'a [Sampled; 3],
+    pub(crate) clut: Clut3Ref<'a, N>,
+    pub(crate) post: &'a [Sampled; N],
+}
+
+/// Per-channel curves of a LUT stage as a chain holds them: sampled tables,
+/// or identities written as a power of 1 (the clamp they amount to).
+pub(crate) enum StageCurves<'a> {
+    Sampled(&'a [Sampled]),
+    Unit,
+}
+
+/// A chain from a Lab-PCS LUT input profile into an RGB matrix/TRC one
+/// (Coated FOGRA39 to sRGB: the other float CMYK row), viewed for the fast
+/// path: the LUT's input tables, its CLUT, its output tables, the Lab
+/// decoding (with the legacy 16-bit scale, if any), the XYZ affine maps, the
+/// clamp and the inverse device curves.
+pub(crate) struct LutInChain<'a> {
+    pub(crate) pre: StageCurves<'a>,
+    pub(crate) clut: &'a ClutEval,
+    pub(crate) post: StageCurves<'a>,
+    pub(crate) lab_scale: Option<f64>,
+    pub(crate) affines: [(Mat3, [f64; 3]); 2],
+    pub(crate) maps: usize,
+    pub(crate) inverse: &'a [InvSeg; 3],
+}
+
+impl<const N: usize> LutOutChain<'_, N> {
+    /// `true` when one of the maps runs as a diagonal (for the tests).
+    #[cfg(test)]
+    pub(crate) fn has_diagonal_map(&self) -> bool {
+        self.diagonal[..self.maps].contains(&true)
+    }
+
+    /// The device curves of one colour (`x` normalised, as the chain takes
+    /// it): the values the chain's first op gives.
+    #[inline(always)]
+    pub(crate) fn curves(&self, x: [f64; 3]) -> [f64; 3] {
+        let [c0, c1, c2] = self.curves;
+        [c0.eval(x[0]), c1.eval(x[1]), c2.eval(x[2])]
+    }
+
+    /// The rest of the chain on the values [`LutOutChain::curves`] gives,
+    /// into `out[..N]`: exactly what [`Chain::eval`] gives for the colour.
+    #[inline(always)]
+    pub(crate) fn rest(&self, mut v: [f64; 3], out: &mut [f64; 16]) {
+        for ((m, off), &diagonal) in self.affines[..self.maps].iter().zip(&self.diagonal) {
+            if diagonal {
+                // The full product's off-diagonal terms are `0 * v` = a zero
+                // of either sign for the finite values met here (curve
+                // outputs and their affine images), which leaves a non-zero
+                // sum unchanged; a zero sum, of either sign, then takes the
+                // non-zero offset as the result in both forms.
+                v = [
+                    m[0][0] * v[0] + off[0],
+                    m[1][1] * v[1] + off[1],
+                    m[2][2] * v[2] + off[2],
+                ];
+            } else {
+                let r = mat_vec(m, v);
+                v = [r[0] + off[0], r[1] + off[1], r[2] + off[2]];
+            }
+        }
+        let l = xyz_to_lab_in_line(Xyz::new(v[0], v[1], v[2]), D50);
+        let mut e = [
+            clamp01(l.l / 100.0),
+            clamp01((l.a + 128.0) / 255.0),
+            clamp01((l.b + 128.0) / 255.0),
+        ];
+        if let Some(k) = self.lab_scale {
+            for x in &mut e {
+                *x *= k;
+            }
+        }
+        // The tables' own clamp is left out: the clamped encoding times a
+        // scale in `0..=1` is already in `0..=1` (or -0.0), where it returns
+        // the value itself.
+        let [p0, p1, p2] = self.pre;
+        let e = [p0.eval_unit(e[0]), p1.eval_unit(e[1]), p2.eval_unit(e[2])];
+        self.clut.lookup::<true>(e, out);
+        // The chain's final clamp is left out: it never acts on what a
+        // sampled table gives (between two of its samples over 65535, so in
+        // `0..=1`, and never -0.0 since the samples are not), and the `N`
+        // tables cover every channel it clamps.
+        for (x, c) in out.iter_mut().zip(self.post) {
+            *x = c.eval(*x);
+        }
     }
 }
 
@@ -860,7 +1022,40 @@ impl ShaperChain<'_> {
             let r = mat_vec(m, v);
             v = [r[0] + off[0], r[1] + off[1], r[2] + off[2]];
         }
-        let v = v.map(clamp01);
+        // No clamp of `v` here, though the chain clamps before its inverse
+        // curves: every inverse evaluation clamps its input first, and the
+        // clamp is idempotent (NaN to 0, -0.0 kept), so a second one is the
+        // first's value.
+        match self.inverse {
+            Inverse::Break([i0, i1, i2]) => [i0.eval(v[0]), i1.eval(v[1]), i2.eval(v[2])],
+            Inverse::Plain([i0, i1, i2]) => [
+                i0.eval_inverse(v[0]),
+                i1.eval_inverse(v[1]),
+                i2.eval_inverse(v[2]),
+            ],
+        }
+    }
+
+    /// The device curves of one colour: the values [`ShaperChain::eval`]
+    /// starts from.
+    #[inline(always)]
+    pub(crate) fn curves(&self, x: [f64; 3]) -> [f64; 3] {
+        let [c0, c1, c2] = self.curves;
+        [c0.eval(x[0]), c1.eval(x[1]), c2.eval(x[2])]
+    }
+
+    /// [`ShaperChain::eval`] after the device curves: `v` holds the values
+    /// they give for the colour.
+    #[inline(always)]
+    pub(crate) fn rest(&self, mut v: [f64; 3]) -> [f64; 3] {
+        for (m, off) in &self.affines[..self.maps] {
+            let r = mat_vec(m, v);
+            v = [r[0] + off[0], r[1] + off[1], r[2] + off[2]];
+        }
+        // No clamp of `v` here, though the chain clamps before its inverse
+        // curves: every inverse evaluation clamps its input first, and the
+        // clamp is idempotent (NaN to 0, -0.0 kept), so a second one is the
+        // first's value.
         match self.inverse {
             Inverse::Break([i0, i1, i2]) => [i0.eval(v[0]), i1.eval(v[1]), i2.eval(v[2])],
             Inverse::Plain([i0, i1, i2]) => [
@@ -907,6 +1102,97 @@ impl Chain {
             affines,
             maps: mid.len(),
             inverse,
+        })
+    }
+
+    /// The chain as a [`LutOutChain`] of `N` outputs, when its ops have
+    /// exactly that shape. Worked out per call from the ops themselves, as
+    /// [`Chain::as_shaper`] is.
+    pub(crate) fn as_lut_out<const N: usize>(&self) -> Option<LutOutChain<'_, N>> {
+        if self.in_ch != 3 || self.out_ch != N {
+            return None;
+        }
+        let [Op::FwdSegs(curves), rest @ ..] = self.ops.as_slice() else {
+            return None;
+        };
+        let mut rest = rest;
+        let mut affines = [(IDENTITY, [0.0; 3]); 2];
+        let mut maps = 0;
+        while let [Op::Affine(m, off), tail @ ..] = rest {
+            *affines.get_mut(maps)? = (*m, *off);
+            maps += 1;
+            rest = tail;
+        }
+        let [Op::XyzToEncodedLab(lab_scale), Op::Sampled(pre), Op::Lut(Stage::Clut(clut)), Op::Sampled(post), Op::Clamp01] =
+            rest
+        else {
+            return None;
+        };
+        let clut = Clut3Ref::new(clut)?;
+        if maps == 0 || !clut.trilinear() || lab_scale.is_some_and(|k| !(0.0..=1.0).contains(&k)) {
+            return None;
+        }
+        let diagonal = affines.map(|(m, off)| {
+            let zero = |x: f64| x == 0.0;
+            [m[0][1], m[0][2], m[1][0], m[1][2], m[2][0], m[2][1]]
+                .into_iter()
+                .all(zero)
+                && off.iter().all(|&o| o != 0.0)
+                && m.iter().flatten().all(|x| x.is_finite())
+        });
+        Some(LutOutChain {
+            curves: curves.as_slice().try_into().ok()?,
+            affines,
+            maps,
+            diagonal,
+            lab_scale: *lab_scale,
+            pre: pre.as_slice().try_into().ok()?,
+            clut,
+            post: post.as_slice().try_into().ok()?,
+        })
+    }
+
+    /// The chain as a [`LutInChain`] (`in_ch` inputs into 3 outputs), when
+    /// its ops have exactly that shape.
+    pub(crate) fn as_lut_in(&self) -> Option<LutInChain<'_>> {
+        if self.out_ch != 3 {
+            return None;
+        }
+        fn curves(op: &Op, n: usize) -> Option<StageCurves<'_>> {
+            match op {
+                Op::Sampled(cs) if cs.len() == n => Some(StageCurves::Sampled(cs)),
+                Op::UnitCurves(k) if *k == n => Some(StageCurves::Unit),
+                _ => None,
+            }
+        }
+        let [pre, Op::Lut(Stage::Clut(clut)), post, Op::EncodedLabToXyz(lab_scale), rest @ ..] =
+            self.ops.as_slice()
+        else {
+            return None;
+        };
+        let (pre, post) = (curves(pre, self.in_ch)?, curves(post, 3)?);
+        let mut rest = rest;
+        let mut affines = [(IDENTITY, [0.0; 3]); 2];
+        let mut maps = 0;
+        while let [Op::Affine(m, off), tail @ ..] = rest {
+            *affines.get_mut(maps)? = (*m, *off);
+            maps += 1;
+            rest = tail;
+        }
+        let [Op::Clamp01, Op::InvSegs(inv)] = rest else {
+            return None;
+        };
+        if clut.outputs != 3 || clut.dims().len() != self.in_ch {
+            return None;
+        }
+        Some(LutInChain {
+            pre,
+            clut,
+            post,
+            lab_scale: *lab_scale,
+            affines,
+            maps,
+            inverse: inv.as_slice().try_into().ok()?,
         })
     }
 
@@ -974,6 +1260,42 @@ impl Chain {
     /// `in_ch`) and receives the result.
     pub(crate) fn eval_in_place(&self, v: &mut [f64; 16]) {
         run(&self.ops, v, self.in_ch);
+    }
+
+    /// When the chain starts with per-channel curves (the sRGB curves of a
+    /// matrix/TRC source, a LUT's input tables): the values they give at
+    /// the 256 points `f32::from(k) / 255.0`, one row per input channel, so
+    /// that float pixels widened from 8-bit values (where every sample is
+    /// such a point) look their first op up instead of evaluating it. Each
+    /// entry is [`run`] of that op on the point, so a lookup gives exactly
+    /// what the op gives. `None` for every other first op.
+    pub(crate) fn head_on_u8_points(&self) -> Option<Box<[[f64; 256]]>> {
+        let head = self.ops.first()?;
+        let per_channel = match head {
+            Op::FwdSegs(cs) => cs.len() == self.in_ch,
+            Op::Sampled(cs) => cs.len() == self.in_ch,
+            Op::Lut(Stage::Curves(cs)) => cs.len() == self.in_ch,
+            _ => false,
+        };
+        if !per_channel {
+            return None;
+        }
+        let mut rows = vec![[0.0f64; 256]; self.in_ch].into_boxed_slice();
+        for (k, x) in U8_POINTS.iter().enumerate() {
+            let mut v = [0.0f64; 16];
+            v[..self.in_ch].fill(f64::from(*x));
+            run(core::slice::from_ref(head), &mut v, self.in_ch);
+            for (row, y) in rows.iter_mut().zip(v) {
+                row[k] = y;
+            }
+        }
+        Some(rows)
+    }
+
+    /// The chain after its first op: with the values that op gives in `v`,
+    /// [`Chain::eval_in_place`] of the colour they came from.
+    pub(crate) fn eval_tail_in_place(&self, v: &mut [f64; 16]) {
+        run(self.ops.get(1..).unwrap_or(&[]), v, self.in_ch);
     }
 }
 

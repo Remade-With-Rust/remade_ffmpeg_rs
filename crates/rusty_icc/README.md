@@ -2,7 +2,10 @@
 
 Pure-Rust ICC colour management: parse and write ICC v2/v4 profiles and
 transform `u8`, `u16` and `f32` pixels between RGB, CMYK, grey and L\*a\*b\*.
-No C, no `unsafe`, no dependencies. The pipeline follows LittleCMS 2 (tag
+No C, no dependencies; `unsafe` lives only in one private module of x86-64
+AVX2 kernels, each with a scalar twin that is its test oracle and the path on
+every other CPU and target (the public API is safe, and the kernels match
+the scalar code bit for bit). The pipeline follows LittleCMS 2 (tag
 selection, legacy `lut16` Lab encoding, absolute-colorimetric scaling,
 black-point detection and compensation, proofing chains) so results are
 comparable with it.
@@ -468,6 +471,40 @@ let bytes = Profile::new_rec2020().encode();
 `rusty_icc::GamutCheck` flags colours a proof round trip moves by more than
 a CIEDE2000 threshold.
 
+### Fast `f32` precision
+
+`f32` pixels go through the exact pipeline by default. Opt in to table-based
+`f32` arithmetic, as fast colour engines use, with
+`Transform::with_precision(Precision::Fast)` (integer pixels are exact either
+way):
+
+```rust
+use rusty_icc::{Intent, Layout, Options, Precision, Profile, Transform};
+
+let t = Transform::new(
+    &Profile::new_srgb(), Layout::Rgb,
+    &Profile::new_display_p3(), Layout::Rgb,
+    Intent::RelativeColorimetric, Options::default(),
+)?
+.with_precision(Precision::Fast);
+```
+
+What it covers and how far it may be from the exact path (measured; see
+`tests/fast_precision.rs` and the crate's unit tests):
+
+- matrix/TRC RGB to matrix/TRC RGB: within 1e-5 per channel (worst measured
+  2.3e-6 over all 2^24 8-bit colours and a 257^3 lattice), output clamped to
+  `0..=1` as the exact path's is;
+- matrix/TRC RGB into a Lab-PCS LUT output profile and a Lab-PCS LUT input
+  profile into matrix/TRC RGB (float CMYK both ways): within CIEDE2000 0.001
+  on Coated FOGRA39 (budget 1.0 worst, 0.1 mean);
+- everything else keeps the exact path, as do matrix-shaper pairs whose
+  output curve is a pure power law (Adobe RGB, ProPhoto).
+
+The result is deterministic: the same `f32` operations in the same order with
+or without SIMD and on every target (a matrix-shaper pixel whose linear value
+lands within 4e-6 of an output curve's segment break takes the exact path).
+
 ## Scope
 
 Implemented: v2/v4 parsing (header, tag table, `XYZ`, `curv`, `para` 0-4,
@@ -482,7 +519,9 @@ Not implemented: device-link and named-colour profiles, `D2Bx`/`B2Dx`
 (`multiProcessElementType`) tags (an `A2Bx` of that type is an error),
 iccMAX (v5), XYZ as a pixel layout, more than 4 device channels, BGR/planar
 layouts, mixed input/output sample types, adaptation states other than full,
-use of the `gamt` tag, and any SIMD. API notes against the issue's sketch:
+use of the `gamt` tag, and SIMD beyond the x86-64 AVX2 kernels (the 8- and
+16-bit matrix-shaper loop and the fast `f32` paths; aarch64 and wasm32 run
+the scalar code). API notes against the issue's sketch:
 `new_proofing` also takes the two layouts and `Options`, and gamut checking
 is a separate `GamutCheck` returning a per-pixel mask rather than an alarm
 colour.

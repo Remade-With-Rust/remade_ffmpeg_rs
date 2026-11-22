@@ -10,6 +10,9 @@
 //!
 //! `.aus` carries streams ADTS cannot (ER AAC-LD/ELD, ...): `u32le` ASC length,
 //! the `AudioSpecificConfig`, then `u32le` length + access unit until EOF.
+//!
+//! It also prints `total <ms> ms`, the wall time of the decode alone (files are
+//! read before the clock starts), for `tools/bench/pinab.py`.
 
 use rusty_aac::{parse_adts, AacDecoder};
 
@@ -25,9 +28,16 @@ fn main() {
             sum = (sum ^ u64::from(v.to_bits())).wrapping_mul(0x100_0000_01b3);
         }
     };
-    for f in std::env::args().skip(1) {
-        let data = std::fs::read(&f).expect("read aac");
-        if std::path::Path::new(&f)
+    let files: Vec<(String, Vec<u8>)> = std::env::args()
+        .skip(1)
+        .map(|f| {
+            let data = std::fs::read(&f).expect("read aac");
+            (f, data)
+        })
+        .collect();
+    let t0 = std::time::Instant::now();
+    for (f, data) in &files {
+        if std::path::Path::new(f)
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("aus"))
         {
@@ -60,5 +70,7 @@ fn main() {
             pos += len;
         }
     }
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
     println!("anchors frames {frames} samples {samples} checksum {sum:016x}");
+    println!("total {ms:.3} ms");
 }
