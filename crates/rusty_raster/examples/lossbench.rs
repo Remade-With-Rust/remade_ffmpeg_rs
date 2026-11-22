@@ -30,6 +30,8 @@ type Workload = (&'static str, fn() -> Out);
 
 const W: u32 = 1024;
 const H: u32 = 768;
+/// Icons per `icon_*` workload.
+const ICONS: usize = 500;
 
 struct Rng(u64);
 
@@ -529,6 +531,77 @@ macro_rules! scenes {
                 hot_timed_full(hot_fh_star)
             }
 
+            /// A small curved shape for a 64x64 icon (SolidCraft's opaque
+            /// icon row): cubics and a quad, no straight edge.
+            fn icon_blob() -> Path {
+                let mut pb = PathBuilder::new();
+                pb.move_to(32.0, 6.5);
+                pb.cubic_to(48.0, 6.5, 57.5, 18.0, 57.5, 32.0);
+                pb.cubic_to(57.5, 46.0, 47.0, 57.0, 32.0, 57.0);
+                pb.quad_to(12.0, 56.0, 7.5, 33.0);
+                pb.cubic_to(8.0, 16.0, 18.0, 6.5, 32.0, 6.5);
+                pb.close();
+                pb.finish().unwrap()
+            }
+
+            /// `ICONS` fresh 64x64 pixmaps, each with one anti-aliased
+            /// solid fill of the blob at a sub-pixel offset; all of them are
+            /// returned.
+            #[inline(never)]
+            fn hot_icons(path: &Path, paint: &Paint, out: &mut Vec<u8>) {
+                for i in 0..super::ICONS {
+                    let mut pm = Pixmap::new(64, 64).unwrap();
+                    let t =
+                        Transform::from_translate((i % 7) as f32 * 0.125, (i % 5) as f32 * 0.25);
+                    pm.fill_path(path, paint, FillRule::Winding, t, None);
+                    out.extend_from_slice(pm.data());
+                }
+            }
+
+            fn icons(alpha: u8) -> Out {
+                let path = icon_blob();
+                let mut paint = Paint::default();
+                paint.set_color_rgba8(40, 120, 200, alpha);
+                let mut out = Vec::with_capacity(super::ICONS * 64 * 64 * 4);
+                let t = Instant::now();
+                hot_icons(&path, &paint, &mut out);
+                (out, t.elapsed())
+            }
+
+            /// SolidCraft's opaque 64x64 icon fill.
+            pub fn icon_opaque() -> Out {
+                icons(255)
+            }
+
+            /// The same icons at alpha 140.
+            pub fn icon_a140() -> Out {
+                icons(140)
+            }
+
+            /// CADCraft's empty layout: `Pixmap::new(1600, 1200)` and one
+            /// `fill` with its dark paper colour (four different bytes).
+            #[inline(never)]
+            fn hot_empty_layout(rgba: [u8; 4]) -> Pixmap {
+                let mut pm = Pixmap::new(1600, 1200).unwrap();
+                pm.fill(Color::from_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]));
+                pm
+            }
+
+            pub fn empty_paper() -> Out {
+                let t = Instant::now();
+                let pm = hot_empty_layout([33, 40, 48, 255]);
+                let d = t.elapsed();
+                (pm.data().to_vec(), d)
+            }
+
+            /// The same with a uniform colour (white: four equal bytes).
+            pub fn empty_white() -> Out {
+                let t = Instant::now();
+                let pm = hot_empty_layout([255, 255, 255, 255]);
+                let d = t.elapsed();
+                (pm.data().to_vec(), d)
+            }
+
             /// Downstream `grad_radial`: two-point conical, r0 in [0, 8),
             /// offset centres.
             pub fn fh_conical() -> Out {
@@ -576,6 +649,10 @@ workloads!(
     fh_star,
     fhx_nearest,
     fhx_star,
+    icon_opaque,
+    icon_a140,
+    empty_paper,
+    empty_white,
 );
 
 fn anchor(name: &str, bytes: &[u8]) {
