@@ -6,6 +6,21 @@ each release, under **Security**. The project follows
 decoder output is stable (gated against the ISO/IEC 14496-26 conformance suite);
 encoder output may change in minor releases when quality improves.
 
+## [2.1.3](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_aac-v2.1.2...rusty_aac-v2.1.3) - 2026-11-22
+
+### Other
+
+- move the 2.2 low-rate knobs into AacTuning (semver-compatible)
+- aac encoder: section trellis prices books with #189's one-walk BandCost
+- Merge remote-tracking branch 'origin/main' into feat/aac-lowrate-quality
+- aac encoder: clippy -D warnings clean (section trellis, bandwidth docs)
+- aac encoder: enable the low-rate tools by default
+- aac encoder: mask SMR as a setting (default 18 dB, unchanged)
+- aac encoder: frame-demand bit allocation within reservoir segments (switch, default off)
+- aac encoder: coding bandwidth policy (switch, default off)
+- aac encoder: high-passed transient detector (switch, default off)
+- aac encoder: section trellis for codebook selection (switch, default off)
+
 ## [2.1.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_aac-v2.1.1...rusty_aac-v2.1.2) - 2026-11-21
 
 ### Fixed

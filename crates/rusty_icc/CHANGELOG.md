@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_icc-v0.1.4...rusty_icc-v0.1.5) - 2026-11-22
+
+### Added
+
+- *(rusty_icc)* fast f32 path for LUT chains (float CMYK both ways)
+- *(rusty_icc)* opt-in fast f32 precision, matrix-shaper path (tables + AVX2)
+
+### Other
+
+- *(rusty_icc)* test the grid kernel's shape before the grid in grid_fixed
+- Merge remote-tracking branch 'origin/main' into perf/icc-u16-cmyk
+- Merge pull request #190 from Remade-With-Rust/perf/icc-moxcms-parity
+- *(rusty_icc)* document Precision::Fast; correct the unsafe and SIMD claims
+- *(rusty_icc)* AVX2 matrix-shaper kernels for 8- and 16-bit RGB, bit-identical
+
 ## [0.1.4](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_icc-v0.1.3...rusty_icc-v0.1.4) - 2026-11-22
 
 ### Other
