@@ -7,7 +7,7 @@ use crate::curve::InvCurve;
 use crate::error::{Error, Result};
 use crate::lut::{ClutEval, FixedClut};
 use crate::pipeline::{
-    build_chain, u8_point, Chain, GamutChain, LutOutChain, ShaperChain, ShaperLink,
+    build_chain, u8_point, Chain, GamutChain, LutOutChain, SegChain, ShaperChain, ShaperLink,
 };
 use crate::profile::{ColorSpace, Profile};
 
@@ -652,10 +652,6 @@ impl Transform {
                 if let Some(s) = T::f32s(src) {
                     if let Some(d) = T::f32s_mut(dst) {
                         let alpha = (src_alpha, dst_alpha);
-                        if let Some(f) = self.chain.as_shaper() {
-                            run_shaper_f32(&f, s, d, (sc, dc), alpha);
-                            return Ok(());
-                        }
                         let head = if !src_lab && mostly_u8_points(s, sc, in_ch) {
                             self.u8_head
                                 .get_or_init(|| self.chain.head_on_u8_points())
@@ -663,6 +659,22 @@ impl Transform {
                         } else {
                             None
                         };
+                        if let Some(f) = self.chain.as_shaper() {
+                            match head {
+                                Some([r0, r1, r2, ..]) => {
+                                    run_shaper_f32_u8_points(
+                                        &f,
+                                        [r0, r1, r2],
+                                        s,
+                                        d,
+                                        (sc, dc),
+                                        alpha,
+                                    );
+                                }
+                                _ => run_shaper_f32(&f, s, d, (sc, dc), alpha),
+                            }
+                            return Ok(());
+                        }
                         if let Some(l) = self.chain.as_lut_out::<4>() {
                             run_lut_out_f32(&l, head, s, d, (sc, dc), alpha);
                         } else if let Some(l) = self.chain.as_lut_out::<3>() {
@@ -801,6 +813,74 @@ fn run_segments_f32(
         }
     }
     true
+}
+
+/// [`run_shaper_f32`] when the device curves of every sample that is an
+/// 8-bit point come from `rows` ([`Chain::head_on_u8_points`]); any other
+/// sample is evaluated (the same value either way). One loop per kind of
+/// chain, each in its own frame, so the pixel loops keep their code.
+fn run_shaper_f32_u8_points(
+    f: &ShaperChain<'_>,
+    rows: [&[f64; 256]; 3],
+    src: &[f32],
+    dst: &mut [f32],
+    sc_dc: (usize, usize),
+    alpha: (bool, bool),
+) {
+    match f.segments() {
+        Some(seg) => run_segments_f32_u8_points(&seg, rows, src, dst, sc_dc, alpha),
+        None => run_curves_f32_u8_points(f, rows, src, dst, sc_dc, alpha),
+    }
+}
+
+/// [`run_shaper_f32_u8_points`] for a [`SegChain`].
+#[inline(never)]
+fn run_segments_f32_u8_points(
+    seg: &SegChain,
+    rows: [&[f64; 256]; 3],
+    src: &[f32],
+    dst: &mut [f32],
+    (sc, dc): (usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+) {
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        let v = match (u8_point(sp[0]), u8_point(sp[1]), u8_point(sp[2])) {
+            (Some(a), Some(b), Some(c)) => [rows[0][a], rows[1][b], rows[2][c]],
+            _ => seg.curves([f64::from(sp[0]), f64::from(sp[1]), f64::from(sp[2])]),
+        };
+        let out = seg.rest(v);
+        dp[0] = out[0] as f32;
+        dp[1] = out[1] as f32;
+        dp[2] = out[2] as f32;
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { 1.0 };
+        }
+    }
+}
+
+/// [`run_shaper_f32_u8_points`] for any other [`ShaperChain`].
+#[inline(never)]
+fn run_curves_f32_u8_points(
+    f: &ShaperChain<'_>,
+    rows: [&[f64; 256]; 3],
+    src: &[f32],
+    dst: &mut [f32],
+    (sc, dc): (usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+) {
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        let v = match (u8_point(sp[0]), u8_point(sp[1]), u8_point(sp[2])) {
+            (Some(a), Some(b), Some(c)) => [rows[0][a], rows[1][b], rows[2][c]],
+            _ => f.curves([f64::from(sp[0]), f64::from(sp[1]), f64::from(sp[2])]),
+        };
+        let out = f.rest(v);
+        dp[0] = out[0] as f32;
+        dp[1] = out[1] as f32;
+        dp[2] = out[2] as f32;
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { 1.0 };
+        }
+    }
 }
 
 /// `f32` pixels through a [`LutOutChain`], one loop per output count; with
@@ -1504,6 +1584,17 @@ mod tests {
         let v4 =
             Profile::new_from_slice(include_bytes!("../tests/data/sRGB_v4_ICC_preference.icc"))
                 .unwrap();
+        let p3 = Profile::new_display_p3();
+        let g22 = Profile::new_rgb(
+            crate::color::D65_XY,
+            [
+                crate::color::Xy::new(0.64, 0.33),
+                crate::color::Xy::new(0.3, 0.6),
+                crate::color::Xy::new(0.15, 0.06),
+            ],
+            crate::Curve::gamma(2.2),
+        )
+        .unwrap();
         let lut4 = test_lut_profile(crate::ColorSpace::Cmyk, 4, 0x0430_0000, (4096, 2), true);
         let lut3 = test_lut_profile(crate::ColorSpace::Rgb, 3, 0x0210_0000, (256, 256), false);
         let odd = [0.3f32, -0.25, f32::NAN, 1.25, -0.0, 0.5];
@@ -1518,6 +1609,9 @@ mod tests {
             (&srgb, Layout::Rgb, &lut4, Layout::Cmyk),
             (&srgb, Layout::Rgba, &lut4, Layout::Cmyka),
             (&srgb, Layout::Rgb, &lut3, Layout::Rgb),
+            (&srgb, Layout::Rgb, &p3, Layout::Rgb),
+            (&srgb, Layout::Rgba, &g22, Layout::Rgba),
+            (&g22, Layout::Rgb, &srgb, Layout::Rgb),
         ] {
             for intent in [Intent::Perceptual, Intent::RelativeColorimetric] {
                 // (The micro test profiles lack some intents' tables.)
@@ -1568,7 +1662,7 @@ mod tests {
                 }
             }
         }
-        assert!(ran >= 14 && tabled >= 12, "{ran} {tabled}");
+        assert!(ran >= 20 && tabled >= 18, "{ran} {tabled}");
     }
 
     #[test]

@@ -860,6 +860,27 @@ impl SegChain {
         let [i0, i1, i2] = &self.inverse;
         [i0.eval(v[0]), i1.eval(v[1]), i2.eval(v[2])]
     }
+
+    /// The device curves of one colour: the values [`SegChain::eval`]
+    /// starts from.
+    #[inline(always)]
+    pub(crate) fn curves(&self, x: [f64; 3]) -> [f64; 3] {
+        let [c0, c1, c2] = &self.curves;
+        [c0.eval(x[0]), c1.eval(x[1]), c2.eval(x[2])]
+    }
+
+    /// [`SegChain::eval`] after the device curves: `v` holds the values
+    /// they give for the colour.
+    #[inline(always)]
+    pub(crate) fn rest(&self, mut v: [f64; 3]) -> [f64; 3] {
+        for (m, off) in &self.affines[..self.maps] {
+            let r = mat_vec(m, v);
+            v = [r[0] + off[0], r[1] + off[1], r[2] + off[2]];
+        }
+        let v = v.map(clamp01);
+        let [i0, i1, i2] = &self.inverse;
+        [i0.eval(v[0]), i1.eval(v[1]), i2.eval(v[2])]
+    }
 }
 
 /// A chain from an RGB matrix/TRC profile into a Lab-PCS LUT output profile
@@ -969,6 +990,33 @@ impl ShaperChain<'_> {
     pub(crate) fn eval(&self, x: [f64; 3]) -> [f64; 3] {
         let [c0, c1, c2] = self.curves;
         let mut v = [c0.eval(x[0]), c1.eval(x[1]), c2.eval(x[2])];
+        for (m, off) in &self.affines[..self.maps] {
+            let r = mat_vec(m, v);
+            v = [r[0] + off[0], r[1] + off[1], r[2] + off[2]];
+        }
+        let v = v.map(clamp01);
+        match self.inverse {
+            Inverse::Break([i0, i1, i2]) => [i0.eval(v[0]), i1.eval(v[1]), i2.eval(v[2])],
+            Inverse::Plain([i0, i1, i2]) => [
+                i0.eval_inverse(v[0]),
+                i1.eval_inverse(v[1]),
+                i2.eval_inverse(v[2]),
+            ],
+        }
+    }
+
+    /// The device curves of one colour: the values [`ShaperChain::eval`]
+    /// starts from.
+    #[inline(always)]
+    pub(crate) fn curves(&self, x: [f64; 3]) -> [f64; 3] {
+        let [c0, c1, c2] = self.curves;
+        [c0.eval(x[0]), c1.eval(x[1]), c2.eval(x[2])]
+    }
+
+    /// [`ShaperChain::eval`] after the device curves: `v` holds the values
+    /// they give for the colour.
+    #[inline(always)]
+    pub(crate) fn rest(&self, mut v: [f64; 3]) -> [f64; 3] {
         for (m, off) in &self.affines[..self.maps] {
             let r = mat_vec(m, v);
             v = [r[0] + off[0], r[1] + off[1], r[2] + off[2]];
