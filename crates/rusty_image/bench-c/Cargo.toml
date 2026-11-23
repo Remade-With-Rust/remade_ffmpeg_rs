@@ -11,7 +11,7 @@ publish = false
 
 [dependencies]
 rusty_image = { path = ".." }
-rusty_alloc-api = "=2.5.0"
+rusty_alloc-api = "2.6.0"
 image = { version = "0.25.10", default-features = false, features = ["bmp", "tga", "hdr", "ico", "pnm", "qoi"] }
 
 [build-dependencies]
