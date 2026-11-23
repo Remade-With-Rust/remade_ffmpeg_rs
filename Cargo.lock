@@ -5812,9 +5812,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_av1d"
-version = "1.2.1"
+version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5370b9948a7ce433aecc1de18e8f9953b7b9f1cfddbc775544434457ae5c3fbf"
+checksum = "9af56536f07b275509d08654be29737c2b4f911cf74dbaa35d68b662fe15b35f"
 dependencies = [
  "assert_matches",
  "atomig",
@@ -5834,9 +5834,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_av1e"
-version = "0.8.0"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "488d88f72f01647594311123cc1356953876237d06ec5354c7b004de450b9a40"
+checksum = "816fcdd6d806b704e4873ca594fc039c2160ae2f9865c360f54a9e089669c39e"
 dependencies = [
  "aligned-vec",
  "arbitrary",
@@ -5870,9 +5870,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_av2d"
-version = "0.2.13"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d22d70328494c17935eb0408bc9afef06890b6a9b4a23b414647b614ca02d9fa"
+checksum = "4d482aa78eaff99d341e4fe20c1cd6279ba515c3303ae218dc153075a71d1897"
 dependencies = [
  "assert_matches",
  "atomig",
@@ -5891,9 +5891,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_av2f"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d0759292494abff44394742849f17ebcde329ed647e140ba301442efba14641"
+checksum = "0c41a66390f96c0ee0bc0ee83a2bbef7990fd3144cb9d0e56f60396ac5f7fae7"
 
 [[package]]
 name = "rusty_flac"
@@ -5914,9 +5914,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_h264"
-version = "0.16.0"
+version = "0.17.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "acc4385b919216f3148223bf790f47611676d3a4084083c0535eaa2d29478da8"
+checksum = "ff02d92f6ec1c8ac81a08f8104e85b68c6a82e054e147f2839f43acd09c7f817"
 dependencies = [
  "rusty_h264-common",
  "rusty_h264-decoder",
@@ -5925,15 +5925,15 @@ dependencies = [
 
 [[package]]
 name = "rusty_h264-accel"
-version = "0.16.0"
+version = "0.17.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18110c8f692668ccf004393bee04e369d4f0f173dd0ea4b515080258e6f9c599"
+checksum = "eb1078d19652da485f4e2491e02ed9559e44f7427cb1f62cd82d63a66b1c740e"
 
 [[package]]
 name = "rusty_h264-common"
-version = "0.16.0"
+version = "0.17.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aaf982ae23ecf8f13015ec1c5576fe2935f4e4296b097ebc4233b5872623af2a"
+checksum = "cdde0fe62dd8d912ae1cb4a507df37d487c7d3f09c00225688516f2d577e2af1"
 dependencies = [
  "bytemuck",
  "once_cell",
@@ -5944,18 +5944,18 @@ dependencies = [
 
 [[package]]
 name = "rusty_h264-decoder"
-version = "0.16.0"
+version = "0.17.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0f4deb1a3a5e928cbaa1dff7db6bc46262c850aedeb75cb5aeab890494c18a5"
+checksum = "91d8f5c7d6bcc0fe2d91252d7c88059540e772abc8041717c9342ebf7c69c312"
 dependencies = [
  "rusty_h264-common",
 ]
 
 [[package]]
 name = "rusty_h264-encoder"
-version = "0.16.0"
+version = "0.17.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e037f6341a02f54021f7077735bd12e2fd61a749e1ee7248eee00466ef5fa4ba"
+checksum = "1ecf0018e5589cd8ddae29193166022970766c1382377eb2cbbc069b0c0335ca"
 dependencies = [
  "rusty_h264-accel",
  "rusty_h264-common",
@@ -5992,9 +5992,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_jpeg"
-version = "0.4.8"
+version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86c9670ba36e698633e33cab4d7d8ef5902a98adfb979efb6f5536fcfc14f598"
+checksum = "c2bef7c9990a884b694dfe2d7b6dba4b1c502862879783a2223d4437368e56ae"
 
 [[package]]
 name = "rusty_json_turbo"
@@ -6097,9 +6097,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_xml"
-version = "0.10.2"
+version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9696d48f8bc079e4535e9ad0a0784d0dc0a118ce79007c8d815d7dcb3675ba3"
+checksum = "7bb630b333cf9e9b8651721480d189c480cd5ada556d76b1d23573cf33d34e10"
 dependencies = [
  "rusty_xml-parser",
  "rusty_xml-reader",
@@ -6112,9 +6112,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_xml-parser"
-version = "0.10.2"
+version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f2d459bb9a389182faa7704ce5838fc4bf293091707a4b9be43b45d0d2dcf9b"
+checksum = "c783519ea7a90141d44dc8b9ea93a7b96b26ae524ffa0c7e0f6a4a8d8aea4164"
 dependencies = [
  "rusty_xml-sax",
  "rusty_xml-tree",
@@ -6122,9 +6122,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_xml-reader"
-version = "0.10.2"
+version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8757e5ba14573e8dd0d75331faaaffe179e10b77682d398bf2251b27caadb175"
+checksum = "a958fc88aba53a88944d6af3525e7d6bf3e3b8d096d6f5f8cd9fedd306eb2347"
 dependencies = [
  "rusty_xml-parser",
  "rusty_xml-tree",
@@ -6132,24 +6132,24 @@ dependencies = [
 
 [[package]]
 name = "rusty_xml-sax"
-version = "0.10.2"
+version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52f275fe29464842fe0d8a694942c37e055e3880126827f679c49b8134296564"
+checksum = "7919b6798f51c4dcce5630d563dab40f0cc8762b143d2a614340dd33d5f7df43"
 
 [[package]]
 name = "rusty_xml-tree"
-version = "0.10.2"
+version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5826a51fff3c94206ca6894b3e8574f67cabde6ff458fd6bdf499aa1b0ee5d44"
+checksum = "23ee0a1b3118a863a2e1ac424774042da8e750aaac5303e59a3fd8a0aaaa013d"
 dependencies = [
  "compact_str",
 ]
 
 [[package]]
 name = "rusty_xml-valid"
-version = "0.10.2"
+version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43e6313cda8ea229e5506b17f12a3b9823db7e4127e742561c2fb7930f0d4eee"
+checksum = "1a7b7d3dedd16a3987157c14e9dabd85cc8c4326d0fc761199a0e99c951647cf"
 dependencies = [
  "rusty_xml-parser",
  "rusty_xml-tree",
@@ -6158,18 +6158,18 @@ dependencies = [
 
 [[package]]
 name = "rusty_xml-writer"
-version = "0.10.2"
+version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a025e7fb696d8611c597e0fd82013d814ef65c3117569d05d6fd1e32d2d58ae"
+checksum = "02d2c3287748e01d38348007bbd3c36b1d7ae245981efe66b6698ee0d5908fbc"
 dependencies = [
  "rusty_xml-tree",
 ]
 
 [[package]]
 name = "rusty_xml-xpath"
-version = "0.10.2"
+version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abb7f386bd17d22f18165ce898d5d0dae8c67c4c920945cc423611857721907c"
+checksum = "8eaff86947895a287988a27a17935c0c0c59cc53c7c921ce73a00ee219c4d164"
 dependencies = [
  "rusty_xml-tree",
 ]

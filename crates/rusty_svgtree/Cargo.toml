@@ -24,7 +24,7 @@ raster-images = ["dep:rusty_png", "dep:rusty_jpeg"]
 
 [dependencies]
 rusty_raster.workspace = true
-rusty_xml = "0.10.2"
+rusty_xml = "0.10.6"
 rusty_png = { workspace = true, optional = true }
 rusty_jpeg = { workspace = true, optional = true }
 
