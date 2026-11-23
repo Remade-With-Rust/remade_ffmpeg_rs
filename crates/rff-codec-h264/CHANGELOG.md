@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.23](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-h264-v0.3.22...rff-codec-h264-v0.3.23) - 2026-11-23
+
+### Other
+
+- bump rusty_alloc-api to 2.6.0 ([#204](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/204))
+
 ## [0.3.22](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-h264-v0.3.21...rff-codec-h264-v0.3.22) - 2026-11-22
 
 ### Other

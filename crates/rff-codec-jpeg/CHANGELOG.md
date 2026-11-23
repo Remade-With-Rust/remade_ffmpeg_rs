@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.4](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-jpeg-v0.8.3...rff-codec-jpeg-v0.8.4) - 2026-11-23
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.7.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-jpeg-v0.6.3...rff-codec-jpeg-v0.7.0) - 2026-11-21
 
 ### Fixed

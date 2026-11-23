@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_tiff-v0.1.7...rusty_tiff-v0.1.8) - 2026-11-23
+
+### Other
+
+- bump rusty_alloc-api to 2.6.0 ([#204](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/204))
+
 ## [0.1.7](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_tiff-v0.1.6...rusty_tiff-v0.1.7) - 2026-11-22
 
 ### Other
