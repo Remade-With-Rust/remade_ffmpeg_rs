@@ -35,7 +35,7 @@ bytemuck = "1"
 # image per strip (1024 one-row strips of a 1536x1024 RGB image: 101 ms
 # against 26 ms to inflate them; the `tiff` crate took 30 ms).
 flate2 = { version = "1.1.11", default-features = false, features = ["zlib-rs"] }
-rusty_jpeg = { version = "0.4.8", optional = true }
+rusty_jpeg = { version = "0.4.12", optional = true }
 
 [dev-dependencies]
 # Bench/example roots only (project convention, see CLAUDE.md): every
