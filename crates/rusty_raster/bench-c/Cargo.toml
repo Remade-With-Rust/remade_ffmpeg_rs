@@ -14,7 +14,7 @@ rusty_raster = { path = "..", default-features = false }
 rusty_svgtree = { path = "../../rusty_svgtree" }
 tiny-skia = "0.12.0"
 resvg = { version = "0.48.1", default-features = false, features = ["raster-images"] }
-rusty_alloc-api = "2.6.0"
+rusty_alloc-api = "2.6.0"
 
 [build-dependencies]
 cc = "1"

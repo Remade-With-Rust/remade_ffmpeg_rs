@@ -13,7 +13,7 @@ description = "rusty_tiff vs libtiff: corpus comparison and side-by-side speed (
 rusty_tiff = { path = ".." }
 # Same pin as the remade_ffmpeg_rs workspace: the Rust arm runs under the
 # allocator that ships (CLAUDE.md).
-rusty_alloc-api = "2.6.0"
+rusty_alloc-api = "2.6.0"
 
 # The workspace's shipping profile.
 [profile.release]
