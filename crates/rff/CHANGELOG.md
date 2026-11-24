@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.9.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/remade-ffmpeg-v0.8.4...remade-ffmpeg-v0.9.0) - 2026-11-24
 
+### Changed (breaking)
+
+- `OutputSpec` gains `pixel_format` (`-pix_fmt`) and `TranscodeReport` gains `warnings`. Code that builds either with `..Default::default()` is unaffected; a struct literal naming every field needs the new field added.
+
 ### Fixed
 
 - signal full colour range in AVIF/VP9/H.264; setrange at every bit depth (#213, #214)
