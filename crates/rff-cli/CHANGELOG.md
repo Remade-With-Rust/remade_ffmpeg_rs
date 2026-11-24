@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.16](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-cli-v0.4.15...rff-cli-v0.4.16) - 2026-11-24
+
+### Fixed
+
+- signal full colour range in AVIF/VP9/H.264; setrange at every bit depth (#213, #214)
+- *(cli)* convert RGB to the encoder's pixel format automatically; honour -pix_fmt ([#179](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/179))
+
 ## [0.4.15](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-cli-v0.4.14...rff-cli-v0.4.15) - 2026-11-23
 
 ### Other

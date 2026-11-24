@@ -6,6 +6,12 @@ each release, under **Security**. The project follows
 decoder output is stable (gated against the ISO/IEC 14496-26 conformance suite);
 encoder output may change in minor releases when quality improves.
 
+## [2.1.6](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_aac-v2.1.5...rusty_aac-v2.1.6) - 2026-11-24
+
+### Other
+
+- Merge branch 'main' into fix/aac-irregular-window-transitions
+
 ## [2.1.5](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_aac-v2.1.4...rusty_aac-v2.1.5) - 2026-11-23
 
 ### Other
