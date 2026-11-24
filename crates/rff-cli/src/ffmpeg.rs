@@ -51,6 +51,9 @@ pub fn run(args: Vec<String>) -> ExitCode {
             }
             match rff::transcode::run(&engine, &spec) {
                 Ok(report) => {
+                    for warning in &report.warnings {
+                        eprintln!("[warning] {warning}");
+                    }
                     eprintln!(
                         "done — {} packet(s) written, {} frame(s) decoded",
                         report.packets_written, report.frames_decoded
@@ -97,6 +100,7 @@ fn print_help() {
     println!("  -profile P         encoder profile (h264: baseline|main|high)");
     println!("  -g N               keyframe interval in frames");
     println!("  -vf FILTERS        video filter graph (e.g. scale=640:480, crop=W:H:X:Y)");
+    println!("  -pix_fmt FMT       encoder pixel format (e.g. yuv420p, yuv444p, yuv420p10le)");
     println!("  -map SPEC          select streams: INPUT[:v|:a|:N] (repeatable)");
     println!("  -vn / -an / -sn    drop video / audio / subtitle streams from the output");
     println!("  -y / -n            overwrite / never overwrite the output");

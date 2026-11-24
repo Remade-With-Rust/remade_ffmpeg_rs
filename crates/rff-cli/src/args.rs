@@ -19,7 +19,7 @@
 use std::path::PathBuf;
 
 use rff::transcode::{InputSpec, MapSelector, MapSpec, OutputSpec, StreamCodec, TranscodeSpec};
-use rff_core::{CodecId, Dictionary, MediaType};
+use rff_core::{CodecId, Dictionary, MediaType, PixelFormat};
 
 /// Parse a `-map` value like `0`, `0:v`, `0:a`, or `0:2`.
 fn parse_map(spec: &str) -> Option<MapSpec> {
@@ -86,6 +86,9 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     let mut shared_opts = Dictionary::new();
     let mut max_video_frames: Option<u64> = None;
     let mut video_filters: Option<String> = None;
+    // `-pix_fmt`: the encoder's input pixel format (an output option, so it
+    // applies whether or not `-c:v` names the encoder).
+    let mut pixel_format: Option<PixelFormat> = None;
     let mut audio_filters: Option<String> = None;
     let mut filter_complex: Option<String> = None;
     let mut maps: Vec<MapSpec> = Vec::new();
@@ -224,6 +227,13 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
 
             // Video filter graph: -vf / -filter:v. Audio: -af / -filter:a.
             "vf" => video_filters = Some(take_value(args, &mut i, arg)?),
+            "pix_fmt" => {
+                let value = take_value(args, &mut i, arg)?;
+                pixel_format = Some(
+                    PixelFormat::from_name(&value)
+                        .ok_or_else(|| format!("Unknown pixel format requested: {value}."))?,
+                );
+            }
             "af" => audio_filters = Some(take_value(args, &mut i, arg)?),
             // Multi-input filter graph: -filter_complex / -lavfi.
             "filter_complex" | "lavfi" => filter_complex = Some(take_value(args, &mut i, arg)?),
@@ -487,6 +497,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         audio_filters,
         metadata,
         format_options,
+        pixel_format,
     });
 
     let spec = TranscodeSpec {
@@ -662,7 +673,26 @@ mod tests {
         assert_eq!(out.path, PathBuf::from("out.mp4"));
         assert_eq!(warnings.len(), 1);
         // Still consumes a value that is not the last argument.
-        let (out, _) = output(&["-i", "src.mp4", "-pix_fmt", "yuv420p", "out.mp4"]);
+        let (out, _) = output(&["-i", "src.mp4", "-tune", "film", "out.mp4"]);
         assert_eq!(out.path, PathBuf::from("out.mp4"));
+    }
+
+    /// `-pix_fmt` is an output option: parsed with or without `-c:v` (#179).
+    #[test]
+    fn pix_fmt_is_parsed_onto_the_output() {
+        let (out, warnings) = output(&["-i", "photo.png", "-pix_fmt", "yuv444p", "out.avif"]);
+        assert_eq!(out.path, PathBuf::from("out.avif"));
+        assert_eq!(out.pixel_format, Some(PixelFormat::Yuv444p));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (out, _) = output(&["-i", "a.png", "-pix_fmt:v", "yuv420p10le", "o.avif"]);
+        assert_eq!(out.pixel_format, Some(PixelFormat::Yuv420p10));
+        let (out, _) = output(&["-i", "a.png", "o.avif"]);
+        assert_eq!(out.pixel_format, None);
+        let args: Vec<String> = ["-i", "a.png", "-pix_fmt", "nv12x", "o.avif"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let err = parse(&args).err().expect("unknown pixel format must fail");
+        assert!(err.contains("nv12x"), "{err}");
     }
 }
