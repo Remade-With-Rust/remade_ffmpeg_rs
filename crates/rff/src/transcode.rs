@@ -120,12 +120,39 @@ fn decodes_to_rgb(codec: CodecId) -> bool {
 /// pick something, so pick it here, once, explicitly:
 /// full-range for codecs that are defined that way, limited-range otherwise
 /// (the video convention, and what an untagged y4m means).
+///
+/// Before the codec default, an untagged H.264 stream's own SPS is asked: its
+/// VUI carries `video_full_range_flag`, which is how a full-range stream in a
+/// container without colour metadata (FLV, a Matroska file without `Colour`)
+/// still round-trips.
 fn effective_color_range(stream: &Stream) -> ColorRange {
     match stream.color_range {
-        ColorRange::Unspecified if is_full_range_codec(stream.codec_id) => ColorRange::Full,
-        ColorRange::Unspecified => ColorRange::Limited,
+        ColorRange::Unspecified => match extradata_color_range(stream) {
+            Some(range) => range,
+            None if is_full_range_codec(stream.codec_id) => ColorRange::Full,
+            None => ColorRange::Limited,
+        },
         explicit => explicit,
     }
+}
+
+/// The range signalled by the codec configuration in a stream's extradata
+/// (the SPS of an H.264 `avcC` or Annex-B header), if it signals one.
+fn extradata_color_range(stream: &Stream) -> Option<ColorRange> {
+    let x = &stream.extradata;
+    let full = match stream.codec_id {
+        CodecId::H264 => {
+            let annexb = rff_format::avc::parse_avcc(x).map(|c| c.headers_annexb);
+            let headers = annexb.as_deref().unwrap_or(x);
+            rff_format::avc::sps_full_range(rff_format::avc::find_sps_annexb(headers)?)?
+        }
+        _ => return None,
+    };
+    Some(if full {
+        ColorRange::Full
+    } else {
+        ColorRange::Limited
+    })
 }
 
 /// One input file for a job.
@@ -405,6 +432,9 @@ struct TranscodeOp {
     resampler: Option<Resampler>,
     /// Pixel-format negotiation + conversion in front of the encoder.
     pixels: PixelConform,
+    /// Full → limited conversion for an encoder that cannot signal full
+    /// range (applied after `pixels`).
+    range_fix: Option<FilterChain>,
     /// Range of the frames reaching the encoder, for that conversion.
     source_range: ColorRange,
     /// Warnings raised mid-stream, handed to the report as they appear.
@@ -690,6 +720,11 @@ struct PixelConform {
     /// compressed video codecs; the full-range image codecs and raw video
     /// keep the source range.
     rgb_to_limited: bool,
+    /// The range committed for the output stream (what the muxer labels and
+    /// the encoder signals). An RGB → Y'CbCr conversion produces it, so a
+    /// source only discovered to be RGB at the first frame (a progressive
+    /// JPEG) still matches the label. `None`: decide by `rgb_to_limited`.
+    out_range: Option<ColorRange>,
     /// Source format the converter below was built for, the target it
     /// converts to, and the converter (`None` when they are equal).
     state: Option<(PixelFormat, PixelFormat, Option<FilterChain>)>,
@@ -706,6 +741,7 @@ impl PixelConform {
             requested,
             codec,
             rgb_to_limited: !is_full_range_codec(codec) && codec != CodecId::RawVideo,
+            out_range: None,
             state: None,
         }
     }
@@ -736,8 +772,11 @@ impl PixelConform {
                 // Pin the range: `spec.limited` describes the Y'CbCr side
                 // either way, and guessing it wrong is a silent several-dB
                 // error.
-                let limited = if self.rgb_to_limited && vf.format.is_rgb() && !target.is_rgb() {
-                    true
+                let limited = if vf.format.is_rgb() && !target.is_rgb() {
+                    match self.out_range {
+                        Some(range) => range != ColorRange::Full,
+                        None => self.rgb_to_limited || source_range == ColorRange::Limited,
+                    }
                 } else {
                     source_range == ColorRange::Limited
                 };
@@ -919,6 +958,10 @@ impl TranscodeOp {
         let frame = self
             .pixels
             .conform(self.source_range, frame, &mut self.warnings)?;
+        let frame = match (&mut self.range_fix, frame) {
+            (Some(chain), Frame::Video(vf)) => Frame::Video(chain.apply(vf)?),
+            (_, frame) => frame,
+        };
         Ok(Some(frame))
     }
 
@@ -1399,7 +1442,7 @@ fn build_op(
             // A colour conversion in the chain decides the output range;
             // otherwise it is whatever we reconciled the source to above.
             os.color_range = filters.output_color_range().unwrap_or(source_range);
-            let pixels = PixelConform::new(accepted_formats, requested_format, target.codec);
+            let mut pixels = PixelConform::new(accepted_formats, requested_format, target.codec);
             // The automatic conversion is the colour conversion when nothing in
             // the chain already is one: label the stream with the range it
             // will produce (limited for an RGB source into a Y'CbCr video
@@ -1421,6 +1464,26 @@ fn build_op(
                         }
                     }
                 }
+            }
+            // Colour range at the encoder (#213), FFmpeg's way: the encoder
+            // signals the range of its frames in the bitstream (AV1 / VP9
+            // `color_range`, H.264 `video_full_range_flag`), or, when it
+            // cannot signal full range, the frames are converted to limited.
+            // Either way the samples, the bitstream and the container label
+            // agree; before, full-range Y'CbCr went out under the bitstream's
+            // default limited label (28 dB through dav1d instead of 40).
+            let mut range_fix = None;
+            if is_video {
+                let range = match os.color_range {
+                    ColorRange::Full => ColorRange::Full,
+                    _ => ColorRange::Limited,
+                };
+                if !encoder.set_color_range(range) && range == ColorRange::Full {
+                    range_fix = Some(FilterChain::parse("setrange=limited")?);
+                    os.color_range = ColorRange::Limited;
+                    encoder.set_color_range(ColorRange::Limited);
+                }
+                pixels.out_range = Some(os.color_range);
             }
             os.sample_rate = out_rate;
             os.channels = if target_channels > 0 {
@@ -1471,6 +1534,7 @@ fn build_op(
                     target_sample_format,
                     resampler: None,
                     pixels,
+                    range_fix,
                     source_range,
                     warnings: Vec::new(),
                     out_index,
@@ -1847,5 +1911,33 @@ mod pixel_format_negotiation_tests {
         assert_eq!(luma_of_black(CodecId::Avif), 16);
         assert_eq!(luma_of_black(CodecId::H264), 16);
         assert_eq!(luma_of_black(CodecId::RawVideo), 0);
+    }
+
+    /// Once the output range is committed, an RGB frame converts to it — a
+    /// source only found to be RGB at the first frame (a progressive JPEG,
+    /// committed Full like every JPEG) must not be converted to limited under
+    /// a full-range label (#213).
+    #[test]
+    fn rgb_to_yuv_follows_the_committed_range() {
+        let rgb = VideoFrame {
+            width: 2,
+            height: 2,
+            format: Rgb24,
+            planes: vec![vec![0u8; 12]],
+            strides: vec![6],
+            pts: None,
+        };
+        for (range, black) in [(ColorRange::Full, 0), (ColorRange::Limited, 16)] {
+            let mut pc = PixelConform::new(Some(vec![Yuv420p]), None, CodecId::Avif);
+            pc.out_range = Some(range);
+            let mut w = Vec::new();
+            match pc
+                .conform(ColorRange::Full, Frame::Video(rgb.clone()), &mut w)
+                .unwrap()
+            {
+                Frame::Video(v) => assert_eq!(v.planes[0][0], black, "{range:?}"),
+                Frame::Audio(_) => unreachable!(),
+            }
+        }
     }
 }

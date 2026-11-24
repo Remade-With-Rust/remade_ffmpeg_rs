@@ -14,10 +14,12 @@
 use std::collections::VecDeque;
 
 use rff_codec::{Codec, CodecRegistry, Decoder, Encoder};
-use rff_core::{Dictionary, Error, Frame, MediaType, Packet, PixelFormat, Result, VideoFrame};
+use rff_core::{
+    ColorRange, Dictionary, Error, Frame, MediaType, Packet, PixelFormat, Result, VideoFrame,
+};
 use rusty_av1d::{Decoder as Rav1dDec, PixelLayout, PlanarImageComponent, Rav1dError};
 use rusty_av1e::prelude::{
-    ChromaSampling, Config, Context, EncoderConfig, EncoderStatus, FrameType,
+    ChromaSampling, Config, Context, EncoderConfig, EncoderStatus, FrameType, PixelRange,
 };
 
 /// Map an `ffmpeg`-style `-preset` (named or numeric) to a rusty_av1e speed (0 =
@@ -95,6 +97,9 @@ struct AvifEncoder {
     eof: bool,
     /// Output rate-control / tuning options (`-crf`, `-preset`, `-b`, ...).
     options: Dictionary,
+    /// Range of the incoming samples, written to the sequence header's
+    /// `color_range` bit (limited unless the pipeline says otherwise).
+    full_range: bool,
 }
 
 impl AvifEncoder {
@@ -105,6 +110,7 @@ impl AvifEncoder {
             queue: VecDeque::new(),
             eof: false,
             options: Dictionary::new(),
+            full_range: false,
         }
     }
 
@@ -130,6 +136,9 @@ impl AvifEncoder {
         enc.chroma_sampling = chroma;
         // AVIF is a single key frame; this tunes rusty_av1e for one-shot intra.
         enc.still_picture = true;
+        if self.full_range {
+            enc.pixel_range = PixelRange::Full;
+        }
         // Rate control: -qp sets rusty_av1e's quantizer directly; -crf (ffmpeg's
         // 0–63 scale) maps onto it ×4; -b targets a bitrate (bits/sec).
         if let Some(qp) = self.options.get_int("qp") {
@@ -208,6 +217,13 @@ impl Encoder for AvifEncoder {
             PixelFormat::Yuv444p10,
             PixelFormat::Yuv422p10,
         ])
+    }
+
+    /// The AV1 sequence header carries `color_range`: both ranges are
+    /// signalled as they are.
+    fn set_color_range(&mut self, range: ColorRange) -> bool {
+        self.full_range = range == ColorRange::Full;
+        true
     }
 
     fn send_frame(&mut self, frame: &Frame) -> Result<()> {

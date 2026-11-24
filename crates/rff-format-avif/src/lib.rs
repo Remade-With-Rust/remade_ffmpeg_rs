@@ -18,7 +18,7 @@
 
 use std::io::{Read, Write};
 
-use rff_core::{CodecId, Error, MediaType, Packet, Rational, Result};
+use rff_core::{CodecId, ColorRange, Error, MediaType, Packet, Rational, Result};
 use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, Stream};
 
 /// Register the AVIF format into a [`FormatRegistry`].
@@ -530,11 +530,25 @@ impl Demuxer for AvifDemuxer {
         } else {
             raw_sample.to_vec()
         };
+        // Colour range: an `nclx` `colr` property wins (MIAF; libavif reads
+        // it the same way), else the AV1 sequence header's `color_range`. A
+        // full-range AVIF left Unspecified was read as limited (#213).
+        let color_range = read_nclx_full_range(&meta_children)
+            .map(|full| {
+                if full {
+                    ColorRange::Full
+                } else {
+                    ColorRange::Limited
+                }
+            })
+            .or_else(|| rff_format::av1::color_range(&sample))
+            .unwrap_or(ColorRange::Unspecified);
         self.sample = Some(sample);
 
         let mut stream = Stream::new(0, CodecId::Avif);
         stream.width = width;
         stream.height = height;
+        stream.color_range = color_range;
         stream.time_base = Rational::new(1, 1);
         Ok(vec![stream])
     }
@@ -652,6 +666,18 @@ fn read_av1c_config(meta_children: &[([u8; 4], &[u8])]) -> Option<Vec<u8>> {
     let av1c = find(&ipco, b"av1C")?;
     // av1C = 4 fixed bytes (marker/version, seq fields, flags), then configOBUs.
     av1c.get(4..).map(|c| c.to_vec())
+}
+
+/// `full_range_flag` of an `nclx` `colr` property in `iprp`/`ipco`, if any
+/// (an ICC `colr` carries no range).
+fn read_nclx_full_range(meta_children: &[([u8; 4], &[u8])]) -> Option<bool> {
+    let iprp = find(meta_children, b"iprp")?;
+    let ipco = find(&child_boxes(iprp), b"ipco").map(child_boxes)?;
+    ipco.iter()
+        .filter(|(t, _)| t == b"colr")
+        .find(|(_, p)| p.starts_with(b"nclx"))
+        .and_then(|(_, p)| p.get(10))
+        .map(|flags| flags & 0x80 != 0)
 }
 
 fn find<'a>(boxes: &[([u8; 4], &'a [u8])], typ: &[u8; 4]) -> Option<&'a [u8]> {

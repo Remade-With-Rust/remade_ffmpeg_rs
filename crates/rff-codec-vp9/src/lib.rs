@@ -12,7 +12,8 @@
 
 use rff_codec::{Codec, CodecParams, CodecRegistry, Decoder, Encoder};
 use rff_core::{
-    CodecId, Dictionary, Error, Frame, MediaType, Packet, PixelFormat, Result, VideoFrame,
+    CodecId, ColorRange, Dictionary, Error, Frame, MediaType, Packet, PixelFormat, Result,
+    VideoFrame,
 };
 use rusty_vp9::{DecodedFrame, Vp9EncoderConfig};
 
@@ -123,9 +124,98 @@ fn parse_bitrate_bps(s: &str) -> Option<f64> {
     }
 }
 
+/// Bit offset (MSB-first, from the start of `frame`) of the `color_range` bit
+/// in a VP9 key frame's uncompressed header (VP9 §6.2 / §7.2), for any
+/// profile. `None` for a non-key frame, a shown-existing frame, or an sRGB
+/// frame (`color_space == CS_RGB` has no range bit).
+fn vp9_color_range_bit(frame: &[u8]) -> Option<usize> {
+    let mut pos = 0usize;
+    let mut read = |n: usize| -> Option<u32> {
+        let mut v = 0u32;
+        for _ in 0..n {
+            let byte = *frame.get(pos / 8)?;
+            v = (v << 1) | u32::from((byte >> (7 - pos % 8)) & 1);
+            pos += 1;
+        }
+        Some(v)
+    };
+    if read(2)? != 2 {
+        return None; // frame_marker
+    }
+    let low = read(1)?;
+    let profile = (read(1)? << 1) | low;
+    if profile == 3 {
+        read(1)?; // reserved_zero
+    }
+    if read(1)? == 1 {
+        return None; // show_existing_frame
+    }
+    if read(1)? != 0 {
+        return None; // frame_type: not a key frame
+    }
+    read(2)?; // show_frame, error_resilient_mode
+    if read(24)? != 0x49_83_42 {
+        return None; // frame_sync_code
+    }
+    if profile >= 2 {
+        read(1)?; // ten_or_twelve_bit
+    }
+    if read(3)? == 7 {
+        return None; // CS_RGB: full range by definition, no bit
+    }
+    Some(pos)
+}
+
+/// The frames of a VP9 packet: the frames of a superframe (Annex B), or the
+/// whole packet.
+fn vp9_frames(data: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let whole: Vec<std::ops::Range<usize>> = std::iter::once(0..data.len()).collect();
+    let Some(&marker) = data.last() else {
+        return whole;
+    };
+    if marker & 0xe0 != 0xc0 {
+        return whole;
+    }
+    let count = usize::from(marker & 7) + 1;
+    let mag = usize::from((marker >> 3) & 3) + 1;
+    let index = 2 + mag * count;
+    if data.len() < index || data[data.len() - index] != marker {
+        return whole;
+    }
+    let mut at = data.len() - index + 1;
+    let mut start = 0;
+    let mut frames = Vec::with_capacity(count);
+    for _ in 0..count {
+        let size = data[at..at + mag]
+            .iter()
+            .rev()
+            .fold(0usize, |a, &b| (a << 8) | usize::from(b));
+        at += mag;
+        if start + size > data.len() - index {
+            return whole;
+        }
+        frames.push(start..start + size);
+        start += size;
+    }
+    frames
+}
+
+/// Set `color_range = 1` in every key-frame header of a VP9 packet. The bit
+/// sits at a fixed position, so nothing else in the packet moves.
+fn signal_full_range(data: &mut [u8]) {
+    for frame in vp9_frames(data) {
+        if let Some(bit) = vp9_color_range_bit(&data[frame.clone()]) {
+            data[frame.start + bit / 8] |= 0x80 >> (bit % 8);
+        }
+    }
+}
+
 #[derive(Default)]
 struct Vp9Encoder {
     inner: rusty_vp9::Vp9Encoder,
+    /// Full-range input: `rusty_vp9` always writes `color_range = 0`, so the
+    /// adapter sets the bit in each key-frame header it emits.
+    full_range: bool,
 }
 
 impl Encoder for Vp9Encoder {
@@ -180,6 +270,13 @@ impl Encoder for Vp9Encoder {
         Some(vec![PixelFormat::Yuv420p])
     }
 
+    /// The key-frame header's `color_range` bit carries the range (profile 0
+    /// codes it for every non-RGB colour space).
+    fn set_color_range(&mut self, range: ColorRange) -> bool {
+        self.full_range = range == ColorRange::Full;
+        true
+    }
+
     fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         let vf: &VideoFrame = match frame {
             Frame::Video(v) => v,
@@ -210,7 +307,10 @@ impl Encoder for Vp9Encoder {
     }
 
     fn receive_packet(&mut self) -> Result<Packet> {
-        let p = self.inner.next_packet().map_err(map_err)?;
+        let mut p = self.inner.next_packet().map_err(map_err)?;
+        if self.full_range {
+            signal_full_range(&mut p.data);
+        }
         let mut packet = Packet::from_data(0, p.data);
         // Muxers need the random-access flag (Matroska SimpleBlock keyframe
         // bit, MP4 stss); dropping it made every seek land on a delta frame.
@@ -416,6 +516,83 @@ mod tests {
         };
         assert_eq!((out.width, out.height), (w, h));
         assert_eq!(out.format, PixelFormat::Yuv420p);
+    }
+
+    /// #213: a full-range encode sets `color_range` in every key-frame header
+    /// (also inside an ALT-REF superframe group and on forced keyframes),
+    /// changes nothing else, and decodes to the same pixels; a limited encode
+    /// is byte-identical to one that was never told a range.
+    #[test]
+    fn full_range_is_signalled_in_key_frame_headers() {
+        let (w, h) = (64u32, 48u32);
+        let (cw, ch) = (w as usize, h as usize);
+        let frame = |f: u32| -> VideoFrame {
+            let y = (0..cw * ch)
+                .map(|i| ((i % cw * 3 + i / cw + f as usize * 5) % 256) as u8)
+                .collect();
+            let uv = vec![100u8; (cw / 2) * (ch / 2)];
+            VideoFrame {
+                width: w,
+                height: h,
+                format: PixelFormat::Yuv420p,
+                planes: vec![y, uv.clone(), uv],
+                strides: vec![cw, cw / 2, cw / 2],
+                pts: Some(f as i64),
+            }
+        };
+        let encode = |range: Option<ColorRange>| -> Vec<Vec<u8>> {
+            let mut enc = Vp9Encoder::default();
+            let mut opts = Dictionary::new();
+            opts.set("lag", "4");
+            opts.set("g", "4");
+            enc.configure(&opts).unwrap();
+            if let Some(r) = range {
+                assert!(enc.set_color_range(r));
+            }
+            for f in 0..8 {
+                enc.send_frame(&Frame::Video(frame(f))).unwrap();
+            }
+            enc.flush();
+            let mut out = Vec::new();
+            while let Ok(p) = enc.receive_packet() {
+                out.push(p.data);
+            }
+            out
+        };
+        let plain = encode(None);
+        assert_eq!(encode(Some(ColorRange::Limited)), plain);
+        let full = encode(Some(ColorRange::Full));
+        assert_eq!(full.len(), plain.len());
+        let mut keys = 0;
+        for (a, b) in plain.iter().zip(&full) {
+            assert_eq!(a.len(), b.len());
+            let flipped: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
+            for frame in vp9_frames(b) {
+                if let Some(bit) = vp9_color_range_bit(&b[frame.clone()]) {
+                    keys += 1;
+                    let byte = frame.start + bit / 8;
+                    assert_eq!(b[byte] & (0x80 >> (bit % 8)), 0x80 >> (bit % 8));
+                    assert_eq!(a[byte] & (0x80 >> (bit % 8)), 0);
+                }
+            }
+            assert!(flipped.len() <= 1, "only the range bit may change");
+        }
+        assert!(
+            keys >= 2,
+            "expected the first and a forced keyframe, got {keys}"
+        );
+        let decode = |packets: &[Vec<u8>]| -> Vec<Vec<Vec<u8>>> {
+            let mut dec = Vp9Decoder::default();
+            let mut out = Vec::new();
+            for p in packets {
+                dec.send_packet(&Packet::from_data(0, p.clone())).unwrap();
+                while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+                    out.push(vf.planes);
+                }
+            }
+            out
+        };
+        assert_eq!(decode(&full), decode(&plain));
     }
 
     /// ALT-REF lookahead: a `-lag N` group codes KEY + a hidden future ALT-REF + P

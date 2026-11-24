@@ -5,9 +5,9 @@
 //! is the output side of the VP9 RD campaign — rff encodes `y4m → ivf`, and
 //! ffmpeg/libvpx decode the `.ivf` back for PSNR/VMAF.
 
-use std::io::{BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 
-use rff_core::{CodecId, Error, Packet, Rational, Result};
+use rff_core::{CodecId, ColorRange, Error, Packet, Rational, Result};
 use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, Stream};
 
 /// Register the IVF format into a [`FormatRegistry`].
@@ -178,6 +178,48 @@ fn read_up_to(r: &mut impl Read, len: usize) -> std::io::Result<Vec<u8>> {
 /// IVF is a bare frame-length container with no codec description beyond this
 /// tag, so it is the only thing distinguishing a VP9 stream from an AV1 or AV2
 /// one. Assuming VP9 here silently hands AV2 packets to the VP9 decoder.
+/// The colour range of a VP9 key frame (VP9 §6.2 `color_config`): the
+/// `color_range` bit, or full for sRGB. `None` if `frame` does not start with
+/// a key frame (or is too short to tell).
+fn vp9_key_frame_range(frame: &[u8]) -> Option<ColorRange> {
+    let mut pos = 0usize;
+    let mut read = |n: usize| -> Option<u32> {
+        let mut v = 0u32;
+        for _ in 0..n {
+            let byte = *frame.get(pos / 8)?;
+            v = (v << 1) | u32::from((byte >> (7 - pos % 8)) & 1);
+            pos += 1;
+        }
+        Some(v)
+    };
+    if read(2)? != 2 {
+        return None; // frame_marker
+    }
+    let low = read(1)?;
+    let profile = (read(1)? << 1) | low;
+    if profile == 3 {
+        read(1)?; // reserved_zero
+    }
+    if read(1)? == 1 || read(1)? != 0 {
+        return None; // show_existing_frame, or not a key frame
+    }
+    read(2)?; // show_frame, error_resilient_mode
+    if read(24)? != 0x49_83_42 {
+        return None; // frame_sync_code
+    }
+    if profile >= 2 {
+        read(1)?; // ten_or_twelve_bit
+    }
+    if read(3)? == 7 {
+        return Some(ColorRange::Full); // CS_RGB
+    }
+    Some(if read(1)? == 1 {
+        ColorRange::Full
+    } else {
+        ColorRange::Limited
+    })
+}
+
 fn codec_from_fourcc(tag: &[u8]) -> Result<CodecId> {
     match tag {
         b"VP90" => Ok(CodecId::Vp9),
@@ -217,11 +259,26 @@ impl Demuxer for IvfDemuxer {
         // A header longer than 32 bytes: skip the extension without buffering it.
         let extra = (rd_u16(&h, 6) as usize).saturating_sub(FILE_HEADER) as u64;
         std::io::copy(&mut (&mut reader).take(extra), &mut std::io::sink())?;
+        // IVF has no colour metadata: a VP9 stream's range is in its first key
+        // frame's header. Peek at what is already buffered (nothing consumed),
+        // so a full-range stream is not read as limited (#213). Limited stays
+        // Unspecified, which every consumer already reads as limited, so a
+        // remux of an ordinary stream gains no new colour box.
+        let color_range = match codec {
+            CodecId::Vp9 => reader
+                .fill_buf()
+                .ok()
+                .and_then(|buf| buf.get(FRAME_HEADER..))
+                .and_then(vp9_key_frame_range)
+                .filter(|r| *r == ColorRange::Full),
+            _ => None,
+        };
         self.reader = Some(reader);
 
         let mut stream = Stream::new(0, codec);
         stream.width = width;
         stream.height = height;
+        stream.color_range = color_range.unwrap_or(ColorRange::Unspecified);
         stream.time_base = Rational::new(fden as i32, fnum as i32);
         Ok(vec![stream])
     }
@@ -295,6 +352,28 @@ mod tests {
         assert_eq!((streams[0].width, streams[0].height), (352, 288));
         assert_eq!(dem.read_packet().unwrap().data, vec![1, 2, 3, 4, 5]);
         assert!(matches!(dem.read_packet(), Err(Error::Eof)));
+    }
+
+    /// #213: a full-range VP9 stream is labelled from its first key frame's
+    /// `color_range`; a limited one stays Unspecified (read as limited); the
+    /// peek consumes nothing.
+    #[test]
+    fn vp9_key_frame_range_labels_the_stream() {
+        // Profile 0 shown key frame, sync code, BT.601, then color_range.
+        let key = |full: bool| vec![0x82, 0x49, 0x83, 0x42, if full { 0x30 } else { 0x20 }, 0];
+        assert_eq!(vp9_key_frame_range(&key(true)), Some(ColorRange::Full));
+        assert_eq!(vp9_key_frame_range(&key(false)), Some(ColorRange::Limited));
+        assert_eq!(vp9_key_frame_range(&[0x86, 0, 0, 0, 0]), None); // inter frame
+        for (full, want) in [(true, ColorRange::Full), (false, ColorRange::Unspecified)] {
+            let mut file = ivf(b"VP90", 32, &[], &[]);
+            file.extend_from_slice(&6u32.to_le_bytes());
+            file.extend_from_slice(&0u64.to_le_bytes());
+            file.extend_from_slice(&key(full));
+            let mut dem = IvfDemuxer::new(Box::new(Cursor::new(file)));
+            let streams = dem.read_header().unwrap();
+            assert_eq!(streams[0].color_range, want);
+            assert_eq!(dem.read_packet().unwrap().data, key(full));
+        }
     }
 
     // ---- streaming (issue #26): equivalence, header cost, robustness ----

@@ -280,6 +280,92 @@ pub fn avcc_record_from_extradata(extradata: &[u8]) -> Option<Vec<u8>> {
     Some(build_avcc_record(of(7)?, of(8)?))
 }
 
+/// The SPS VUI's `video_full_range_flag` (H.264 E.1.1) of an SPS NAL (header
+/// byte included): `Some(true)` / `Some(false)` when the VUI carries a video
+/// signal type, `None` when it does not (no VUI, no signal type, or a
+/// malformed SPS) and the range is whatever the container says.
+pub fn sps_full_range(nal: &[u8]) -> Option<bool> {
+    if nal.first()? & 0x1F != 7 {
+        return None;
+    }
+    let mut rbsp = Vec::with_capacity(nal.len());
+    let mut zeros = 0u32;
+    for &b in &nal[1..] {
+        if zeros >= 2 && b == 3 {
+            zeros = 0;
+            continue;
+        }
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        rbsp.push(b);
+    }
+    let mut r = Bits::new(&rbsp);
+    let profile_idc = r.bits(8)?;
+    r.bits(16)?; // constraint flags + reserved + level_idc
+    r.ue()?; // seq_parameter_set_id
+    if matches!(
+        profile_idc,
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+    ) {
+        let chroma_format_idc = r.ue()?;
+        if chroma_format_idc == 3 {
+            r.bit()?; // separate_colour_plane_flag
+        }
+        r.ue()?; // bit_depth_luma_minus8
+        r.ue()?; // bit_depth_chroma_minus8
+        r.bit()?; // qpprime_y_zero_transform_bypass_flag
+        if r.bit()? == 1 {
+            let lists = if chroma_format_idc != 3 { 8 } else { 12 };
+            for i in 0..lists {
+                if r.bit()? == 1 {
+                    skip_scaling_list(&mut r, if i < 6 { 16 } else { 64 })?;
+                }
+            }
+        }
+    }
+    r.ue()?; // log2_max_frame_num_minus4
+    match r.ue()? {
+        0 => {
+            r.ue()?; // log2_max_pic_order_cnt_lsb_minus4
+        }
+        1 => {
+            r.bit()?; // delta_pic_order_always_zero_flag
+            r.se()?; // offset_for_non_ref_pic
+            r.se()?; // offset_for_top_to_bottom_field
+            for _ in 0..r.ue()?.min(255) {
+                r.se()?; // offset_for_ref_frame
+            }
+        }
+        _ => {}
+    }
+    r.ue()?; // max_num_ref_frames
+    r.bit()?; // gaps_in_frame_num_value_allowed_flag
+    r.ue()?; // pic_width_in_mbs_minus1
+    r.ue()?; // pic_height_in_map_units_minus1
+    if r.bit()? == 0 {
+        r.bit()?; // mb_adaptive_frame_field_flag
+    }
+    r.bit()?; // direct_8x8_inference_flag
+    if r.bit()? == 1 {
+        for _ in 0..4 {
+            r.ue()?; // frame_crop_*_offset
+        }
+    }
+    if r.bit()? == 0 {
+        return None; // vui_parameters_present_flag
+    }
+    if r.bit()? == 1 && r.bits(8)? == 255 {
+        r.bits(32)?; // Extended_SAR: sar_width, sar_height
+    }
+    if r.bit()? == 1 {
+        r.bit()?; // overscan_appropriate_flag
+    }
+    if r.bit()? == 0 {
+        return None; // video_signal_type_present_flag
+    }
+    r.bits(3)?; // video_format
+    Some(r.bit()? == 1)
+}
+
 /// `(chroma_format_idc, bit_depth_luma_minus8, bit_depth_chroma_minus8)`
 /// of an SPS NAL (header byte included); 4:2:0 8-bit for profiles that do
 /// not code them.
@@ -420,6 +506,18 @@ mod tests {
             0x03, 0x00, 0x01, 0x00, 0x00, 0x03, 0x00, 0x30, 0x0F, 0x16, 0x2D, 0x96,
         ];
         assert_eq!(sps_dimensions(&sps), Some((640, 360)));
+    }
+
+    /// rusty_h264's High-profile 96x64 SPS without a VUI, and the same SPS
+    /// after rff-codec-h264 added its full-range VUI (#213).
+    #[test]
+    fn sps_full_range_reads_the_vui() {
+        let plain = [103, 100, 64, 30, 172, 202, 65, 137, 144];
+        let full = [103, 100, 64, 30, 172, 202, 65, 137, 166, 192, 64];
+        assert_eq!(sps_full_range(&plain), None);
+        assert_eq!(sps_full_range(&full), Some(true));
+        assert_eq!(sps_dimensions(&full), sps_dimensions(&plain));
+        assert_eq!(sps_full_range(&[0x68, 0xff]), None); // a PPS
     }
 
     #[test]
