@@ -6,6 +6,12 @@ each release, under **Security**. The project follows
 decoder output is stable (gated against the ISO/IEC 14496-26 conformance suite);
 encoder output may change in minor releases when quality improves.
 
+## [2.1.6](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_aac-v2.1.5...rusty_aac-v2.1.6) - 2026-11-24
+
+### Fixed
+
+- *(decode)* window irregular `window_sequence` transitions per ISO/IEC 14496-3 §4.6.11: each frame's half is windowed by its own sequence and the two are summed, instead of one slope chosen from the previous block ([#208](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/issues/208), [#209](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/209)). ISO conformance stream `al03_48` goes from max error 2,800 LSB (RMS 88) to 0.004 LSB; all 24 `al03*` streams now match their ISO references. The other 401 ISO LC/Main/LTP streams decode byte-identically. Encoder output is unchanged.
+
 ## [2.1.5](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_aac-v2.1.4...rusty_aac-v2.1.5) - 2026-11-23
 
 ### Other
