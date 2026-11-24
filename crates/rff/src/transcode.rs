@@ -106,6 +106,14 @@ fn is_full_range_codec(codec: CodecId) -> bool {
     )
 }
 
+/// Codecs whose decoders hand out packed RGB(A) frames.
+fn decodes_to_rgb(codec: CodecId) -> bool {
+    matches!(
+        codec,
+        CodecId::Png | CodecId::Gif | CodecId::Webp | CodecId::Jxl
+    )
+}
+
 /// What range this stream's decoded frames are actually in.
 ///
 /// An `Unspecified` stream is not "unknown, do nothing" — every consumer has to
@@ -215,6 +223,11 @@ pub struct OutputSpec {
     /// Muxer options (`-hls_time 6` → `{"hls_time": "6"}`), for formats that
     /// take them (HLS/DASH segmenting).
     pub format_options: Dictionary,
+    /// Pixel format handed to the video encoder (`-pix_fmt`). `None` = the
+    /// encoder's best accepted format for the source (FFmpeg's automatic
+    /// format negotiation). A format the encoder does not accept falls back to
+    /// that automatic choice with a warning, as FFmpeg does.
+    pub pixel_format: Option<PixelFormat>,
 }
 
 /// A complete, declarative transcoding job.
@@ -230,6 +243,9 @@ pub struct TranscodeSpec {
 pub struct TranscodeReport {
     pub packets_written: u64,
     pub frames_decoded: u64,
+    /// Non-fatal notices raised while encoding (an incompatible `-pix_fmt`
+    /// that was replaced, an alpha channel the encoder cannot carry, ...).
+    pub warnings: Vec<String>,
 }
 
 /// Output trim window (`-ss` / `-t` / `-to`), in seconds.
@@ -387,12 +403,12 @@ struct TranscodeOp {
     target_sample_format: Option<SampleFormat>,
     /// Lazily built once the first audio frame reveals the input rate.
     resampler: Option<Resampler>,
-    /// Pixel formats the encoder accepts (`None` = anything).
-    accepted_formats: Option<Vec<PixelFormat>>,
-    /// Lazily built conversion into an accepted format.
-    pixel_converter: Option<FilterChain>,
+    /// Pixel-format negotiation + conversion in front of the encoder.
+    pixels: PixelConform,
     /// Range of the frames reaching the encoder, for that conversion.
     source_range: ColorRange,
+    /// Warnings raised mid-stream, handed to the report as they appear.
+    warnings: Vec<String>,
     out_index: usize,
     /// `-frames:v` limit for this output, and how many we have sent.
     max_video_frames: Option<u64>,
@@ -565,53 +581,179 @@ fn conform_audio(
     Ok(f32_frame(out, target_rate, af.channels, pts))
 }
 
-/// Convert a video frame into a pixel format the encoder accepts, if it isn't
-/// already in one. The converting chain is built lazily from the first frame
-/// that needs it, mirroring the audio resampler above.
+/// Pick the pixel format to hand an encoder for a `src` frame — FFmpeg's
+/// automatic format negotiation (`avcodec_find_best_pix_fmt_of_list` plus the
+/// `-pix_fmt` override).
+///
+/// * `requested` (`-pix_fmt`) wins when the encoder accepts it. When it does
+///   not, the automatic choice is used instead and a warning says so, worded
+///   as FFmpeg words it ("Incompatible pixel format ...").
+/// * A source the encoder already accepts passes through untouched.
+/// * Otherwise: the encoder's most-preferred accepted format that the
+///   pipeline can convert `src` into, keeping high bit depth when the
+///   reference (the request, else the source) has it and the encoder takes it,
+///   and staying at 8 bits otherwise.
+///
+/// Returns the chosen format plus any warnings. `accepted == None` means the
+/// encoder takes anything.
+fn negotiate_pixel_format(
+    src: PixelFormat,
+    accepted: Option<&[PixelFormat]>,
+    requested: Option<PixelFormat>,
+    codec: CodecId,
+) -> Result<(PixelFormat, Vec<String>)> {
+    let accepted = accepted.filter(|a| !a.is_empty());
+    let accepts = |f: PixelFormat| accepted.is_none_or(|a| a.contains(&f));
+    let mut warnings = Vec::new();
+    let chosen = match requested {
+        Some(req) if accepts(req) => req,
+        Some(req) => {
+            let best = best_pixel_format(src, req, accepted.unwrap_or_default())?;
+            warnings.push(format!(
+                "Incompatible pixel format '{}' for codec '{}', auto-selecting format '{}'",
+                req.name(),
+                codec.name(),
+                best.name()
+            ));
+            best
+        }
+        None if accepts(src) => src,
+        None => best_pixel_format(src, src, accepted.unwrap_or_default())?,
+    };
+    if chosen != src && !rff_filter::can_convert(src, chosen) {
+        return Err(Error::unsupported(format!(
+            "no conversion from `{}` to `{}`",
+            src.name(),
+            chosen.name()
+        )));
+    }
+    if src.has_alpha() && !chosen.has_alpha() {
+        warnings.push(format!(
+            "codec '{}' has no alpha channel in `{}`: the alpha of the `{}` input is dropped",
+            codec.name(),
+            chosen.name(),
+            src.name()
+        ));
+    }
+    Ok((chosen, warnings))
+}
+
+/// The encoder's best accepted format for a `src` frame: candidates are the
+/// accepted formats `src` converts into, in the encoder's preference order;
+/// a high-bit-depth `reference` takes the first deep candidate, an 8-bit one
+/// the first 8-bit candidate, and failing that the first candidate of any
+/// depth.
+fn best_pixel_format(
+    src: PixelFormat,
+    reference: PixelFormat,
+    accepted: &[PixelFormat],
+) -> Result<PixelFormat> {
+    let candidates: Vec<PixelFormat> = accepted
+        .iter()
+        .copied()
+        .filter(|&f| rff_filter::can_convert(src, f))
+        .collect();
+    let deep = reference.bit_depth() > 8;
+    candidates
+        .iter()
+        .copied()
+        .find(|f| (f.bit_depth() > 8) == deep)
+        .or(candidates.first().copied())
+        .ok_or_else(|| {
+            let names: Vec<&str> = accepted.iter().map(|f| f.name()).collect();
+            Error::unsupported(format!(
+                "no conversion from `{}` to any format this encoder accepts ({})",
+                src.name(),
+                names.join(", ")
+            ))
+        })
+}
+
+/// Converts video frames into the pixel format negotiated with the encoder,
+/// if they aren't already in it. The converting chain is built lazily from
+/// the first frame that needs it, mirroring the audio resampler above.
 ///
 /// This is what lets a decoder emit its cheapest native layout: the JPEG decoder
 /// hands out planar Y'CbCr, and a PNG encoder downstream still gets the RGB it
-/// requires because this inserts the conversion.
-fn conform_video(
-    converter: &mut Option<FilterChain>,
-    accepted: &Option<Vec<PixelFormat>>,
-    source_range: ColorRange,
-    frame: Frame,
-) -> Result<Frame> {
-    let Some(accepted) = accepted else {
-        return Ok(frame);
-    };
-    let Frame::Video(vf) = frame else {
-        return Ok(frame);
-    };
-    if accepted.is_empty() || accepted.contains(&vf.format) {
-        return Ok(Frame::Video(vf));
+/// requires because this inserts the conversion. Equally, a PNG's RGB reaches
+/// an AVIF / H.264 / VP9 encoder as the planar Y'CbCr it needs.
+struct PixelConform {
+    /// Pixel formats the encoder accepts (`None` = anything).
+    accepted: Option<Vec<PixelFormat>>,
+    /// `-pix_fmt`, if given.
+    requested: Option<PixelFormat>,
+    /// The output codec, for messages.
+    codec: CodecId,
+    /// An RGB → Y'CbCr conversion produces limited range (FFmpeg's default,
+    /// and what a video bitstream that carries no range flag is read as),
+    /// rather than following the source's full range. True for the
+    /// compressed video codecs; the full-range image codecs and raw video
+    /// keep the source range.
+    rgb_to_limited: bool,
+    /// Source format the converter below was built for, the target it
+    /// converts to, and the converter (`None` when they are equal).
+    state: Option<(PixelFormat, PixelFormat, Option<FilterChain>)>,
+}
+
+impl PixelConform {
+    fn new(
+        accepted: Option<Vec<PixelFormat>>,
+        requested: Option<PixelFormat>,
+        codec: CodecId,
+    ) -> PixelConform {
+        PixelConform {
+            accepted,
+            requested,
+            codec,
+            rgb_to_limited: !is_full_range_codec(codec) && codec != CodecId::RawVideo,
+            state: None,
+        }
     }
-    if converter.is_none() {
-        // First choice the encoder listed that we can actually convert to.
-        let target = accepted
-            .iter()
-            .find(|f| matches!(f, PixelFormat::Rgb24 | PixelFormat::Yuv420p))
-            .ok_or_else(|| {
-                Error::unsupported(format!(
-                    "no conversion from `{}` to any format this encoder accepts",
-                    vf.format.name()
-                ))
-            })?;
-        // Pin the range: `spec.limited` describes the Y'CbCr side either way,
-        // and guessing it wrong is a silent several-dB error.
-        let range = match source_range {
-            ColorRange::Limited => "limited",
-            _ => "full",
+
+    fn negotiate(&self, src: PixelFormat) -> Result<(PixelFormat, Vec<String>)> {
+        negotiate_pixel_format(src, self.accepted.as_deref(), self.requested, self.codec)
+    }
+
+    fn conform(
+        &mut self,
+        source_range: ColorRange,
+        frame: Frame,
+        warnings: &mut Vec<String>,
+    ) -> Result<Frame> {
+        if self.accepted.is_none() && self.requested.is_none() {
+            return Ok(frame);
+        }
+        let Frame::Video(vf) = frame else {
+            return Ok(frame);
         };
-        *converter = Some(FilterChain::parse(&format!(
-            "format={}:bt601:{}",
-            target.name(),
-            range
-        ))?);
+        let fresh = !matches!(&self.state, Some((src, _, _)) if *src == vf.format);
+        if fresh {
+            let (target, mut notes) = self.negotiate(vf.format)?;
+            warnings.append(&mut notes);
+            let converter = if target == vf.format {
+                None
+            } else {
+                // Pin the range: `spec.limited` describes the Y'CbCr side
+                // either way, and guessing it wrong is a silent several-dB
+                // error.
+                let limited = if self.rgb_to_limited && vf.format.is_rgb() && !target.is_rgb() {
+                    true
+                } else {
+                    source_range == ColorRange::Limited
+                };
+                Some(FilterChain::parse(&format!(
+                    "format={}:bt601:{}",
+                    target.name(),
+                    if limited { "limited" } else { "full" }
+                ))?)
+            };
+            self.state = Some((vf.format, target, converter));
+        }
+        match &mut self.state {
+            Some((_, _, Some(chain))) => Ok(Frame::Video(chain.apply(vf)?)),
+            _ => Ok(Frame::Video(vf)),
+        }
     }
-    let chain = converter.as_mut().expect("just built");
-    Ok(Frame::Video(chain.apply(vf)?))
 }
 
 /// Mix an audio frame to `target` channels (0 = keep). Stereo↔mono only: a
@@ -741,7 +883,9 @@ impl TranscodeOp {
                 self.video_frames_sent += 1;
             }
         }
-        let Some(frame) = phases::time(&phases::CONFORM, || self.conform(frame))? else {
+        let conformed = phases::time(&phases::CONFORM, || self.conform(frame));
+        report.warnings.append(&mut self.warnings);
+        let Some(frame) = conformed? else {
             return Ok(()); // atrim consumed the whole frame
         };
         if self.is_video {
@@ -772,12 +916,9 @@ impl TranscodeOp {
         };
         let frame = conform_audio(&mut self.resampler, self.target_rate, frame)?;
         let frame = conform_sample_format(self.target_sample_format, frame)?;
-        let frame = conform_video(
-            &mut self.pixel_converter,
-            &self.accepted_formats,
-            self.source_range,
-            frame,
-        )?;
+        let frame = self
+            .pixels
+            .conform(self.source_range, frame, &mut self.warnings)?;
         Ok(Some(frame))
     }
 
@@ -1228,6 +1369,7 @@ fn build_op(
             };
 
             let mut accepted_formats = encoder.accepted_pixel_formats();
+            let requested_format = if is_video { output.pixel_format } else { None };
 
             let mut os = Stream::new(out_index, target.codec);
             os.media_type = stream.media_type;
@@ -1242,7 +1384,9 @@ fn build_op(
             // (A 4:4:4 JPEG decoded straight to planes under a `C420mpeg2`
             // header is silent corruption, not a mislabel.)
             if target.codec == CodecId::RawVideo && stream.media_type == MediaType::Video {
-                let pinned = os.pixel_format.unwrap_or(PixelFormat::Yuv420p);
+                let pinned = requested_format
+                    .or(os.pixel_format)
+                    .unwrap_or(PixelFormat::Yuv420p);
                 os.pixel_format = Some(pinned);
                 accepted_formats = Some(vec![pinned]);
             }
@@ -1255,6 +1399,29 @@ fn build_op(
             // A colour conversion in the chain decides the output range;
             // otherwise it is whatever we reconciled the source to above.
             os.color_range = filters.output_color_range().unwrap_or(source_range);
+            let pixels = PixelConform::new(accepted_formats, requested_format, target.codec);
+            // The automatic conversion is the colour conversion when nothing in
+            // the chain already is one: label the stream with the range it
+            // will produce (limited for an RGB source into a Y'CbCr video
+            // codec), and commit the pixel format the encoder will really see.
+            // Image demuxers rarely declare a pixel format, but their decoders
+            // are known to emit packed RGB(A): that is enough to know an RGB
+            // → Y'CbCr conversion is coming.
+            let src_format = stream
+                .pixel_format
+                .or_else(|| decodes_to_rgb(stream.codec_id).then_some(PixelFormat::Rgb24));
+            if is_video && filters.output_color_range().is_none() {
+                if let Some(src) = src_format {
+                    if let Ok((fmt, _)) = pixels.negotiate(src) {
+                        if pixels.rgb_to_limited && src.is_rgb() && !fmt.is_rgb() {
+                            os.color_range = ColorRange::Limited;
+                        }
+                        if stream.pixel_format.is_some() && target.codec != CodecId::RawVideo {
+                            os.pixel_format = Some(fmt);
+                        }
+                    }
+                }
+            }
             os.sample_rate = out_rate;
             os.channels = if target_channels > 0 {
                 target_channels
@@ -1303,9 +1470,9 @@ fn build_op(
                     target_rate,
                     target_sample_format,
                     resampler: None,
-                    accepted_formats,
-                    pixel_converter: None,
+                    pixels,
                     source_range,
+                    warnings: Vec::new(),
                     out_index,
                     max_video_frames: output.max_video_frames,
                     video_frames_sent: 0,
@@ -1555,5 +1722,130 @@ mod sample_format_tests {
         // Bare `pcm` pins nothing, and compressed codecs never do.
         assert_eq!(CodecId::sample_format_from_name("pcm"), None);
         assert_eq!(CodecId::sample_format_from_name("mp3"), None);
+    }
+}
+
+#[cfg(test)]
+mod pixel_format_negotiation_tests {
+    use super::*;
+    use PixelFormat::*;
+
+    const AVIF: &[PixelFormat] = &[Yuv420p, Yuv444p, Yuv422p, Yuv420p10, Yuv444p10, Yuv422p10];
+
+    fn pick(
+        src: PixelFormat,
+        accepted: Option<&[PixelFormat]>,
+        requested: Option<PixelFormat>,
+    ) -> (PixelFormat, Vec<String>) {
+        negotiate_pixel_format(src, accepted, requested, CodecId::Avif).unwrap()
+    }
+
+    #[test]
+    fn rgb_into_a_yuv_encoder_takes_its_first_8_bit_format() {
+        assert_eq!(pick(Rgb24, Some(AVIF), None), (Yuv420p, vec![]));
+        assert_eq!(pick(Rgb24, Some(&[Yuv420p]), None), (Yuv420p, vec![]));
+    }
+
+    #[test]
+    fn accepted_sources_pass_through() {
+        for f in AVIF {
+            assert_eq!(pick(*f, Some(AVIF), None), (*f, vec![]));
+        }
+        assert_eq!(pick(Rgba, None, None), (Rgba, vec![]));
+    }
+
+    #[test]
+    fn high_bit_depth_is_kept_when_the_encoder_takes_it() {
+        assert_eq!(pick(Yuv420p12, Some(AVIF), None).0, Yuv420p10);
+        assert_eq!(pick(Yuv422p12, Some(AVIF), None).0, Yuv422p10);
+        // ... and narrowed when it does not.
+        assert_eq!(pick(Yuv420p10, Some(&[Yuv420p]), None).0, Yuv420p);
+    }
+
+    #[test]
+    fn pix_fmt_wins_when_accepted() {
+        assert_eq!(pick(Rgb24, Some(AVIF), Some(Yuv444p)), (Yuv444p, vec![]));
+        assert_eq!(
+            pick(Rgb24, Some(AVIF), Some(Yuv420p10)),
+            (Yuv420p10, vec![])
+        );
+        // An encoder that takes anything takes the request too.
+        assert_eq!(pick(Rgb24, None, Some(Yuv422p)), (Yuv422p, vec![]));
+        // Even when the source is already acceptable as it is.
+        assert_eq!(pick(Yuv420p, Some(AVIF), Some(Yuv420p10)).0, Yuv420p10);
+    }
+
+    #[test]
+    fn unaccepted_pix_fmt_falls_back_with_ffmpegs_warning() {
+        let (fmt, warnings) = pick(Rgb24, Some(AVIF), Some(Rgb24));
+        assert_eq!(fmt, Yuv420p);
+        assert_eq!(
+            warnings,
+            vec!["Incompatible pixel format 'rgb24' for codec 'avif', auto-selecting format 'yuv420p'"]
+        );
+        // A deep request falls back to a deep format.
+        let (fmt, warnings) = pick(Rgb24, Some(AVIF), Some(Yuv420p12));
+        assert_eq!(fmt, Yuv420p10);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn dropped_alpha_is_reported() {
+        let (fmt, warnings) = pick(Rgba, Some(AVIF), None);
+        assert_eq!(fmt, Yuv420p);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("alpha"), "{warnings:?}");
+        // Kept alpha is not.
+        assert_eq!(pick(Rgba, Some(&[Rgb24, Rgba]), None), (Rgba, vec![]));
+    }
+
+    /// The image encoders' choices are what they were before negotiation
+    /// grew depth awareness: first convertible accepted format.
+    #[test]
+    fn existing_image_encoder_choices_are_unchanged() {
+        let jpeg = &[Yuv420p, Yuv422p, Yuv444p, Rgb24, Rgba];
+        for src in [Yuv420p10, Yuv422p10, Yuv444p10, Yuv420p12, Yuv444p12] {
+            assert_eq!(pick(src, Some(jpeg), None).0, Yuv420p, "{}", src.name());
+        }
+        let png = &[Rgb24, Rgba];
+        for src in [Yuv420p, Yuv422p, Yuv444p, Yuv420p10, Yuv444p12] {
+            assert_eq!(pick(src, Some(png), None).0, Rgb24, "{}", src.name());
+        }
+    }
+
+    #[test]
+    fn impossible_conversions_are_errors() {
+        // 8-bit 4:2:0 cannot be upsampled to 4:4:4 by the pipeline.
+        assert!(negotiate_pixel_format(Yuv420p, Some(&[Yuv444p]), None, CodecId::Avif).is_err());
+        assert!(negotiate_pixel_format(Yuv420p, Some(AVIF), Some(Yuv444p), CodecId::Avif).is_err());
+    }
+
+    /// The converter an RGB source gets in front of a Y'CbCr video encoder is
+    /// BT.601 limited range (FFmpeg's default); in front of raw video it keeps
+    /// following the source, as before.
+    #[test]
+    fn rgb_to_yuv_range_depends_on_the_codec() {
+        let rgb = VideoFrame {
+            width: 2,
+            height: 2,
+            format: Rgb24,
+            planes: vec![vec![0u8; 12]],
+            strides: vec![6],
+            pts: None,
+        };
+        let luma_of_black = |codec| {
+            let mut pc = PixelConform::new(Some(vec![Yuv420p]), None, codec);
+            let mut w = Vec::new();
+            match pc
+                .conform(ColorRange::Full, Frame::Video(rgb.clone()), &mut w)
+                .unwrap()
+            {
+                Frame::Video(v) => v.planes[0][0],
+                Frame::Audio(_) => unreachable!(),
+            }
+        };
+        assert_eq!(luma_of_black(CodecId::Avif), 16);
+        assert_eq!(luma_of_black(CodecId::H264), 16);
+        assert_eq!(luma_of_black(CodecId::RawVideo), 0);
     }
 }

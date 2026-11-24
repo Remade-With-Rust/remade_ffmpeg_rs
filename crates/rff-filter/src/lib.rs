@@ -733,7 +733,11 @@ impl ColorSpec {
     }
 }
 
-/// `format=PIXFMT[:MATRIX][:RANGE]` — convert between `rgb24` and `yuv420p`.
+/// `format=PIXFMT[:MATRIX][:RANGE]` — pixel-format conversion (the `swscale`
+/// role). Packed RGB(A) converts to any planar Y'CbCr format (4:2:0 / 4:2:2 /
+/// 4:4:4 at 8, 10 or 12 bits); 8-bit planar Y'CbCr converts to `rgb24`;
+/// 4:2:2/4:4:4 down to 4:2:0; and bit depth changes within one chroma layout.
+/// [`can_convert`] answers which pairs are reachable without running it.
 /// MATRIX ∈ {`bt601`, `bt709`}; RANGE ∈ {`full`/`pc`, `limited`/`tv`}. Defaults to
 /// BT.601 full range for backward compatibility.
 struct FormatConv {
@@ -748,15 +752,12 @@ struct FormatConv {
 impl FormatConv {
     fn parse(args: &[&str]) -> Result<FormatConv> {
         let name = args.first().copied().unwrap_or("").trim();
-        let target = match name {
-            "yuv420p" => PixelFormat::Yuv420p,
-            "rgb24" => PixelFormat::Rgb24,
-            other => {
-                return Err(Error::unsupported(format!(
-                    "format: target `{other}` (only yuv420p and rgb24)"
-                )))
-            }
-        };
+        let target = PixelFormat::from_name(name).ok_or_else(|| {
+            Error::unsupported(format!(
+                "format: target `{name}` (want rgb24, rgba, or yuv420p/yuv422p/yuv444p \
+                 at 8, 10 or 12 bits, e.g. yuv420p10le)"
+            ))
+        })?;
         let mut spec = ColorSpec::default();
         let mut range_explicit = false;
         for opt in args.iter().skip(1).map(|s| s.trim()) {
@@ -814,16 +815,13 @@ impl Filter for FormatConv {
     /// distinction, so converting *to* RGB leaves the question to whoever
     /// converts back.
     fn output_color_range(&self) -> Option<ColorRange> {
-        match self.target {
-            PixelFormat::Yuv420p | PixelFormat::Yuv422p | PixelFormat::Yuv444p => {
-                Some(if self.spec.limited {
-                    ColorRange::Limited
-                } else {
-                    ColorRange::Full
-                })
+        planar_subsampling(self.target).map(|_| {
+            if self.spec.limited {
+                ColorRange::Limited
+            } else {
+                ColorRange::Full
             }
-            _ => None,
-        }
+        })
     }
 
     fn filter(&mut self, src: VideoFrame) -> Result<VideoFrame> {
@@ -833,6 +831,12 @@ impl Filter for FormatConv {
         match (src.format, self.target) {
             (PixelFormat::Rgb24, PixelFormat::Yuv420p) => rgb_to_yuv420(&src, 3, self.spec),
             (PixelFormat::Rgba, PixelFormat::Yuv420p) => rgb_to_yuv420(&src, 4, self.spec),
+            (PixelFormat::Rgb24, to) if planar_subsampling(to).is_some() => {
+                rgb_to_yuv_planar(&src, 3, self.spec, to)
+            }
+            (PixelFormat::Rgba, to) if planar_subsampling(to).is_some() => {
+                rgb_to_yuv_planar(&src, 4, self.spec, to)
+            }
             (PixelFormat::Rgba, PixelFormat::Rgb24) => rgba_to_rgb(&src),
             (PixelFormat::Yuv420p, PixelFormat::Rgb24) => yuv420_to_rgb(&src, self.spec),
             (PixelFormat::Yuv422p, PixelFormat::Rgb24)
@@ -848,6 +852,13 @@ impl Filter for FormatConv {
                 } else {
                     self.filter(narrowed)
                 }
+            }
+            // Same chroma layout, different bit depth (8 → 10, 12 → 10, ...).
+            (from, to)
+                if planar_subsampling(from).is_some()
+                    && planar_subsampling(from) == planar_subsampling(to) =>
+            {
+                rescale_depth(&src, to)
             }
             (from, to) => Err(Error::unsupported(format!(
                 "format: {} → {} not supported",
@@ -921,6 +932,191 @@ fn rgb_to_yuv420(src: &VideoFrame, bpp: usize, spec: ColorSpec) -> Result<VideoF
         format: PixelFormat::Yuv420p,
         planes: vec![y, u, v],
         strides: vec![w, cw, cw],
+        pts: src.pts,
+    })
+}
+
+/// Can a `format=` filter (and so the transcode pipeline's automatic
+/// conversion) turn `from` into `to`? Mirrors [`FormatConv`]'s dispatch
+/// exactly; a unit test holds the two together.
+pub fn can_convert(from: PixelFormat, to: PixelFormat) -> bool {
+    use PixelFormat::*;
+    if from == to {
+        return true;
+    }
+    match (from, to) {
+        (Rgb24 | Rgba, t) if planar_subsampling(t).is_some() => true,
+        (Rgba, Rgb24) => true,
+        (Yuv420p | Yuv422p | Yuv444p, Rgb24) => true,
+        (Yuv422p | Yuv444p, Yuv420p) => true,
+        (f, t) if f.bit_depth() > 8 && t.bit_depth() == 8 => match narrowed_format(f) {
+            Some(n) => n == t || can_convert(n, t),
+            None => false,
+        },
+        (f, t) => planar_subsampling(f).is_some() && planar_subsampling(f) == planar_subsampling(t),
+    }
+}
+
+/// The 8-bit format [`narrow_to_8`] produces from a high-bit-depth one.
+fn narrowed_format(format: PixelFormat) -> Option<PixelFormat> {
+    match format {
+        PixelFormat::Yuv420p10 | PixelFormat::Yuv420p12 => Some(PixelFormat::Yuv420p),
+        PixelFormat::Yuv422p10 | PixelFormat::Yuv422p12 => Some(PixelFormat::Yuv422p),
+        PixelFormat::Yuv444p10 | PixelFormat::Yuv444p12 => Some(PixelFormat::Yuv444p),
+        _ => None,
+    }
+}
+
+/// Packed RGB(A) → any planar Y'CbCr layout and depth. Same arithmetic as
+/// [`rgb_to_yuv420`] (which stays the 8-bit 4:2:0 path, byte for byte): luma
+/// per pixel, chroma from the RGB average over each subsampled block. Deeper
+/// targets scale the 8-bit ranges the way FFmpeg does: limited range by
+/// `2^(depth-8)` (16..235 → 64..940 at 10 bits), full range to `0..2^depth-1`.
+fn rgb_to_yuv_planar(
+    src: &VideoFrame,
+    bpp: usize,
+    spec: ColorSpec,
+    target: PixelFormat,
+) -> Result<VideoFrame> {
+    let (sh, sv) = planar_subsampling(target).ok_or_else(|| {
+        Error::unsupported(format!("format: {} is not planar Y'CbCr", target.name()))
+    })?;
+    let (w, h) = (src.width as usize, src.height as usize);
+    let stride = src.strides[0];
+    let rgb = &src.planes[0];
+    if w > 0 && h > 0 && rgb.len() < (h - 1) * stride + w * bpp {
+        return Err(Error::invalid(
+            "format: RGB plane shorter than its geometry",
+        ));
+    }
+    let px = |i: usize, j: usize| {
+        let p = j * stride + i * bpp;
+        (rgb[p] as f32, rgb[p + 1] as f32, rgb[p + 2] as f32)
+    };
+
+    let depth = target.bit_depth();
+    let max = ((1u32 << depth) - 1) as f32;
+    let (yoff, yscale, coff, cscale) = if spec.limited {
+        let m = (1u32 << (depth - 8)) as f32;
+        (16.0 * m, 219.0 / 255.0 * m, 128.0 * m, 224.0 / 255.0 * m)
+    } else {
+        (0.0, max / 255.0, (1u32 << (depth - 1)) as f32, max / 255.0)
+    };
+    let (kr, kb, kg) = (spec.kr, spec.kb, spec.kg());
+    let (ur, ug) = (-0.5 * kr / (1.0 - kb), -0.5 * kg / (1.0 - kb));
+    let (vg, vb) = (-0.5 * kg / (1.0 - kr), -0.5 * kb / (1.0 - kr));
+    let quant = |v: f32| v.round().clamp(0.0, max) as u16;
+
+    let mut y = Vec::with_capacity(w * h);
+    for j in 0..h {
+        for i in 0..w {
+            let (r, g, b) = px(i, j);
+            y.push(quant(yoff + yscale * (kr * r + kg * g + kb * b)));
+        }
+    }
+    let (cw, ch) = (w.div_ceil(sh), h.div_ceil(sv));
+    let (mut u, mut v) = (Vec::with_capacity(cw * ch), Vec::with_capacity(cw * ch));
+    for cj in 0..ch {
+        for ci in 0..cw {
+            let (mut sr, mut sg, mut sb, mut n) = (0.0, 0.0, 0.0, 0.0);
+            for dy in 0..sv {
+                for dx in 0..sh {
+                    let (i, j) = (ci * sh + dx, cj * sv + dy);
+                    if i < w && j < h {
+                        let (r, g, b) = px(i, j);
+                        sr += r;
+                        sg += g;
+                        sb += b;
+                        n += 1.0;
+                    }
+                }
+            }
+            let (r, g, b) = (sr / n, sg / n, sb / n);
+            u.push(quant(coff + cscale * (ur * r + ug * g + 0.5 * b)));
+            v.push(quant(coff + cscale * (0.5 * r + vg * g + vb * b)));
+        }
+    }
+
+    let pack = |samples: Vec<u16>| -> Vec<u8> {
+        if depth > 8 {
+            samples.iter().flat_map(|s| s.to_le_bytes()).collect()
+        } else {
+            samples.iter().map(|&s| s as u8).collect()
+        }
+    };
+    let bps = target.bytes_per_sample();
+    Ok(VideoFrame {
+        width: src.width,
+        height: src.height,
+        format: target,
+        planes: vec![pack(y), pack(u), pack(v)],
+        strides: vec![w * bps, cw * bps, cw * bps],
+        pts: src.pts,
+    })
+}
+
+/// Change the bit depth of planar Y'CbCr without touching its chroma layout:
+/// a left shift to widen (FFmpeg's limited-range convention), a rounded right
+/// shift to narrow.
+fn rescale_depth(src: &VideoFrame, target: PixelFormat) -> Result<VideoFrame> {
+    let (sh, sv) = planar_subsampling(src.format)
+        .filter(|s| Some(*s) == planar_subsampling(target))
+        .ok_or_else(|| {
+            Error::unsupported(format!(
+                "format: {} → {} changes the chroma layout",
+                src.format.name(),
+                target.name()
+            ))
+        })?;
+    let (from, to) = (src.format.bit_depth(), target.bit_depth());
+    let (in_bps, out_bps) = (src.format.bytes_per_sample(), target.bytes_per_sample());
+    let max = (1u32 << to) - 1;
+    let convert = |v: u32| -> u32 {
+        if to >= from {
+            v << (to - from)
+        } else {
+            let shift = from - to;
+            ((v + (1 << (shift - 1))) >> shift).min(max)
+        }
+    };
+    let (w, h) = (src.width as usize, src.height as usize);
+    let mut planes = Vec::with_capacity(3);
+    let mut strides = Vec::with_capacity(3);
+    for (i, plane) in src.planes.iter().enumerate().take(3) {
+        let (pw, ph) = if i == 0 {
+            (w, h)
+        } else {
+            (w.div_ceil(sh), h.div_ceil(sv))
+        };
+        let stride = src.strides.get(i).copied().unwrap_or(pw * in_bps);
+        let mut out = Vec::with_capacity(pw * ph * out_bps);
+        for y in 0..ph {
+            let row = plane
+                .get(y * stride..y * stride + pw * in_bps)
+                .ok_or_else(|| Error::invalid("format: plane shorter than its geometry"))?;
+            for s in row.chunks_exact(in_bps) {
+                let v = if in_bps == 2 {
+                    u16::from_le_bytes([s[0], s[1]]) as u32
+                } else {
+                    s[0] as u32
+                };
+                let o = convert(v);
+                if out_bps == 2 {
+                    out.extend_from_slice(&(o as u16).to_le_bytes());
+                } else {
+                    out.push(o as u8);
+                }
+            }
+        }
+        strides.push(pw * out_bps);
+        planes.push(out);
+    }
+    Ok(VideoFrame {
+        width: src.width,
+        height: src.height,
+        format: target,
+        planes,
+        strides,
         pts: src.pts,
     })
 }
@@ -1689,5 +1885,179 @@ mod setrange_tests {
         let b = pinned.apply(frame()).unwrap();
         assert_eq!(a.planes[0][0], 0, "limited reading maps 16 -> 0");
         assert!(b.planes[0][0] > 0, "full reading leaves 16 above black");
+    }
+}
+
+#[cfg(test)]
+mod format_conversion_tests {
+    use super::*;
+
+    const ALL: [PixelFormat; 11] = [
+        PixelFormat::Yuv420p,
+        PixelFormat::Yuv422p,
+        PixelFormat::Yuv444p,
+        PixelFormat::Yuv420p10,
+        PixelFormat::Yuv422p10,
+        PixelFormat::Yuv444p10,
+        PixelFormat::Yuv420p12,
+        PixelFormat::Yuv422p12,
+        PixelFormat::Yuv444p12,
+        PixelFormat::Rgb24,
+        PixelFormat::Rgba,
+    ];
+
+    /// A frame of `format` at an odd size (so partial chroma blocks are hit),
+    /// filled with a mid-scale ramp.
+    fn frame_of(format: PixelFormat, w: u32, h: u32) -> VideoFrame {
+        let (wi, hi) = (w as usize, h as usize);
+        if format.is_rgb() {
+            let bpp = if format.has_alpha() { 4 } else { 3 };
+            let px: Vec<u8> = (0..wi * hi * bpp).map(|i| (i * 7 % 256) as u8).collect();
+            return VideoFrame {
+                width: w,
+                height: h,
+                format,
+                planes: vec![px],
+                strides: vec![wi * bpp],
+                pts: Some(3),
+            };
+        }
+        let (sh, sv) = planar_subsampling(format).unwrap();
+        let bps = format.bytes_per_sample();
+        let mid = 1u32 << (format.bit_depth() - 1);
+        let plane = |pw: usize, ph: usize| -> Vec<u8> {
+            (0..pw * ph)
+                .flat_map(|i| {
+                    let v = mid - 8 + (i as u32 % 16);
+                    if bps == 2 {
+                        (v as u16).to_le_bytes().to_vec()
+                    } else {
+                        vec![v as u8]
+                    }
+                })
+                .collect()
+        };
+        let (cw, ch) = (wi.div_ceil(sh), hi.div_ceil(sv));
+        VideoFrame {
+            width: w,
+            height: h,
+            format,
+            planes: vec![plane(wi, hi), plane(cw, ch), plane(cw, ch)],
+            strides: vec![wi * bps, cw * bps, cw * bps],
+            pts: Some(3),
+        }
+    }
+
+    /// `can_convert` is what the transcode pipeline consults before it builds
+    /// a converter, so it must agree with what `format=` actually does, pair
+    /// for pair.
+    #[test]
+    fn can_convert_matches_the_filter_for_every_pair() {
+        for from in ALL {
+            for to in ALL {
+                let mut conv = FilterChain::parse(&format!("format={}", to.name())).unwrap();
+                let result = conv.apply(frame_of(from, 5, 3));
+                assert_eq!(
+                    result.is_ok(),
+                    can_convert(from, to),
+                    "{} -> {}: filter says {:?}",
+                    from.name(),
+                    to.name(),
+                    result.as_ref().err()
+                );
+                if let Ok(out) = result {
+                    assert_eq!(out.format, to);
+                    assert_eq!((out.width, out.height, out.pts), (5, 3, Some(3)));
+                    if let Some((sh, sv)) = planar_subsampling(to) {
+                        let bps = to.bytes_per_sample();
+                        let (cw, ch) = (5usize.div_ceil(sh), 3usize.div_ceil(sv));
+                        assert_eq!(out.planes[0].len(), 5 * 3 * bps);
+                        assert_eq!(out.planes[1].len(), cw * ch * bps);
+                        assert_eq!(out.strides, vec![5 * bps, cw * bps, cw * bps]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rgb_reaches_every_planar_layout() {
+        for to in ALL.iter().copied().filter(|f| !f.is_rgb()) {
+            assert!(can_convert(PixelFormat::Rgb24, to), "{}", to.name());
+            assert!(can_convert(PixelFormat::Rgba, to), "{}", to.name());
+        }
+    }
+
+    fn solid_rgb(r: u8, g: u8, b: u8) -> VideoFrame {
+        VideoFrame {
+            width: 4,
+            height: 2,
+            format: PixelFormat::Rgb24,
+            planes: vec![[r, g, b].repeat(8)],
+            strides: vec![12],
+            pts: None,
+        }
+    }
+
+    fn sample(f: &VideoFrame, plane: usize) -> u32 {
+        if f.format.bytes_per_sample() == 2 {
+            u16::from_le_bytes([f.planes[plane][0], f.planes[plane][1]]) as u32
+        } else {
+            f.planes[plane][0] as u32
+        }
+    }
+
+    /// The generic RGB → Y'CbCr path agrees with the long-standing 4:2:0
+    /// one, and scales to deeper targets the way FFmpeg does.
+    #[test]
+    fn rgb_to_planar_levels() {
+        for range in ["limited", "full"] {
+            let mut reference =
+                FilterChain::parse(&format!("format=yuv420p:bt601:{range}")).unwrap();
+            let src = solid_rgb(200, 30, 90);
+            let base = reference.apply(src.clone()).unwrap();
+            for to in ["yuv444p", "yuv422p"] {
+                let mut c = FilterChain::parse(&format!("format={to}:bt601:{range}")).unwrap();
+                let out = c.apply(src.clone()).unwrap();
+                for p in 0..3 {
+                    assert_eq!(sample(&out, p), sample(&base, p), "{to} {range} plane {p}");
+                }
+            }
+        }
+        // Limited range: black/white at 16/235 (8-bit) and 64/940 (10-bit).
+        for (to, black, white, mid) in [("yuv444p", 16, 235, 128), ("yuv420p10le", 64, 940, 512)] {
+            let mut c = FilterChain::parse(&format!("format={to}:bt601:limited")).unwrap();
+            let k = c.apply(solid_rgb(0, 0, 0)).unwrap();
+            let w = c.apply(solid_rgb(255, 255, 255)).unwrap();
+            assert_eq!((sample(&k, 0), sample(&w, 0)), (black, white), "{to}");
+            assert_eq!((sample(&k, 1), sample(&w, 2)), (mid, mid), "{to}");
+        }
+        // Full range, 10-bit: 0..1023 with chroma centred on 512.
+        let mut c = FilterChain::parse("format=yuv444p10le:bt601:full").unwrap();
+        let w = c.apply(solid_rgb(255, 255, 255)).unwrap();
+        assert_eq!((sample(&w, 0), sample(&w, 1)), (1023, 512));
+    }
+
+    #[test]
+    fn depth_changes_keep_the_layout() {
+        let src = frame_of(PixelFormat::Yuv422p, 6, 2);
+        let mut widen = FilterChain::parse("format=yuv422p10le").unwrap();
+        let wide = widen.apply(src.clone()).unwrap();
+        assert_eq!(sample(&wide, 0), sample(&src, 0) << 2);
+        let mut narrow = FilterChain::parse("format=yuv422p").unwrap();
+        assert_eq!(narrow.apply(wide).unwrap().planes, src.planes);
+        let mut twelve_to_ten = FilterChain::parse("format=yuv420p10").unwrap();
+        let ten = twelve_to_ten
+            .apply(frame_of(PixelFormat::Yuv420p12, 4, 4))
+            .unwrap();
+        assert_eq!(sample(&ten, 0), (2048 - 8 + 2) >> 2);
+    }
+
+    #[test]
+    fn format_names_follow_ffmpeg() {
+        assert!(FilterChain::parse("format=yuv444p").is_ok());
+        assert!(FilterChain::parse("format=yuv420p10le").is_ok());
+        let err = FilterChain::parse("format=nv12").err().unwrap();
+        assert!(err.to_string().contains("nv12"), "{err}");
     }
 }

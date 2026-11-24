@@ -104,6 +104,12 @@ struct OpenH264Encoder {
 }
 
 impl Encoder for OpenH264Encoder {
+    /// 8-bit 4:2:0 only; the pipeline converts anything else (RGB from a PNG,
+    /// 4:2:2/4:4:4, high bit depth) before it gets here.
+    fn accepted_pixel_formats(&self) -> Option<Vec<PixelFormat>> {
+        Some(vec![PixelFormat::Yuv420p])
+    }
+
     fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         let vf = match frame {
             Frame::Video(v) => v,

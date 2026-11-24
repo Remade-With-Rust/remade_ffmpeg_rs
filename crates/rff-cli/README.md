@@ -8,7 +8,7 @@ The command-line front-ends of **remade_ffmpeg_rs** — a ground-up,
 permissively-licensed Rust rebuild of FFmpeg. Installs `rff` and `rffprobe`,
 which speak the FFmpeg flags you already know.
 
-- **Familiar flags** — `-i`, `-c:v`, `-c:a`, `-b:v`, `-b:a`, `-q:a`, `-crf`, `-f`, `-y`/`-n`, `-map`, `-vf`, `-filter_complex`, `-frames:v`, `-codecs`, `-formats`.
+- **Familiar flags** — `-i`, `-c:v`, `-c:a`, `-b:v`, `-b:a`, `-q:a`, `-crf`, `-f`, `-y`/`-n`, `-map`, `-vf`, `-pix_fmt`, `-filter_complex`, `-frames:v`, `-codecs`, `-formats`.
 - **Pure Rust on the default path** — no C, no FFI, no copyleft. Apache-2.0.
 - **Optional drop-in names** — `--features drop-in-names` additionally installs executables named `ffmpeg` and `ffprobe`. Off by default, because installing them shadows a real FFmpeg on your `PATH` and that should be your explicit choice.
 - **`--features https`** adds `https://` streaming input on a pure-Rust rustls stack.

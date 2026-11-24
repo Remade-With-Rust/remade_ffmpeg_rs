@@ -193,6 +193,23 @@ impl Encoder for AvifEncoder {
         Ok(())
     }
 
+    /// Planar Y'CbCr, 8- and 10-bit, in preference order. 8-bit 4:2:0 leads,
+    /// so an RGB picture (PNG/JPEG/WebP) gets FFmpeg's `yuv420p` by default;
+    /// a high-bit-depth source keeps 10 bits; `-pix_fmt` picks any of them.
+    /// There is no alpha plane: an RGBA source loses its alpha (with a
+    /// warning from the pipeline), as an FFmpeg AVIF encode without an
+    /// explicit alpha stream does.
+    fn accepted_pixel_formats(&self) -> Option<Vec<PixelFormat>> {
+        Some(vec![
+            PixelFormat::Yuv420p,
+            PixelFormat::Yuv444p,
+            PixelFormat::Yuv422p,
+            PixelFormat::Yuv420p10,
+            PixelFormat::Yuv444p10,
+            PixelFormat::Yuv422p10,
+        ])
+    }
+
     fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         let vf = match frame {
             Frame::Video(v) => v,

@@ -362,6 +362,38 @@ impl PixelFormat {
         }
     }
 
+    /// The format FFmpeg calls `name` (`-pix_fmt yuv420p`, `format=yuv444p`).
+    /// High-bit-depth names take FFmpeg's `le` spelling or the bare one
+    /// (`yuv420p10le` / `yuv420p10`), since every sample here is little-endian.
+    pub fn from_name(name: &str) -> Option<PixelFormat> {
+        let name = name.trim().to_ascii_lowercase();
+        let name = name.strip_suffix("le").unwrap_or(&name);
+        Some(match name {
+            "yuv420p" => PixelFormat::Yuv420p,
+            "yuv422p" => PixelFormat::Yuv422p,
+            "yuv444p" => PixelFormat::Yuv444p,
+            "yuv420p10" => PixelFormat::Yuv420p10,
+            "yuv422p10" => PixelFormat::Yuv422p10,
+            "yuv444p10" => PixelFormat::Yuv444p10,
+            "yuv420p12" => PixelFormat::Yuv420p12,
+            "yuv422p12" => PixelFormat::Yuv422p12,
+            "yuv444p12" => PixelFormat::Yuv444p12,
+            "rgb24" => PixelFormat::Rgb24,
+            "rgba" => PixelFormat::Rgba,
+            _ => return None,
+        })
+    }
+
+    /// Packed RGB(A), as opposed to planar Y'CbCr.
+    pub fn is_rgb(self) -> bool {
+        matches!(self, PixelFormat::Rgb24 | PixelFormat::Rgba)
+    }
+
+    /// Carries an alpha channel.
+    pub fn has_alpha(self) -> bool {
+        matches!(self, PixelFormat::Rgba)
+    }
+
     /// Bits per component sample (8 for the 8-bit formats, 10 for the 10-bit
     /// planar ones).
     pub fn bit_depth(self) -> u32 {
