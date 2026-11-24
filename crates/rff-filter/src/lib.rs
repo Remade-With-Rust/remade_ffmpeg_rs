@@ -1422,6 +1422,10 @@ impl Filter for Negate {
 /// inserts this automatically when the target codec needs full range; the CLI
 /// name is exposed for when you need to override that.
 ///
+/// Every bit depth is rescaled (#214): limited range scales the 8-bit levels
+/// by `2^(depth-8)` (10-bit luma 64–940 / chroma 64–960, 12-bit 256–3760 /
+/// 256–3840) and full range is `0..2^depth-1`, as in FFmpeg.
+///
 /// RGB frames pass through untouched — the distinction is a Y'CbCr one.
 struct SetRange {
     to_full: bool,
@@ -1438,22 +1442,36 @@ impl SetRange {
         }
     }
 
-    /// 256-entry map for one component. Luma and chroma differ: limited luma is
-    /// 16–235, limited chroma 16–240.
-    fn lut(&self, chroma: bool) -> [u8; 256] {
-        let (lo, span) = if chroma { (16.0, 224.0) } else { (16.0, 219.0) };
-        let mut lut = [0u8; 256];
-        for (v, out) in lut.iter_mut().enumerate() {
-            let v = v as f32;
-            let mapped = if self.to_full {
-                (v - lo) * 255.0 / span
-            } else {
-                v * span / 255.0 + lo
-            };
-            *out = mapped.round().clamp(0.0, 255.0) as u8;
-        }
-        lut
+    /// `2^depth`-entry map for one component. Luma and chroma differ: limited
+    /// luma is 16–235, limited chroma 16–240 (at 8 bits).
+    fn lut(&self, depth: u32, chroma: bool) -> Vec<u16> {
+        (0..1u32 << depth)
+            .map(|v| range_map(v, depth, chroma, self.to_full) as u16)
+            .collect()
     }
+}
+
+/// One sample mapped between limited and full range at `depth` bits (8–16).
+///
+/// Limited range is the 8-bit `16..=235` (luma) / `16..=240` (chroma) scaled
+/// by `2^(depth-8)`; full range is `0..=2^depth-1`. The map is the exact
+/// rational one, `(v - lo) * max / span` to full and `v * span / max + lo` to
+/// limited, rounded half up and clamped, so out-of-range input saturates. At
+/// 8 bits it is, value for value, the float table this filter always used
+/// (a unit test pins all 256 entries), so 8-bit output is unchanged.
+fn range_map(v: u32, depth: u32, chroma: bool, to_full: bool) -> u32 {
+    let scale = 1u64 << (depth - 8);
+    let lo = 16 * scale;
+    let span = if chroma { 224 } else { 219 } * scale;
+    let max = (1u64 << depth) - 1;
+    let v = u64::from(v).min(max);
+    let mapped = if to_full {
+        let num = v.saturating_sub(lo) * max;
+        (2 * num + span) / (2 * span)
+    } else {
+        lo + (2 * v * span + max) / (2 * max)
+    };
+    mapped.min(max) as u32
 }
 
 impl Filter for SetRange {
@@ -1470,16 +1488,26 @@ impl Filter for SetRange {
     }
 
     fn filter(&mut self, mut frame: VideoFrame) -> Result<VideoFrame> {
-        // Only planar Y'CbCr has a range to convert.
-        if ensure_planar_yuv(&frame, "setrange").is_err() {
+        // Only planar Y'CbCr has a range to convert, at any bit depth.
+        if planar_subsampling(frame.format).is_none() || frame.planes.len() < 3 {
             return Ok(frame);
         }
-        let luma = self.lut(false);
-        let chroma = self.lut(true);
+        let depth = frame.format.bit_depth();
+        let luma = self.lut(depth, false);
+        let chroma = self.lut(depth, true);
+        let max = (1u16 << depth) - 1;
         for (i, plane) in frame.planes.iter_mut().enumerate() {
             let lut = if i == 0 { &luma } else { &chroma };
-            for b in plane.iter_mut() {
-                *b = lut[*b as usize];
+            if depth == 8 {
+                for b in plane.iter_mut() {
+                    *b = lut[*b as usize] as u8;
+                }
+            } else {
+                // Little-endian u16 samples; stray high bits are clamped.
+                for s in plane.chunks_exact_mut(2) {
+                    let v = u16::from_le_bytes([s[0], s[1]]).min(max);
+                    s.copy_from_slice(&lut[v as usize].to_le_bytes());
+                }
             }
         }
         Ok(frame)
@@ -1834,6 +1862,152 @@ mod setrange_tests {
             .unwrap();
         assert_eq!(out.planes[0][0], 0);
         assert_eq!(out.planes[0][1], 255);
+    }
+
+    /// The float table `SetRange` used before it grew bit depths; 8-bit
+    /// output must stay byte-identical to it.
+    fn legacy_lut(to_full: bool, chroma: bool) -> [u8; 256] {
+        let (lo, span) = if chroma { (16.0, 224.0) } else { (16.0, 219.0) };
+        let mut lut = [0u8; 256];
+        for (v, out) in lut.iter_mut().enumerate() {
+            let v = v as f32;
+            let mapped = if to_full {
+                (v - lo) * 255.0 / span
+            } else {
+                v * span / 255.0 + lo
+            };
+            *out = mapped.round().clamp(0.0, 255.0) as u8;
+        }
+        lut
+    }
+
+    #[test]
+    fn eight_bit_map_is_the_legacy_table() {
+        for to_full in [true, false] {
+            for chroma in [false, true] {
+                let old = legacy_lut(to_full, chroma);
+                for v in 0..256u32 {
+                    assert_eq!(
+                        range_map(v, 8, chroma, to_full),
+                        old[v as usize] as u32,
+                        "v={v} to_full={to_full} chroma={chroma}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Limited/full anchors at 8, 10 and 12 bits: black, white, chroma
+    /// extremes and the neutral chroma point.
+    #[test]
+    fn anchors_at_every_depth() {
+        for (depth, lo, y_hi, c_hi, max, mid) in [
+            (8, 16, 235, 240, 255, 128),
+            (10, 64, 940, 960, 1023, 512),
+            (12, 256, 3760, 3840, 4095, 2048),
+        ] {
+            // limited -> full
+            assert_eq!(range_map(lo, depth, false, true), 0, "{depth}");
+            assert_eq!(range_map(y_hi, depth, false, true), max, "{depth}");
+            assert_eq!(range_map(lo, depth, true, true), 0, "{depth}");
+            assert_eq!(range_map(c_hi, depth, true, true), max, "{depth}");
+            assert_eq!(range_map(mid, depth, true, true), mid, "{depth}");
+            // full -> limited
+            assert_eq!(range_map(0, depth, false, false), lo, "{depth}");
+            assert_eq!(range_map(max, depth, false, false), y_hi, "{depth}");
+            assert_eq!(range_map(0, depth, true, false), lo, "{depth}");
+            assert_eq!(range_map(max, depth, true, false), c_hi, "{depth}");
+            assert_eq!(range_map(mid, depth, true, false), mid, "{depth}");
+            // Out-of-range input saturates.
+            assert_eq!(range_map(0, depth, false, true), 0, "{depth}");
+            assert_eq!(range_map(max, depth, false, true), max, "{depth}");
+            assert_eq!(range_map(max + 1000, depth, true, true), max, "{depth}");
+        }
+    }
+
+    /// The map against the real-valued formula at 10 and 12 bits: never more
+    /// than half a step off, and monotonic.
+    #[test]
+    fn deep_maps_round_to_nearest_and_are_monotonic() {
+        for depth in [10u32, 12] {
+            let s = f64::from(1u32 << (depth - 8));
+            let max = f64::from((1u32 << depth) - 1);
+            for chroma in [false, true] {
+                let span = if chroma { 224.0 } else { 219.0 } * s;
+                let mut prev = (0, 0);
+                for v in 0..1u32 << depth {
+                    let to_full = range_map(v, depth, chroma, true);
+                    let ideal = ((f64::from(v) - 16.0 * s) * max / span).clamp(0.0, max);
+                    assert!((f64::from(to_full) - ideal).abs() <= 0.5, "{depth} {v}");
+                    let to_lim = range_map(v, depth, chroma, false);
+                    let ideal = f64::from(v) * span / max + 16.0 * s;
+                    assert!((f64::from(to_lim) - ideal).abs() <= 0.5, "{depth} {v}");
+                    assert!(to_full >= prev.0 && to_lim >= prev.1);
+                    prev = (to_full, to_lim);
+                }
+            }
+        }
+    }
+
+    fn planar16(format: PixelFormat, y: &[u16], u: u16, v: u16) -> VideoFrame {
+        let le = |s: &[u16]| s.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        VideoFrame {
+            width: 2,
+            height: 2,
+            format,
+            planes: vec![le(y), le(&[u]), le(&[v])],
+            strides: vec![4, 2, 2],
+            pts: None,
+        }
+    }
+
+    fn samples16(plane: &[u8]) -> Vec<u16> {
+        plane
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    }
+
+    /// #214: 10- and 12-bit frames are expanded, not skipped.
+    #[test]
+    fn high_bit_depth_frames_are_rescaled() {
+        let mut f = SetRange { to_full: true };
+        let out = f
+            .filter(planar16(
+                PixelFormat::Yuv420p10,
+                &[64, 940, 502, 940],
+                64,
+                960,
+            ))
+            .unwrap();
+        assert_eq!(samples16(&out.planes[0]), vec![0, 1023, 512, 1023]);
+        assert_eq!(samples16(&out.planes[1]), vec![0]);
+        assert_eq!(samples16(&out.planes[2]), vec![1023]);
+
+        let out = f
+            .filter(planar16(
+                PixelFormat::Yuv420p12,
+                &[256, 3760, 256, 3760],
+                256,
+                3840,
+            ))
+            .unwrap();
+        assert_eq!(samples16(&out.planes[0]), vec![0, 4095, 0, 4095]);
+        assert_eq!(samples16(&out.planes[1]), vec![0]);
+        assert_eq!(samples16(&out.planes[2]), vec![4095]);
+
+        let mut f = SetRange { to_full: false };
+        let out = f
+            .filter(planar16(
+                PixelFormat::Yuv444p10,
+                &[0, 1023, 0, 1023],
+                0,
+                1023,
+            ))
+            .unwrap();
+        assert_eq!(samples16(&out.planes[0]), vec![64, 940, 64, 940]);
+        assert_eq!(samples16(&out.planes[1]), vec![64]);
+        assert_eq!(samples16(&out.planes[2]), vec![960]);
     }
 
     #[test]

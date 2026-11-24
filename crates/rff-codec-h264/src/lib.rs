@@ -39,7 +39,9 @@
 use std::collections::VecDeque;
 
 use rff_codec::{Codec, CodecParams, CodecRegistry, Decoder, Encoder};
-use rff_core::{Dictionary, Error, Frame, MediaType, Packet, PixelFormat, Result, VideoFrame};
+use rff_core::{
+    ColorRange, Dictionary, Error, Frame, MediaType, Packet, PixelFormat, Result, VideoFrame,
+};
 use rusty_h264::{
     Decoder as RustyDecoder, Encoder as RustyEncoder, EncoderConfig, Preset, Profile, YuvFrame,
 };
@@ -80,6 +82,105 @@ fn au_has_idr(data: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// The VUI written after `vui_parameters_present_flag = 1` to signal full
+/// range and nothing else (H.264 E.1.1), one bit per entry:
+/// `aspect_ratio_info_present_flag` 0, `overscan_info_present_flag` 0,
+/// `video_signal_type_present_flag` 1, `video_format` 5 (unspecified, 3 bits),
+/// `video_full_range_flag` 1, `colour_description_present_flag` 0,
+/// `chroma_loc_info_present_flag` 0, `timing_info_present_flag` 0,
+/// `nal_hrd_parameters_present_flag` 0, `vcl_hrd_parameters_present_flag` 0,
+/// `pic_struct_present_flag` 0, `bitstream_restriction_flag` 0. Absent fields
+/// take the values an SPS without a VUI implies, so only the range changes.
+const FULL_RANGE_VUI: [u8; 14] = [0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+
+/// An SPS NAL (header byte included, no start code) with a VUI that signals
+/// full range. `rusty_h264` writes `vui_parameters_present_flag = 0` as the
+/// last syntax element before `rbsp_trailing_bits` (checked by parsing to
+/// it): that bit becomes 1 and the VUI follows it.
+///
+/// `None` when the NAL is not an SPS, is malformed, or already has a VUI
+/// (left alone).
+fn sps_with_full_range_vui(nal: &[u8]) -> Option<Vec<u8>> {
+    if nal.first()? & 0x1f != 7 {
+        return None;
+    }
+    // RBSP: drop emulation-prevention bytes (00 00 03 → 00 00).
+    let mut rbsp = Vec::with_capacity(nal.len());
+    let mut zeros = 0;
+    for &b in &nal[1..] {
+        if zeros >= 2 && b == 3 {
+            zeros = 0;
+            continue;
+        }
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        rbsp.push(b);
+    }
+    let last = rbsp.iter().rposition(|&b| b != 0)?;
+    let stop = last * 8 + 7 - rbsp[last].trailing_zeros() as usize;
+    let bit = |i: usize| (rbsp[i / 8] >> (7 - i % 8)) & 1;
+    // Only an SPS whose last element really is a cleared VUI flag: parse
+    // to it rather than trust the position.
+    if stop == 0 || sps_vui_flag_pos(&rbsp)? != stop - 1 || bit(stop - 1) != 0 {
+        return None;
+    }
+    let mut bits: Vec<u8> = (0..stop - 1).map(bit).collect();
+    bits.push(1); // vui_parameters_present_flag
+    bits.extend_from_slice(&FULL_RANGE_VUI);
+    bits.push(1); // rbsp_stop_one_bit
+    while bits.len() % 8 != 0 {
+        bits.push(0); // rbsp_alignment_zero_bit
+    }
+    let mut out = Vec::with_capacity(nal.len() + 4);
+    out.push(nal[0]);
+    let mut zeros = 0;
+    for byte in bits
+        .chunks(8)
+        .map(|c| c.iter().fold(0u8, |a, &b| (a << 1) | b))
+    {
+        if zeros >= 2 && byte <= 3 {
+            out.push(3); // emulation_prevention_three_byte
+            zeros = 0;
+        }
+        zeros = if byte == 0 { zeros + 1 } else { 0 };
+        out.push(byte);
+    }
+    Some(out)
+}
+
+/// Rewrite every SPS in an Annex-B access unit with
+/// [`sps_with_full_range_vui`]; all other bytes are copied as they are.
+fn signal_full_range(au: &[u8]) -> Vec<u8> {
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i + 3 <= au.len() {
+        if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
+            starts.push(i);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let mut out = Vec::with_capacity(au.len() + 8);
+    let mut copied = 0;
+    for (k, &sc) in starts.iter().enumerate() {
+        let begin = sc + 3;
+        let end = starts.get(k + 1).copied().unwrap_or(au.len());
+        // Zero bytes before the next start code belong to it (or are
+        // trailing_zero_8bits), not to this NAL.
+        let mut nal_end = end;
+        while nal_end > begin && au[nal_end - 1] == 0 {
+            nal_end -= 1;
+        }
+        if let Some(sps) = sps_with_full_range_vui(&au[begin..nal_end]) {
+            out.extend_from_slice(&au[copied..begin]);
+            out.extend_from_slice(&sps);
+            copied = nal_end;
+        }
+    }
+    out.extend_from_slice(&au[copied..]);
+    out
 }
 
 /// Split an Annex-B stream into access units: each ends after a VCL
@@ -351,6 +452,38 @@ impl Bits<'_> {
 /// from the level (Table A-1). A picture larger than its level allows, or an
 /// unknown level, gets the maximum of 16.
 fn sps_max_dpb_frames(rbsp: &[u8]) -> Option<usize> {
+    sps_scan(rbsp).map(|s| s.max_dpb_frames)
+}
+
+/// What [`sps_scan`] reads from an SPS RBSP.
+struct SpsScan {
+    max_dpb_frames: usize,
+    /// Bit position just after `frame_mbs_only_flag`.
+    pos: usize,
+    frame_mbs_only: bool,
+}
+
+/// Bit position of `vui_parameters_present_flag` in an SPS RBSP.
+fn sps_vui_flag_pos(rbsp: &[u8]) -> Option<usize> {
+    let scan = sps_scan(rbsp)?;
+    let mut r = Bits {
+        data: rbsp,
+        pos: scan.pos,
+    };
+    if !scan.frame_mbs_only {
+        r.bit()?; // mb_adaptive_frame_field_flag
+    }
+    r.bit()?; // direct_8x8_inference_flag
+    if r.bit()? == 1 {
+        for _ in 0..4 {
+            r.ue()?; // frame_crop_*_offset
+        }
+    }
+    Some(r.pos)
+}
+
+/// Walk an SPS RBSP to `frame_mbs_only_flag`; MaxDpbFrames along the way.
+fn sps_scan(rbsp: &[u8]) -> Option<SpsScan> {
     let mut r = Bits { data: rbsp, pos: 0 };
     let profile_idc = r.bits(8)?;
     let constraint_set3 = r.bits(8)? & 0x10 != 0;
@@ -424,11 +557,16 @@ fn sps_max_dpb_frames(rbsp: &[u8]) -> Option<usize> {
         50 => 110400,
         51 | 52 => 184320,
         60..=62 => 696320,
-        _ => return Some(MAX_DPB_FRAMES),
+        _ => 0,
     };
-    Some(match max_dpb_mbs / frame_mbs {
+    let max_dpb_frames = match max_dpb_mbs / frame_mbs {
         0 => MAX_DPB_FRAMES,
         n => n.min(MAX_DPB_FRAMES),
+    };
+    Some(SpsScan {
+        max_dpb_frames,
+        pos: r.pos,
+        frame_mbs_only,
     })
 }
 
@@ -506,6 +644,9 @@ struct H264Encoder {
     pending_pts: VecDeque<Option<i64>>,
     queue: VecDeque<Packet>,
     eof: bool,
+    /// Full-range input: `rusty_h264` writes no VUI, so the adapter adds one
+    /// with `video_full_range_flag` to every SPS it emits.
+    full_range: bool,
 }
 
 impl H264Encoder {
@@ -516,6 +657,7 @@ impl H264Encoder {
             pending_pts: VecDeque::new(),
             queue: VecDeque::new(),
             eof: false,
+            full_range: false,
         }
     }
 
@@ -525,7 +667,12 @@ impl H264Encoder {
             return;
         }
         for au in split_access_units(stream) {
-            let mut packet = Packet::from_data(0, au.to_vec());
+            let data = if self.full_range {
+                signal_full_range(au)
+            } else {
+                au.to_vec()
+            };
+            let mut packet = Packet::from_data(0, data);
             packet.flags.keyframe = au_has_idr(au);
             packet.pts = self.pending_pts.pop_front().flatten();
             packet.dts = packet.pts;
@@ -606,6 +753,13 @@ impl Encoder for H264Encoder {
     /// 4:2:2/4:4:4, high bit depth) before it gets here.
     fn accepted_pixel_formats(&self) -> Option<Vec<PixelFormat>> {
         Some(vec![PixelFormat::Yuv420p])
+    }
+
+    /// Full range is signalled in a VUI the adapter adds to the SPS;
+    /// limited range writes no VUI (byte-identical to before).
+    fn set_color_range(&mut self, range: ColorRange) -> bool {
+        self.full_range = range == ColorRange::Full;
+        true
     }
 
     fn send_frame(&mut self, frame: &Frame) -> Result<()> {
@@ -749,6 +903,93 @@ mod tests {
             }
             Frame::Audio(_) => panic!("expected a video frame"),
         }
+    }
+
+    /// #213: a full-range encode carries `video_full_range_flag = 1` in a VUI
+    /// on every SPS, decodes to the same pixels, and a limited encode is
+    /// byte-identical to one that was never told a range (no VUI).
+    #[test]
+    fn full_range_is_signalled_in_the_sps_vui() {
+        let (w, h) = (64u32, 48u32);
+        let encode = |range: Option<ColorRange>| -> Vec<Vec<u8>> {
+            let mut enc = H264Encoder::new();
+            enc.configure(&{
+                let mut d = Dictionary::new();
+                d.set("g", "3");
+                d
+            })
+            .unwrap();
+            if let Some(r) = range {
+                assert!(enc.set_color_range(r));
+            }
+            for i in 0..7 {
+                enc.send_frame(&grey_frame(w, h, 60 + i as u8 * 20, i))
+                    .unwrap();
+            }
+            enc.flush();
+            drain(&mut enc).into_iter().map(|p| p.data).collect()
+        };
+        let plain = encode(None);
+        assert_eq!(encode(Some(ColorRange::Limited)), plain);
+        let full = encode(Some(ColorRange::Full));
+        assert_eq!(full.len(), plain.len());
+
+        // Every SPS: the bits before rbsp_stop_one_bit are
+        // vui_parameters_present_flag = 1 followed by the full-range VUI.
+        let mut sps_seen = 0;
+        for au in &full {
+            let mut i = 0;
+            while i + 3 < au.len() {
+                if au[i..i + 3] == [0, 0, 1] && au[i + 3] & 0x1f == 7 {
+                    let end = (i + 3..au.len().saturating_sub(2))
+                        .find(|&j| au[j..j + 3] == [0, 0, 1])
+                        .unwrap_or(au.len());
+                    let mut nal = &au[i + 3..end];
+                    while nal.last() == Some(&0) {
+                        nal = &nal[..nal.len() - 1];
+                    }
+                    let last = *nal.last().unwrap();
+                    let bits: Vec<u8> = nal
+                        .iter()
+                        .flat_map(|b| (0..8).map(move |k| (b >> (7 - k)) & 1))
+                        .collect();
+                    let stop = bits.len() - 1 - last.trailing_zeros() as usize;
+                    assert_eq!(bits[stop - 15], 1, "vui_parameters_present_flag");
+                    assert_eq!(&bits[stop - 14..stop], &FULL_RANGE_VUI);
+                    sps_seen += 1;
+                }
+                i += 1;
+            }
+        }
+        assert!(sps_seen >= 2, "every IDR carries an SPS; saw {sps_seen}");
+        // A limited SPS has no VUI to patch twice.
+        let sps = |au: &[u8]| {
+            let i = (0..au.len())
+                .find(|&i| au[i..].starts_with(&[0, 0, 1, 0x67]))
+                .unwrap();
+            let end = (i + 3..au.len())
+                .find(|&j| au[j..].starts_with(&[0, 0, 1]))
+                .unwrap();
+            au[i + 3..end].to_vec()
+        };
+        let patched = sps_with_full_range_vui(&sps(&plain[0])).unwrap();
+        assert_eq!(sps_with_full_range_vui(&patched), None);
+
+        let decode = |packets: &[Vec<u8>]| -> Vec<Vec<Vec<u8>>> {
+            let mut dec = H264Decoder::new();
+            for p in packets {
+                dec.send_packet(&Packet::from_data(0, p.clone())).unwrap();
+            }
+            dec.flush();
+            let mut out = Vec::new();
+            while let Ok(Frame::Video(v)) = dec.receive_frame() {
+                out.push(v.planes);
+            }
+            out
+        };
+        let frames = decode(&plain);
+        assert_eq!(frames.len(), 7);
+        assert_eq!(decode(&full), frames);
     }
 
     /// The default configuration runs a lookahead: frames buffer, then come

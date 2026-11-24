@@ -14,7 +14,8 @@
 use std::collections::HashMap;
 
 use rff_core::{
-    CodecId, Dictionary, Error, Frame, MediaType, Packet, PixelFormat, Result, SampleFormat,
+    CodecId, ColorRange, Dictionary, Error, Frame, MediaType, Packet, PixelFormat, Result,
+    SampleFormat,
 };
 
 /// Stream parameters handed to a decoder before the first packet. Self-describing
@@ -87,6 +88,25 @@ pub trait Encoder: Send {
     /// leaves this `None` must genuinely handle every format it is given.
     fn accepted_pixel_formats(&self) -> Option<Vec<PixelFormat>> {
         None
+    }
+
+    /// Tell a video encoder the colour range of the frames it will receive.
+    /// Called once, before the first frame, with [`ColorRange::Limited`] or
+    /// [`ColorRange::Full`].
+    ///
+    /// Return `true` when the encoder takes frames in that range: it either
+    /// signals the range in its bitstream (the AV1 sequence header's
+    /// `color_range`, the VP9 frame header's `color_range`, the H.264 VUI's
+    /// `video_full_range_flag`) or has a fixed range of its own that the
+    /// pipeline already reconciles (JPEG, PNG, raw video). Return `false` when
+    /// it cannot signal `range`: the pipeline then converts the frames to
+    /// limited range, what a bitstream without a range flag is read as, and
+    /// calls this again with `Limited`. FFmpeg's encoders do the same through
+    /// `AVCodecContext::color_range`.
+    ///
+    /// Default: `true`, with nothing signalled.
+    fn set_color_range(&mut self, _range: ColorRange) -> bool {
+        true
     }
 
     /// Submit one raw frame for encoding.

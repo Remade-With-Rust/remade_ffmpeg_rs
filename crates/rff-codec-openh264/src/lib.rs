@@ -11,10 +11,11 @@
 use std::collections::VecDeque;
 
 use openh264::decoder::Decoder as H264CDecoder;
-use openh264::encoder::Encoder as H264CEncoder;
+use openh264::encoder::{Encoder as H264CEncoder, EncoderConfig as H264CConfig, VuiConfig};
 use openh264::formats::{YUVBuffer, YUVSource};
+use openh264::OpenH264API;
 use rff_codec::{Codec, CodecRegistry, Decoder, Encoder};
-use rff_core::{Error, Frame, MediaType, Packet, PixelFormat, Result, VideoFrame};
+use rff_core::{ColorRange, Error, Frame, MediaType, Packet, PixelFormat, Result, VideoFrame};
 
 /// Register the openh264-backed H.264 codec, overriding the scaffold for
 /// [`CodecId::H264`](rff_core::CodecId::H264). Called only when the
@@ -101,9 +102,18 @@ struct OpenH264Encoder {
     encoder: Option<H264CEncoder>,
     queue: VecDeque<Packet>,
     eof: bool,
+    /// Full-range input: signalled in the SPS VUI (`video_full_range_flag`).
+    full_range: bool,
 }
 
 impl Encoder for OpenH264Encoder {
+    /// Full range goes into the VUI (BT.601, the matrix the pipeline's
+    /// RGB → Y'CbCr conversion uses); limited range writes no VUI, as before.
+    fn set_color_range(&mut self, range: ColorRange) -> bool {
+        self.full_range = range == ColorRange::Full;
+        true
+    }
+
     /// 8-bit 4:2:0 only; the pipeline converts anything else (RGB from a PNG,
     /// 4:2:2/4:4:4, high bit depth) before it gets here.
     fn accepted_pixel_formats(&self) -> Option<Vec<PixelFormat>> {
@@ -144,7 +154,13 @@ impl Encoder for OpenH264Encoder {
         }
 
         if self.encoder.is_none() {
-            self.encoder = Some(H264CEncoder::new().map_err(map_err)?);
+            self.encoder = Some(if self.full_range {
+                let config = H264CConfig::new().vui(VuiConfig::bt601().full_range(true));
+                H264CEncoder::with_api_config(OpenH264API::from_source(), config)
+                    .map_err(map_err)?
+            } else {
+                H264CEncoder::new().map_err(map_err)?
+            });
         }
         let encoder = self.encoder.as_mut().unwrap();
         let yuv = YUVBuffer::from_vec(i420, w, h);
