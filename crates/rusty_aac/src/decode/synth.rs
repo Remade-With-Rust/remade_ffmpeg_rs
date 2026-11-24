@@ -6,9 +6,12 @@
 //! The overlap logic follows the reference decoder's buffer discipline exactly:
 //! each channel keeps `saved` (the not-yet-overlapped second half of the last
 //! transform) and every frame is `out = window(saved, this_half)`. Window *shape*
-//! transitions take the previous frame's shape on the rising half, and the
-//! "meaningless" long↔short transitions some encoders emit are treated as
-//! short↔short, which is what keeps such streams sample-identical to FFmpeg.
+//! transitions take the previous frame's shape on the rising half. Irregular
+//! window-*sequence* transitions (the previous right slope and this left slope
+//! of different lengths, e.g. `ONLY_LONG` → `EIGHT_SHORT`) are not folded into
+//! one slope as FFmpeg does: each frame is windowed by its own sequence and the
+//! halves are summed, as ISO/IEC 14496-3 defines it (`irregular_overlap`,
+//! issue #208).
 
 use crate::dsp;
 use crate::ics::WindowSequence;
@@ -197,6 +200,125 @@ pub struct SynthIn<'a> {
     pub prev_kbd: bool,
 }
 
+/// This frame's short-slope left half overlapped with `saved`: the copy of the
+/// flat part of `saved`, the short overlap at `ov`, then either the eight-short
+/// windows 1–4 (`EIGHT_SHORT`) or the flat body (`LONG_STOP`). `temp` receives
+/// window 4's overlap, whose second half seeds the next `saved`.
+///
+/// Exact for every transition whose previous right slope is short too — then
+/// `saved` already carries the previous frame's flat / zero regions. With a zero
+/// `saved` it yields this frame's left half alone; with a zero `buf` and a
+/// non-eight-short `seq`, the previous frame's short-slope right half alone.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the two windows, the frame geometry and the four buffers are distinct borrows"
+)]
+#[inline(always)]
+fn short_left(
+    out: &mut [f32],
+    saved: &[f32],
+    buf: &[f32],
+    temp: &mut [f32],
+    swin_prev: &[f32],
+    swin: &[f32],
+    l: usize,
+    seq: WindowSequence,
+) {
+    let sh = l / 8;
+    let hs = sh / 2;
+    let ov = l / 2 - hs;
+    out[..ov].copy_from_slice(&saved[..ov]);
+    fmul_window(&mut out[ov..], &saved[ov..], buf, swin_prev, hs);
+    if seq == WindowSequence::EightShort {
+        // The sources are read straight from `buf`: the destinations
+        // (`out`, `temp`, `saved`) never alias it, so the per-window
+        // `.to_vec()` copies were pure overhead.
+        for k in 1..4 {
+            let (a, b) = ((k - 1) * sh + hs, k * sh);
+            fmul_window(
+                &mut out[ov + k * sh..],
+                &buf[a..a + hs],
+                &buf[b..b + hs],
+                swin,
+                hs,
+            );
+        }
+        fmul_window(
+            temp,
+            &buf[3 * sh + hs..4 * sh],
+            &buf[4 * sh..4 * sh + hs],
+            swin,
+            hs,
+        );
+        out[ov + 4 * sh..ov + 4 * sh + hs].copy_from_slice(&temp[..hs]);
+    } else {
+        out[ov + sh..ov + sh + ov].copy_from_slice(&buf[hs..hs + ov]);
+    }
+}
+
+/// An IRREGULAR window-sequence transition: the previous frame's right slope
+/// and this frame's left slope differ in length (`ONLY_LONG`/`LONG_STOP` →
+/// `EIGHT_SHORT`/`LONG_STOP`, or `LONG_START`/`EIGHT_SHORT` →
+/// `ONLY_LONG`/`LONG_START`). The one-pass shortcut above assumes one shared
+/// slope; here, as ISO/IEC 14496-3 4.6.11.3 (and the reference decoder, and
+/// FAAD2) defines it, each frame is windowed by its OWN window sequence and the
+/// two halves are overlap-added: `out = prev_right(saved) + cur_left(buf)`.
+/// Both slopes take the previous frame's window shape (its right half is its
+/// own shape; this frame's left half is `window_shape_previous`).
+///
+/// The overlap state written afterwards depends on this frame alone, so
+/// `saved` keeps its meaning for the next frame and for LTP.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the three windows, the frame geometry and the four buffers are distinct borrows"
+)]
+#[cold]
+#[inline(never)]
+fn irregular_overlap(
+    out: &mut [f32],
+    saved: &[f32],
+    buf: &[f32],
+    temp: &mut [f32],
+    lwin_prev: &[f32],
+    swin_prev: &[f32],
+    swin: &[f32],
+    l: usize,
+    prev_long: bool,
+    seq: WindowSequence,
+) {
+    let half = l / 2;
+    let zeros = [0f32; 1024];
+    let zeros = &zeros[..l];
+    let mut prev = [0f32; 1024];
+    let prev = &mut prev[..l];
+    if prev_long {
+        // Previous ONLY_LONG / LONG_STOP: `saved` is its unwindowed right half,
+        // falling on the long slope across the whole frame.
+        fmul_window(prev, saved, zeros, lwin_prev, half);
+        // This LONG_STOP / EIGHT_SHORT frame's left half (zeros, short slope,
+        // flat body or short windows), with no overlap state.
+        short_left(out, zeros, buf, temp, swin_prev, swin, l, seq);
+    } else {
+        // Previous LONG_START / EIGHT_SHORT: `saved` holds its flat (or already
+        // windowed) part and the unwindowed short falling slope; zeros follow.
+        short_left(
+            prev,
+            saved,
+            zeros,
+            temp,
+            swin_prev,
+            swin,
+            l,
+            WindowSequence::LongStop,
+        );
+        // This ONLY_LONG / LONG_START frame's left half: the long rising slope.
+        fmul_window(out, zeros, buf, lwin_prev, half);
+    }
+    for (o, p) in out[..l].iter_mut().zip(prev.iter()) {
+        *o += *p;
+    }
+}
+
 /// GA synthesis for frame length `L` (1024 or 960). `buf` (len `L`) receives the
 /// half IMDCT (reused by LTP), `out` (len `L`) the PCM, `saved` (len `L/2`) is
 /// the overlap state.
@@ -233,38 +355,24 @@ pub fn imdct_and_window(
     // per call - and only the eight-short path writes and reads it.
     let mut temp = [0f32; 128];
     let temp = &mut temp[..sh];
-    if is_long_end(s.prev_seq)
-        && matches!(s.seq, WindowSequence::OnlyLong | WindowSequence::LongStart)
-    {
-        fmul_window(out, saved, buf, lwin_prev, l / 2);
-    } else {
-        out[..ov].copy_from_slice(&saved[..ov]);
-        fmul_window(&mut out[ov..], &saved[ov..], buf, swin_prev, hs);
-        if s.seq == WindowSequence::EightShort {
-            // The sources are read straight from `buf`: the destinations
-            // (`out`, `temp`, `saved`) never alias it, so the per-window
-            // `.to_vec()` copies were pure overhead.
-            for k in 1..4 {
-                let (a, b) = ((k - 1) * sh + hs, k * sh);
-                fmul_window(
-                    &mut out[ov + k * sh..],
-                    &buf[a..a + hs],
-                    &buf[b..b + hs],
-                    swin,
-                    hs,
-                );
-            }
-            fmul_window(
-                temp,
-                &buf[3 * sh + hs..4 * sh],
-                &buf[4 * sh..4 * sh + hs],
-                swin,
-                hs,
-            );
-            out[ov + 4 * sh..ov + 4 * sh + hs].copy_from_slice(&temp[..hs]);
+    // The overlap slope type on each side of the frame boundary: the previous
+    // frame's RIGHT slope is long for ONLY_LONG / LONG_STOP, short for
+    // LONG_START / EIGHT_SHORT; this frame's LEFT slope is long for
+    // ONLY_LONG / LONG_START, short for LONG_STOP / EIGHT_SHORT.
+    let prev_long = is_long_end(s.prev_seq);
+    let cur_long = matches!(s.seq, WindowSequence::OnlyLong | WindowSequence::LongStart);
+    if prev_long == cur_long {
+        // Regular transition: both halves share one slope, so the falling
+        // (previous) and rising (current) halves are windowed in one pass.
+        if cur_long {
+            fmul_window(out, saved, buf, lwin_prev, l / 2);
         } else {
-            out[ov + sh..ov + sh + ov].copy_from_slice(&buf[hs..hs + ov]);
+            short_left(out, saved, buf, temp, swin_prev, swin, l, s.seq);
         }
+    } else {
+        irregular_overlap(
+            out, saved, buf, temp, lwin_prev, swin_prev, swin, l, prev_long, s.seq,
+        );
     }
 
     match s.seq {
@@ -460,5 +568,194 @@ mod fmul_window_twin {
                 "len={len}"
             );
         }
+    }
+}
+
+/// Issue #208: [`imdct_and_window`] against a straightforward ISO/IEC 14496-3
+/// 4.6.11 filterbank written from the spec text — a direct-formula f64 IMDCT,
+/// the full `2N`-sample window of each `window_sequence` (left half in
+/// `window_shape_previous`, right half in `window_shape`), and an explicit
+/// overlap-add `out = z_cur[n] + z_prev[n + N/2]`. Every prev → cur sequence
+/// pair (all 16, legal or not), both shapes on both sides, both frame lengths.
+#[cfg(test)]
+mod iso_filterbank {
+    use super::{imdct_and_window, SynthIn, Windows};
+    use crate::ics::WindowSequence::{self, EightShort, LongStart, LongStop, OnlyLong};
+    use std::f64::consts::PI;
+
+    const SEQS: [WindowSequence; 4] = [OnlyLong, LongStart, EightShort, LongStop];
+
+    /// Spec IMDCT: `N/2` coefficients → `N` samples,
+    /// `x[i] = (2/N)·Σ_k X[k]·cos((2π/N)(i + n0)(k + ½))`, `n0 = (N/2 + 1)/2`.
+    fn imdct(spec: &[f32]) -> Vec<f64> {
+        let n = 2 * spec.len();
+        let n0 = n as f64 / 4.0 + 0.5; // (N/2 + 1)/2
+        (0..n)
+            .map(|i| {
+                let acc: f64 = spec
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &x)| {
+                        f64::from(x)
+                            * (2.0 * PI / n as f64 * (i as f64 + n0) * (k as f64 + 0.5)).cos()
+                    })
+                    .sum();
+                2.0 / n as f64 * acc
+            })
+            .collect()
+    }
+
+    fn bessel_i0(x: f64) -> f64 {
+        let (mut sum, mut term) = (1.0, 1.0);
+        for k in 1..60 {
+            term *= x / 2.0 / f64::from(k);
+            sum += term * term;
+        }
+        sum
+    }
+
+    /// The rising half (`n < N/2`) of the length-`N` window of one shape.
+    fn rising(n_win: usize, kbd: bool) -> Vec<f64> {
+        let half = n_win / 2;
+        if !kbd {
+            return (0..half)
+                .map(|n| (PI / n_win as f64 * (n as f64 + 0.5)).sin())
+                .collect();
+        }
+        let alpha = if n_win <= 256 { 6.0 } else { 4.0 };
+        let q = n_win as f64 / 4.0;
+        let k: Vec<f64> = (0..=half)
+            .map(|p| bessel_i0(PI * alpha * (1.0 - ((p as f64 - q) / q).powi(2)).sqrt()))
+            .collect();
+        let total: f64 = k.iter().sum();
+        let mut acc = 0.0;
+        (0..half)
+            .map(|n| {
+                acc += k[n];
+                (acc / total).sqrt()
+            })
+            .collect()
+    }
+
+    /// The windowed time signal `z[0..2L]` of one frame (frame length `l`).
+    fn frame_time(
+        coeffs: &[f32],
+        l: usize,
+        seq: WindowSequence,
+        kbd: bool,
+        prev_kbd: bool,
+    ) -> Vec<f64> {
+        let sh = l / 8;
+        let ov = l / 2 - sh / 2; // 448 / 420
+        let (ll, lr) = (rising(2 * l, prev_kbd), rising(2 * l, kbd));
+        let (sl, sr) = (rising(2 * sh, prev_kbd), rising(2 * sh, kbd));
+        let mut z = vec![0f64; 2 * l];
+        if seq == EightShort {
+            for w in 0..8 {
+                let y = imdct(&coeffs[w * 128..w * 128 + sh]);
+                let left = if w == 0 { &sl } else { &sr };
+                for (n, &v) in y.iter().enumerate() {
+                    let win = if n < sh { left[n] } else { sr[2 * sh - 1 - n] };
+                    z[ov + w * sh + n] += v * win;
+                }
+            }
+            return z;
+        }
+        let y = imdct(&coeffs[..l]);
+        for (n, zn) in z.iter_mut().enumerate() {
+            let win = if n < l {
+                match seq {
+                    LongStop if n < ov => 0.0,
+                    LongStop if n < ov + sh => sl[n - ov],
+                    LongStop => 1.0,
+                    _ => ll[n],
+                }
+            } else {
+                let m = n - l;
+                match seq {
+                    LongStart if m < ov => 1.0,
+                    LongStart if m < ov + sh => sr[sh - 1 - (m - ov)],
+                    LongStart => 0.0,
+                    _ => lr[l - 1 - m],
+                }
+            };
+            *zn = y[n] * win;
+        }
+        z
+    }
+
+    fn coeffs(seed: u32) -> Vec<f32> {
+        // Deterministic, broadband, decaying with frequency; peaks O(0.5) after
+        // the 1/32768 output scale.
+        let mut s = seed;
+        (0..1024)
+            .map(|k| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let u = (s >> 8) as f32 / (1u32 << 24) as f32 - 0.5;
+                u * 4.0e6 / (1.0 + (k % 128) as f32 / 16.0)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_transition_matches_iso_overlap_add() {
+        let (ca, cb) = (coeffs(1), coeffs(2));
+        let mut worst_regular = 0f64;
+        let mut worst_irregular = 0f64;
+        for l in [1024usize, 960] {
+            let w = Windows::new(l);
+            for prev in SEQS {
+                for cur in SEQS {
+                    for prev_kbd in [false, true] {
+                        for kbd in [false, true] {
+                            let mut buf = vec![0f32; l];
+                            let mut saved = vec![0f32; l / 2];
+                            let mut out = vec![0f32; l];
+                            // Frame A (`prev`): its own left half is irrelevant;
+                            // only the overlap state it leaves matters.
+                            let sa = SynthIn {
+                                coeffs: &ca,
+                                seq: prev,
+                                prev_seq: prev,
+                                kbd: prev_kbd,
+                                prev_kbd,
+                            };
+                            imdct_and_window(&w, l, &sa, &mut buf, &mut saved, &mut out);
+                            let sb = SynthIn {
+                                coeffs: &cb,
+                                seq: cur,
+                                prev_seq: prev,
+                                kbd,
+                                prev_kbd,
+                            };
+                            imdct_and_window(&w, l, &sb, &mut buf, &mut saved, &mut out);
+
+                            let za = frame_time(&ca, l, prev, prev_kbd, prev_kbd);
+                            let zb = frame_time(&cb, l, cur, kbd, prev_kbd);
+                            let err = (0..l)
+                                .map(|n| {
+                                    let want = (zb[n] + za[n + l]) / 32768.0;
+                                    (f64::from(out[n]) - want).abs()
+                                })
+                                .fold(0f64, f64::max);
+                            let regular = matches!(prev, OnlyLong | LongStop)
+                                == matches!(cur, OnlyLong | LongStart);
+                            if regular {
+                                worst_regular = worst_regular.max(err);
+                            } else {
+                                worst_irregular = worst_irregular.max(err);
+                            }
+                            // 1e-5 of full scale is a third of one 16-bit LSB;
+                            // the single-slope shortcut misses by ~1e-2 here.
+                            assert!(
+                                err < 1e-5,
+                                "l={l} {prev:?}(kbd={prev_kbd}) -> {cur:?}(kbd={kbd}): max err {err:e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("worst |err|: regular {worst_regular:e}, irregular {worst_irregular:e}");
     }
 }
