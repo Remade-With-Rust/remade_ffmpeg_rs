@@ -511,3 +511,74 @@ fn words(r2: &[u8], r1: &[u8], i: usize) -> Option<(u64, u64)> {
     let q = r1.get(i..)?.first_chunk::<8>()?;
     Some((u64::from_ne_bytes(*p), u64::from_ne_bytes(*q)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn noise(w: u32, h: u32, seed: &mut u32) -> Bitmap {
+        let mut data = vec![0u8; w.div_ceil(8) as usize * h as usize];
+        for v in &mut data {
+            *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *v = (*seed >> 24) as u8;
+        }
+        Bitmap::from_packed(w, h, data)
+    }
+
+    /// Every pixel's context, as a row is gone through by bytes, against its
+    /// windows read off one pixel at a time.
+    fn contexts<S: Shape>() {
+        let mut seed = 1;
+        for w in [1u32, 7, 8, 9, 23, 40, 65] {
+            let rows = noise(w, 3, &mut seed);
+            let get = |x: i64, y: u32| match u32::try_from(x) {
+                Ok(x) if x < w => rows.get(x, y),
+                _ => 0,
+            };
+            let window = |x: i64, y: u32, right: i64, n: u32| {
+                (0..i64::from(n)).fold(0, |v, k| v | get(x + right - k, y) << k)
+            };
+            let (r2, r1) = (rows.row(0), rows.row(1));
+            let mut c = first::<S>(r2, r1);
+            for i in 0..r1.len() {
+                let two =
+                    |r: &[u8]| u32::from(r[i]) << 8 | u32::from(r.get(i + 1).copied().unwrap_or(0));
+                // Anything above the two bytes is of no consequence.
+                let junk = 0xABCD_0000;
+                let mut next = entering::<S>(two(r2) | junk, two(r1) | junk);
+                for x in i as i64 * 8..(i as i64 * 8 + 8).min(i64::from(w)) {
+                    let mut want = window(x, 1, i64::from(S::R1.1), S::R1.0)
+                        | window(x, 2, -1, S::H.0) << S::H.1;
+                    if S::R2.0 != 0 {
+                        want |= window(x, 0, i64::from(S::R2.2), S::R2.0) << S::R2.1;
+                    }
+                    assert_eq!(c, want, "{w} {x}");
+                    c = advance::<S>(c, get(x, 2), next);
+                    next <<= 1;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contexts_match_single_pixels() {
+        contexts::<T0>();
+        contexts::<T1>();
+        contexts::<T2>();
+        contexts::<T3>();
+    }
+
+    #[test]
+    fn spread_matches_single_bits() {
+        for v in 0..=255u8 {
+            for bit in [1u16, 1 << 11, 1 << 15] {
+                let mut out = [0x0420; 8];
+                spread(&mut out, v, bit);
+                for (j, o) in out.into_iter().enumerate() {
+                    let want = if v >> (7 - j) & 1 == 1 { bit } else { 0 };
+                    assert_eq!(o, 0x0420 | want);
+                }
+            }
+        }
+    }
+}

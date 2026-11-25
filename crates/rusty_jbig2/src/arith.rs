@@ -266,6 +266,46 @@ impl IntCtx {
 mod tests {
     use super::*;
 
+    /// A run either is so many single decisions or does nothing.
+    #[test]
+    fn runs_match_single_decisions() {
+        let data: Vec<u8> = (0..4000u32).map(|i| (i * i * 31 + i * 7) as u8).collect();
+        let mut taken = 0;
+        for n in [1u32, 8, 64] {
+            let mut a = Arith::new(&data);
+            let mut cx = [0u8; 4];
+            for step in 0..20_000usize {
+                let k = step * step / 7 % 4;
+                let before = cx[k];
+                let (mut run, mut single) = (a, a);
+                let d = (step % 2) as u8;
+                if run.run(before, d, n) {
+                    taken += 1;
+                    for _ in 0..n {
+                        assert_eq!(single.bit(&mut cx[k]), u32::from(d));
+                    }
+                    assert_eq!(cx[k], before);
+                    assert_eq!(
+                        (run.a, run.c, run.ct, run.pos),
+                        (single.a, single.c, single.ct, single.pos)
+                    );
+                    a = single;
+                } else {
+                    assert_eq!((run.a, run.c, run.ct, run.pos), (a.a, a.c, a.ct, a.pos));
+                    a.bit(&mut cx[k]);
+                    if before > 1 && before & 1 == d {
+                        // The state may just as well be the skewest.
+                        cx[k] = 45 << 1 | d;
+                    }
+                }
+                if step % 3 == 0 {
+                    cx[k] = (45 << 1) | (step / 3 % 2) as u8;
+                }
+            }
+        }
+        assert!(taken > 1000, "{taken}");
+    }
+
     /// T.88 H.2: the arithmetic coder's test sequence, decision by decision.
     #[test]
     fn annex_h2_sequence() {

@@ -307,3 +307,96 @@ fn run<const ONE: bool, const CUSTOM: bool, const N: usize>(
     *coder = a;
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bit(row: &[u8], x: i64) -> u16 {
+        usize::try_from(x)
+            .ok()
+            .and_then(|x| Some(u16::from(row.get(x >> 3)? >> (7 - (x & 7)) & 1)))
+            .unwrap_or(0)
+    }
+
+    fn noise(n: usize, seed: &mut u32) -> Vec<u8> {
+        let mut byte = || {
+            *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (*seed >> 24) as u8
+        };
+        (0..n).map(|_| byte()).collect()
+    }
+
+    #[test]
+    fn windows_match_single_pixels() {
+        let mut seed = 5;
+        for len in [0usize, 1, 2, 9, 30] {
+            let mut row = noise(len, &mut seed);
+            // Room for white stretches.
+            for v in row.iter_mut().skip(3).take(19) {
+                *v = 0;
+            }
+            for pos in -150..300i64 {
+                let mut w = Window::new(&row, pos);
+                let mut at = pos;
+                for _ in 0..30 {
+                    if w.white() {
+                        for x in at..at + 72 {
+                            assert_eq!(bit(&row, x), 0, "{len} {pos} {x}");
+                        }
+                        w.skip();
+                        at += 64;
+                    }
+                    let v = w.advance();
+                    for k in 0..16 {
+                        assert_eq!(v >> (15 - k) & 1, bit(&row, at + k), "{len} {pos} {at}");
+                    }
+                    at += 8;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contexts_and_typical_match_single_pixels() {
+        let mut seed = 9;
+        for round in 0..3000 {
+            let mut rows: Vec<Vec<u8>> = (0..4).map(|_| noise(2, &mut seed)).collect();
+            if round % 3 != 0 {
+                // Uniform but for a few pixels.
+                let v = if round % 3 == 1 { 0 } else { 0xFF };
+                for r in &mut rows {
+                    let k = r[0] as usize;
+                    *r = vec![v; 2];
+                    if k < 60 {
+                        r[k / 8 % 2] ^= 0x80 >> (k % 8);
+                    }
+                }
+            }
+            let words: Vec<u16> = rows
+                .iter()
+                .map(|r| u16::from_be_bytes([r[0], r[1]]))
+                .collect();
+            let q = [words[1], words[2], words[3]];
+            let (zero, one) = (
+                contexts8::<false>(words[0], q),
+                contexts8::<true>(words[0], q),
+            );
+            let (sure, black) = typical(q);
+            for j in 0..8usize {
+                let three = |r: &Vec<u8>| (0..3).fold(0, |v, k| v << 1 | bit(r, (j + k) as i64));
+                let (p, a, b, c) = (
+                    three(&rows[0]),
+                    three(&rows[1]),
+                    three(&rows[2]),
+                    three(&rows[3]),
+                );
+                assert_eq!(zero[j], p << 10 | a << 6 | b << 3 | c);
+                assert_eq!(one[j], p << 7 | (a >> 1 & 1) << 5 | b << 2 | c & 3);
+                let uniform = a == b && b == c && (a == 0 || a == 7);
+                assert_eq!(sure >> (7 - j) & 1 == 1, uniform);
+                assert_eq!(black >> (7 - j) & 1 == 1, uniform && a == 7);
+            }
+        }
+    }
+}

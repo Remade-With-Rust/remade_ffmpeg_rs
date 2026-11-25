@@ -129,6 +129,8 @@ impl Decoder<'_> {
                 self.resources.insert(s.number, Resource::Patterns(dict));
             }
             kind::TABLES => {
+                // For its lookup table.
+                self.budget.charge(4096)?;
                 let t = Arc::new(Table::parse(s.data)?);
                 self.resources.insert(s.number, Resource::Table(t));
             }
