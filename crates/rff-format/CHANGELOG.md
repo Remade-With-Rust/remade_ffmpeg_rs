@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-v0.9.0...rff-format-v0.9.1) - 2026-11-25
+
+### Added
+
+- *(rff-format)* chapters, timecode streams, track references and sample groups in the API ([#114](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/114))
+
 ## [0.9.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-v0.8.4...rff-format-v0.9.0) - 2026-11-24
 
 ### Fixed

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_tiff-v0.1.8...rusty_tiff-v0.1.9) - 2026-11-25
+
+### Added
+
+- *(rusty_tiff)* ccitt::decode_filter with PDF EndOfLine, EndOfBlock and DamagedRowsBeforeError ([#132](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/132))
+
 ## [0.1.8](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_tiff-v0.1.7...rusty_tiff-v0.1.8) - 2026-11-23
 
 ### Other

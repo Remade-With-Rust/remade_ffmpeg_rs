@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_svgtree-v0.1.7...rusty_svgtree-v0.2.0) - 2026-11-25
+
+### Added
+
+- *(rusty_svgtree)* text, a usvg-style tree and Tree::to_svg_string
+- *(rusty_svgtree)* SVG filters, pixel-identical to resvg on its test suite
+
+### Other
+
+- *(rusty_svgtree)* image formats, context paints, nested documents, svgz
+- Merge branch 'feat/svg-filters-text' into feat/svg-images-fixes
+- *(rusty_svgtree)* shorter filter chain in debug builds
+
 ## [0.1.7](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_svgtree-v0.1.6...rusty_svgtree-v0.1.7) - 2026-11-23
 
 ### Other
