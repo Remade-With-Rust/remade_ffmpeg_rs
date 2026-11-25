@@ -53,13 +53,12 @@ const STATES: [(u16, u8, u8, u8); 47] = [
     (0x5601, 46, 46, 0),
 ];
 
-/// A context: `Qe << 48 | state * 2 + MPS`.
+/// A context, from `i = state * 2 + MPS`: `Qe << 48 | i << 4 | MPS`.
 const fn context(i: usize) -> u64 {
-    ((STATES[i / 2].0 as u64) << 48) | i as u64
+    ((STATES[i / 2].0 as u64) << 48) | (i << 4 | i & 1) as u64
 }
 
-/// Contexts after an MPS (even index) and an LPS (odd), by `state * 4 + MPS *
-/// 2`.
+/// Contexts after an MPS (even index) and an LPS (odd), by `2 * i`.
 static NEXT: [u64; 256] = {
     let mut t = [0; 256];
     let mut i = 0;
@@ -187,7 +186,7 @@ impl<'a> Mq<'a> {
     pub fn decode(&mut self, cx: &mut Contexts, ctx: Ctx) -> u32 {
         let ctx = ctx as usize;
         let e = cx.0[ctx];
-        let qe = e & !0xFF;
+        let qe = e & !0xFFFF;
         let mut a = self.a.wrapping_sub(qe);
         let (c, low) = self.c.overflowing_sub(qe);
         // The sub-interval sizes may be inverted (conditional exchange): then
@@ -204,8 +203,7 @@ impl<'a> Mq<'a> {
             }
             a < qe
         };
-        let i = e as usize & 0x7F;
-        cx.0[ctx] = NEXT[2 * i + usize::from(lps)];
+        cx.0[ctx] = NEXT[((e as usize & 0x7F0) >> 3) | usize::from(lps)];
         let n = 63 - (a | 1).ilog2();
         self.a = a << n;
         if n <= self.ct {
@@ -214,7 +212,7 @@ impl<'a> Mq<'a> {
         } else {
             (self.pos, self.c, self.ct) = shift_in(self.data, self.pos, self.c, self.ct, n);
         }
-        (i as u32 ^ u32::from(lps)) & 1
+        (e as u32 ^ u32::from(lps)) & 1
     }
 }
 
