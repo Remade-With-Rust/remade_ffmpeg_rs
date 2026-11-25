@@ -14,7 +14,7 @@ description = "Pure-Rust SVG parser and renderer: parses SVG into a simplified r
 readme = "README.md"
 keywords = ["svg", "vector", "render", "rasterizer", "graphics"]
 categories = ["graphics", "rendering", "multimedia::images"]
-include = ["/LICENSE", "/README.md", "/src/"]
+include = ["/LICENSE", "/NOTICE.md", "/README.md", "/src/"]
 
 [features]
 default = ["raster-images"]

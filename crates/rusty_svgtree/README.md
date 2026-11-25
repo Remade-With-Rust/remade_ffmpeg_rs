@@ -20,7 +20,7 @@ by **[Mata Network](https://www.mata.network/)**.
 
 - **Pixels:**
   - 98 of the 105 files are identical to resvg; the other 7 are 36-55 dB.
-  - 7 files use `<filter>` or `<text>`, which are not implemented (the filter is skipped and the content drawn).
+  - 7 files use `<filter>` or `<text>`, which were not implemented when this was measured.
   - 1 file differs only by JPEG decoder rounding.
 - **nanosvg:** its median PSNR against both this crate and resvg is 27 dB. It has no CSS, clip paths, masks or `preserveAspectRatio`, so it serves only as a speed reference.
 - **Speed:** measured over the 98 files where this crate and resvg produce identical pixels, so both do the same work. Parse and render the whole set, minimum of 11 pinned, ABBA-interleaved rounds.
@@ -93,6 +93,22 @@ tests pass.
 
 No speed numbers are claimed yet.
 
+## Filters
+
+Every SVG 1.1 filter primitive plus `feDropShadow` and the CSS filter
+functions (`blur()`, `drop-shadow()`, `grayscale()`, ...), with filter and
+primitive regions, `filterUnits` / `primitiveUnits`,
+`color-interpolation-filters`, `href` inheritance and filter lists. The
+filters are in the tree (`Group::filters`, types in the `filter` module) and
+`render` applies them. Pixel-identical to resvg 0.48.1 on the resvg test
+suite's `filters` files (the 7 that differ there draw text labels).
+
+Two things are deliberately not as in resvg: `feDisplacementMap` applies
+`scale` once and reads the map unpremultiplied (resvg applies it twice), and a
+huge `feMorphology` radius costs no more than a small one.
+`BackgroundImage`, `BackgroundAlpha`, `FillPaint` and `StrokePaint` inputs
+read as `SourceGraphic`, as in resvg.
+
 ## Usage
 
 ```rust
@@ -114,8 +130,10 @@ rusty_svgtree::render(&tree, Transform::identity(), &mut pixmap.as_mut());
 All in `Options`, all with safe defaults: `max_nodes` (500,000 elements after
 `use` expansion), `max_depth` (256), `max_image_pixels` (64 Mi),
 `max_canvas_pixels` (2^28; larger documents are `Error::InvalidSize`, not an
-allocation) and `max_layer_bytes` (1 GiB held at once by group layers and
-clip/mask scratch; a group past it is skipped). Fixed internal work budgets
+allocation), `max_layer_bytes` (1 GiB held at once by group layers and
+clip/mask/filter scratch; a group past it is skipped) and `max_filter_work`
+(2^33 pixel operations per `render`; an element whose filter would exceed it
+is not drawn). Fixed internal work budgets
 bound style-sheet matching, `use` cycle checks and the re-conversion of shared
 clip paths, patterns and markers. `use` reference cycles are
 skipped (resvg instead fails the whole document); clip-path, mask and pattern
@@ -126,9 +144,6 @@ access.
 
 - **Text** (`<text>` is skipped; resvg was measured with its `text` feature
   off, so the oracle compares like with like). Needs the house font stack.
-- **Filters**: a `filter` that references a valid element is ignored and the
-  content drawn unfiltered; a dangling reference hides the element, as the
-  spec requires.
 - Context paints (`context-fill`/`context-stroke`) carry solid colours only.
 - No GIF/WebP/nested-SVG images, no external `href`s, no `Tree::to_svg_string`
   export, no animation.

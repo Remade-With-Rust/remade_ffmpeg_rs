@@ -28,6 +28,10 @@
 mod colors;
 mod convert;
 mod css;
+pub mod filter;
+mod filter_convert;
+mod filter_kernels;
+mod filter_render;
 mod image;
 mod marker;
 mod render;
@@ -93,9 +97,15 @@ pub struct Options {
     /// checked against it; giant `width`/`height` attributes are an error,
     /// not an allocation).
     pub max_canvas_pixels: u64,
-    /// Cap on bytes held at once by group layers, clip and mask scratch
-    /// buffers while rendering. A group that would exceed it is skipped.
+    /// Cap on bytes held at once by group layers, clip, mask and filter
+    /// scratch buffers while rendering. A group that would exceed it is
+    /// skipped.
     pub max_layer_bytes: u64,
+    /// Cap on filter work per `render` call, in pixel operations (a blur
+    /// costs about 10 per pixel, a convolution its kernel's size, a
+    /// turbulence 16 per octave; every primitive costs at least a few
+    /// thousand). A filter past it leaves its element undrawn.
+    pub max_filter_work: u64,
 }
 
 impl Default for Options {
@@ -110,6 +120,7 @@ impl Default for Options {
             max_image_pixels: 64 * 1024 * 1024,
             max_canvas_pixels: 1 << 28,
             max_layer_bytes: 1 << 30,
+            max_filter_work: 1 << 33,
         }
     }
 }
@@ -121,6 +132,7 @@ pub struct Tree {
     root: Group,
     max_layer_bytes: u64,
     max_image_pixels: u64,
+    max_filter_work: u64,
 }
 
 impl Tree {
@@ -148,6 +160,7 @@ impl Tree {
             root: converted.root,
             max_layer_bytes: opt.max_layer_bytes,
             max_image_pixels: opt.max_image_pixels,
+            max_filter_work: opt.max_filter_work,
         })
     }
 
@@ -175,6 +188,7 @@ pub fn render(tree: &Tree, transform: Transform, pixmap: &mut PixmapMut) {
         pixmap.height(),
         tree.max_layer_bytes,
         tree.max_image_pixels,
+        tree.max_filter_work,
     ) else {
         return;
     };

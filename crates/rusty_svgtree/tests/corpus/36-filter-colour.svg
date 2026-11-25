@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="160" viewBox="0 0 240 160">
+  <linearGradient id="g"><stop offset="0" stop-color="red"/><stop offset=".5" stop-color="lime" stop-opacity=".6"/><stop offset="1" stop-color="blue"/></linearGradient>
+  <filter id="m"><feColorMatrix values=".3 .6 .1 0 0  .2 .5 .3 0 .1  0 .1 .8 0 0  0 0 0 .9 0"/></filter>
+  <filter id="s"><feColorMatrix type="saturate" values=".3"/></filter>
+  <filter id="h" color-interpolation-filters="sRGB"><feColorMatrix type="hueRotate" values="75"/></filter>
+  <filter id="l"><feColorMatrix type="luminanceToAlpha"/></filter>
+  <filter id="t"><feComponentTransfer><feFuncR type="table" tableValues="0 .8 .2 1"/><feFuncG type="discrete" tableValues="0 .4 .9"/><feFuncB type="gamma" amplitude="1" exponent="1.8" offset=".1"/><feFuncA type="linear" slope=".7" intercept=".1"/></feComponentTransfer></filter>
+  <filter id="bl"><feFlood flood-color="#48c" result="f" x="10%" y="10%" width="70%" height="70%"/><feBlend in="SourceGraphic" in2="f" mode="multiply"/></filter>
+  <g fill="url(#g)">
+    <rect x="10" y="10" width="60" height="40" filter="url(#m)"/><rect x="90" y="10" width="60" height="40" filter="url(#s)"/><rect x="170" y="10" width="60" height="40" filter="url(#h)"/>
+    <rect x="10" y="60" width="60" height="40" filter="url(#l)"/><rect x="90" y="60" width="60" height="40" filter="url(#t)"/><rect x="170" y="60" width="60" height="40" filter="url(#bl)"/>
+    <rect x="10" y="110" width="60" height="40" filter="grayscale(.7) contrast(1.4)"/><rect x="90" y="110" width="60" height="40" filter="sepia() brightness(80%) blur(1px)"/><rect x="170" y="110" width="60" height="40" filter="drop-shadow(3px 4px 2px rgba(0,0,0,.5)) hue-rotate(40deg)"/>
+  </g>
+</svg>

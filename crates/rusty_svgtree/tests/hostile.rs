@@ -475,3 +475,224 @@ fn overflowing_geometry_helpers() {
     )));
     assert!(r.is_ok());
 }
+
+// -------------------------------------------------------------- filters --
+
+/// Renders a filtered document under a deadline.
+fn run_filter(body: &str) {
+    let start = std::time::Instant::now();
+    let _ = run(&doc(body));
+    let t = start.elapsed();
+    assert!(
+        t.as_secs() < 60,
+        "{t:?} for {}",
+        &body[..body.len().min(200)]
+    );
+}
+
+#[test]
+fn filter_chain_of_2000_primitives() {
+    let mut f = String::from(r#"<filter id="f">"#);
+    for _ in 0..2000 {
+        f.push_str(r#"<feGaussianBlur stdDeviation="3"/><feOffset dx="1"/>"#);
+    }
+    run_filter(&format!(
+        r##"{f}</filter><rect width="90" height="90" filter="url(#f)"/>"##
+    ));
+}
+
+#[test]
+fn filter_results_all_kept_alive() {
+    // Every result is read again by the last primitive.
+    let mut f = String::from(r#"<filter id="f">"#);
+    for i in 0..3000 {
+        f.push_str(&format!(r#"<feFlood result="r{i}"/>"#));
+    }
+    f.push_str("<feMerge>");
+    for i in 0..3000 {
+        f.push_str(&format!(r#"<feMergeNode in="r{i}"/>"#));
+    }
+    let svg = doc(&format!(
+        r##"{f}</feMerge></filter><rect width="90" height="90" filter="url(#f)"/>"##
+    ));
+    let opt = Options {
+        max_layer_bytes: 4 << 20,
+        ..Options::default()
+    };
+    let _ = run_with(&svg, &opt);
+}
+
+#[test]
+fn filter_huge_numbers() {
+    let huge = [
+        "1e9", "1e38", "1e300", "-1e38", "NaN", "inf", "0", "-0", "1e-38",
+    ];
+    for v in huge {
+        for fe in [
+            format!(r#"<feGaussianBlur stdDeviation="{v}"/>"#),
+            format!(r#"<feGaussianBlur stdDeviation="{v} 1"/>"#),
+            format!(r#"<feDropShadow dx="{v}" dy="{v}" stdDeviation="{v}"/>"#),
+            format!(r#"<feOffset dx="{v}" dy="{v}"/>"#),
+            format!(r#"<feMorphology radius="{v}"/>"#),
+            format!(r#"<feMorphology operator="dilate" radius="{v} 2"/>"#),
+            format!(r#"<feTurbulence baseFrequency="{v}" numOctaves="{v}" seed="{v}"/>"#),
+            format!(
+                r#"<feTurbulence baseFrequency="{v}" numOctaves="9" seed="{v}" stitchTiles="stitch" type="fractalNoise"/>"#
+            ),
+            format!(r#"<feConvolveMatrix order="{v}" kernelMatrix="1 1 1" bias="{v}"/>"#),
+            format!(
+                r#"<feConvolveMatrix order="3 1" kernelMatrix="{v} 1 1" divisor="{v}" targetX="{v}"/>"#
+            ),
+            format!(r#"<feDisplacementMap in2="SourceGraphic" scale="{v}" xChannelSelector="R"/>"#),
+            format!(r#"<feFlood x="{v}" y="{v}" width="{v}" height="{v}"/><feTile/>"#),
+            format!(r#"<feComposite operator="arithmetic" k1="{v}" k2="{v}" k3="{v}" k4="{v}"/>"#),
+            format!(r#"<feColorMatrix type="hueRotate" values="{v}"/>"#),
+            format!(r#"<feColorMatrix type="saturate" values="{v}"/>"#),
+            format!(
+                r#"<feComponentTransfer><feFuncR type="gamma" amplitude="{v}" exponent="{v}" offset="{v}"/><feFuncG type="table" tableValues="{v} {v}"/></feComponentTransfer>"#
+            ),
+            format!(
+                r#"<feDiffuseLighting surfaceScale="{v}" diffuseConstant="{v}"><feDistantLight azimuth="{v}" elevation="{v}"/></feDiffuseLighting>"#
+            ),
+            format!(
+                r#"<feSpecularLighting surfaceScale="{v}" specularExponent="{v}"><feSpotLight x="{v}" y="{v}" z="{v}" pointsAtX="{v}" limitingConeAngle="{v}" specularExponent="{v}"/></feSpecularLighting>"#
+            ),
+            format!(r##"<feImage href="#t" x="{v}" width="{v}"/>"##),
+        ] {
+            for units in ["", r#"primitiveUnits="objectBoundingBox""#] {
+                run_filter(&format!(
+                    r##"<filter id="f" {units}>{fe}</filter><rect id="t" width="40" height="40" fill="red"/><rect x="9.5" y="9.25" width="50" height="60" filter="url(#f)"/>"##
+                ));
+            }
+        }
+        for f in [
+            "blur",
+            "hue-rotate",
+            "brightness",
+            "sepia",
+            "invert",
+            "opacity",
+        ] {
+            run_filter(&format!(
+                r##"<rect width="50" height="50" filter="{f}({v})"/>"##
+            ));
+        }
+        run_filter(&format!(
+            r##"<rect width="50" height="50" filter="drop-shadow({v}px {v}px {v}px)"/>"##
+        ));
+    }
+}
+
+#[test]
+fn filter_huge_regions() {
+    for v in ["1e9", "1e30", "4294967296", "-1e9"] {
+        for units in ["userSpaceOnUse", "objectBoundingBox"] {
+            run_filter(&format!(
+                r##"<filter id="f" filterUnits="{units}" x="-{v}" y="-{v}" width="{v}" height="{v}"><feFlood/><feGaussianBlur stdDeviation="50"/></filter><rect width="1e8" height="10" filter="url(#f)" transform="scale(1e5)"/>"##
+            ));
+            run_filter(&format!(
+                r##"<filter id="f" filterUnits="{units}" x="-{v}" y="-5" width="2e30" height="{v}"><feTurbulence numOctaves="9" baseFrequency=".1"/></filter><rect width="90" height="90" filter="url(#f)"/>"##
+            ));
+        }
+    }
+}
+
+#[test]
+fn filter_work_budget() {
+    // A 300x300 kernel on a full canvas, and a stack of filtered groups:
+    // past the budget the element is not drawn, and the time is bounded.
+    let kernel = "1 ".repeat(300 * 300);
+    let mut body = format!(
+        r##"<filter id="f" x="0" y="0" width="1" height="1"><feConvolveMatrix order="300" kernelMatrix="{kernel}"/></filter>"##
+    );
+    for _ in 0..200 {
+        body.push_str(r##"<rect width="100" height="100" filter="url(#f)"/>"##);
+    }
+    let opt = Options {
+        max_filter_work: 1 << 28,
+        ..Options::default()
+    };
+    let start = std::time::Instant::now();
+    let _ = run_with(&doc(&body), &opt);
+    assert!(start.elapsed().as_secs() < 60);
+}
+
+#[test]
+fn filter_image_cycles() {
+    // Directly, through a second filter, and through itself in a chain that
+    // would double at every step.
+    run_filter(
+        r##"<filter id="f"><feImage href="#r"/></filter><rect id="r" width="50" height="50" filter="url(#f)"/>"##,
+    );
+    run_filter(
+        r##"<filter id="a"><feImage href="#y"/></filter><filter id="b"><feImage href="#x"/></filter><rect id="x" width="50" height="50" filter="url(#a)"/><rect id="y" width="50" height="50" filter="url(#b)"/>"##,
+    );
+    let mut body = String::from(r#"<rect id="e0" width="10" height="10"/>"#);
+    for i in 1..60 {
+        for units in ["objectBoundingBox", "userSpaceOnUse"] {
+            body.push_str(&format!(
+                r##"<filter id="{units}{i}" filterUnits="{units}" x="0" y="0" width="20" height="20"><feImage href="#e{p}"/><feImage href="#e{p}" result="q"/><feMerge><feMergeNode in="q"/><feMergeNode/></feMerge></filter>"##,
+                p = i - 1
+            ));
+        }
+        body.push_str(&format!(
+            r##"<g id="e{i}"><rect width="10" height="10" filter="url(#userSpaceOnUse{i})"/><rect width="10" height="10" filter="url(#objectBoundingBox{i})"/></g>"##
+        ));
+    }
+    let opt = Options {
+        max_filter_work: 1 << 28,
+        max_nodes: 20_000,
+        ..Options::default()
+    };
+    let start = std::time::Instant::now();
+    let _ = run_with(&doc(&body), &opt);
+    assert!(start.elapsed().as_secs() < 60, "{:?}", start.elapsed());
+}
+
+#[test]
+fn filter_many_users_of_one_large_filter() {
+    let mut f = String::from(r#"<filter id="f">"#);
+    for _ in 0..2000 {
+        f.push_str("<feMerge><feMergeNode/><feMergeNode/></feMerge>");
+    }
+    f.push_str("</filter>");
+    for _ in 0..3000 {
+        f.push_str(r##"<rect width="1" height="1" filter="url(#f)"/>"##);
+    }
+    let opt = Options {
+        max_filter_work: 1 << 28,
+        ..Options::default()
+    };
+    let start = std::time::Instant::now();
+    let _ = run_with(&doc(&f), &opt);
+    assert!(start.elapsed().as_secs() < 60, "{:?}", start.elapsed());
+}
+
+#[test]
+fn filter_external_references_are_not_followed() {
+    let dir = std::env::temp_dir().join("rusty_svgtree_filter_canary.png");
+    let mut red = Pixmap::new(8, 8).unwrap();
+    red.fill(rusty_svgtree::rusty_raster::Color::from_rgba8(
+        255, 0, 0, 255,
+    ));
+    if red.save_png(&dir).is_err() {
+        return;
+    }
+    let path = dir.to_string_lossy().replace('\\', "/");
+    for href in [
+        path.clone(),
+        format!("file:///{path}"),
+        "http://127.0.0.1:9/x.png".to_string(),
+        "//127.0.0.1/share/x.png".to_string(),
+        "/dev/zero".to_string(),
+    ] {
+        let svg = doc(&format!(
+            r##"<filter id="f"><feImage href="{href}"/></filter><rect width="90" height="90" fill="blue" filter="url(#f)"/><image href="{href}" width="90" height="90"/>"##
+        ));
+        let tree = Tree::from_data(&svg, &Options::default()).unwrap();
+        let mut p = Pixmap::new(100, 100).unwrap();
+        rusty_svgtree::render(&tree, Transform::identity(), &mut p.as_mut());
+        assert!(p.data().chunks_exact(4).all(|c| c[0] == 0), "{href}");
+    }
+    let _ = std::fs::remove_file(&dir);
+}

@@ -9,6 +9,7 @@ use rusty_raster::{
     PathStroker, Rect, Size, SpreadMode, Transform,
 };
 
+use crate::filter::Filter;
 use crate::svgtree::{AId, Document, EId, NodeId, SvgNode};
 use crate::tree::{
     BaseGradient, ClipPath, Color, Fill, Group, Image, ImageKind, LinearGradient, Mask, Node,
@@ -19,17 +20,17 @@ use crate::{Error, Options};
 
 /// Coordinate system of a paint server, clip path or mask.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Units {
+pub(crate) enum Units {
     UserSpaceOnUse,
     ObjectBoundingBox,
 }
 
 #[derive(Clone)]
-struct State<'a> {
+pub(crate) struct State<'a> {
     in_clip_path: bool,
     view_box: NonZeroRect,
     use_size: (Option<f32>, Option<f32>),
-    opt: &'a Options,
+    pub(crate) opt: &'a Options,
     /// Markers being instantiated (a marker cannot contain itself).
     parent_markers: Vec<NodeId>,
     /// The paints `context-fill` / `context-stroke` resolve to.
@@ -37,12 +38,13 @@ struct State<'a> {
 }
 
 #[derive(Default)]
-struct Cache {
+pub(crate) struct Cache {
     clip_paths: HashMap<NodeId, Arc<ClipPath>>,
     masks: HashMap<NodeId, Arc<Mask>>,
-    /// Clip paths / masks / patterns being converted: a reference back into
-    /// one of them is a cycle and is treated as `none`.
-    active: Vec<NodeId>,
+    pub(crate) filters: HashMap<NodeId, Arc<Filter>>,
+    /// Clip paths / masks / patterns / filters being converted: a reference
+    /// back into one of them is a cycle and is treated as `none`.
+    pub(crate) active: Vec<NodeId>,
     /// Elements converted so far, across every re-conversion of shared
     /// content (`objectBoundingBox` clip paths, patterns, markers): bounds
     /// the output tree, which bounds render work.
@@ -72,8 +74,13 @@ const PRESIZE_MIN_BYTES: usize = 1 << 16;
 
 impl Cache {
     /// Spends one unit of conversion work; `false` once the budget is gone.
-    fn spend(&mut self) -> bool {
-        self.work += 1;
+    pub(crate) fn spend(&mut self) -> bool {
+        self.spend_many(1)
+    }
+
+    /// Spends `n` units of conversion work.
+    pub(crate) fn spend_many(&mut self, n: usize) -> bool {
+        self.work = self.work.saturating_add(n);
         self.work <= self.max_work
     }
 
@@ -126,7 +133,7 @@ impl Cache {
 
 /// Maximum nesting of clip-path / mask / pattern references being resolved
 /// at once (each level is a real reference, cycles are broken separately).
-const MAX_REF_DEPTH: usize = 32;
+pub(crate) const MAX_REF_DEPTH: usize = 32;
 
 fn ts_from_matrix(m: values::Matrix) -> Transform {
     Transform::from_row(
@@ -167,7 +174,7 @@ impl<'a> SvgNode<'a> {
         NonZeroRect::from_xywh(vb[0] as f32, vb[1] as f32, vb[2] as f32, vb[3] as f32)
     }
 
-    fn aspect(&self) -> AspectRatio {
+    pub(crate) fn aspect(&self) -> AspectRatio {
         self.attribute(AId::PreserveAspectRatio)
             .and_then(values::aspect_ratio)
             .unwrap_or_default()
@@ -215,30 +222,61 @@ impl<'a> SvgNode<'a> {
     }
 }
 
+/// The x and y offsets of a `transform-origin` (the z offset is parsed and
+/// dropped), as svgtypes reads it: one keyword names its own axis, and two
+/// values may come in either order when a keyword says which is which.
 fn parse_transform_origin(text: &str) -> Option<(Length, Length)> {
-    let words: Vec<&str> = text.split_ascii_whitespace().collect();
-    let kw = |w: &str| -> Option<Length> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Axis {
+        X,
+        Y,
+        Either,
+    }
+    let part = |w: &str| -> Option<(Length, Axis)> {
+        let percent = |n: f64, axis: Axis| (Length::new(n, Unit::Percent), axis);
         Some(match w {
-            "left" | "top" => Length::new(0.0, Unit::Percent),
-            "center" => Length::new(50.0, Unit::Percent),
-            "right" | "bottom" => Length::new(100.0, Unit::Percent),
-            _ => values::length(w)?,
+            "left" => percent(0.0, Axis::X),
+            "right" => percent(100.0, Axis::X),
+            "top" => percent(0.0, Axis::Y),
+            "bottom" => percent(100.0, Axis::Y),
+            "center" => percent(50.0, Axis::Either),
+            _ => (values::length(w)?, Axis::Either),
         })
     };
-    match words.as_slice() {
-        [x] => Some((kw(x)?, Length::new(50.0, Unit::Percent))),
-        [x, y] | [x, y, _] => {
-            if matches!(*x, "top" | "bottom") || matches!(*y, "left" | "right") {
-                Some((kw(y)?, kw(x)?))
-            } else {
-                Some((kw(x)?, kw(y)?))
-            }
+    let mut words = text
+        .split(|c: char| c.is_ascii_whitespace() || c == ',')
+        .filter(|w| !w.is_empty());
+    let center = Length::new(50.0, Unit::Percent);
+    let a = part(words.next()?)?;
+    let Some(b) = words.next() else {
+        return Some(if a.1 == Axis::Y {
+            (center, a.0)
+        } else {
+            (a.0, center)
+        });
+    };
+    let b = part(b)?;
+    if let Some(z) = words.next() {
+        if values::length(z)?.unit == Unit::Percent || words.next().is_some() {
+            return None;
         }
-        _ => None,
+    }
+    if a.1 != Axis::Y && b.1 != Axis::X {
+        Some((a.0, b.0))
+    } else if a.1 != Axis::X && b.1 != Axis::Y {
+        Some((b.0, a.0))
+    } else {
+        None
     }
 }
 
-fn convert_length(length: Length, node: SvgNode, name: AId, units: Units, state: &State) -> f32 {
+pub(crate) fn convert_length(
+    length: Length,
+    node: SvgNode,
+    name: AId,
+    units: Units,
+    state: &State,
+) -> f32 {
     let dpi = state.opt.dpi;
     let n = length.number as f32;
     match length.unit {
@@ -257,6 +295,7 @@ fn convert_length(length: Length, node: SvgNode, name: AId, units: Units, state:
                 let vb = state.view_box;
                 match name {
                     AId::Cx
+                    | AId::Dx
                     | AId::Fx
                     | AId::MarkerWidth
                     | AId::RefX
@@ -266,6 +305,7 @@ fn convert_length(length: Length, node: SvgNode, name: AId, units: Units, state:
                     | AId::X1
                     | AId::X2 => vb.width() * n / 100.0,
                     AId::Cy
+                    | AId::Dy
                     | AId::Fy
                     | AId::Height
                     | AId::MarkerHeight
@@ -573,7 +613,7 @@ fn convert_children(parent_node: SvgNode, state: &State, cache: &mut Cache, pare
     }
 }
 
-fn convert_element(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut Group) {
+pub(crate) fn convert_element(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut Group) {
     let Some(tag) = node.tag_name() else {
         return;
     };
@@ -636,7 +676,7 @@ fn convert_element_impl(
         }
         EId::Image => convert_image(node, state, parent),
         EId::Svg | EId::G => convert_children(node, state, cache, parent),
-        // Text is deferred (see README); filters are not graphics elements.
+        // Text is deferred (see README).
         _ => {}
     }
 }
@@ -709,17 +749,10 @@ fn convert_group_into(
     } else {
         node.func_iri_attribute(AId::Mask)
     };
-    // Filters are not implemented: a reference to a missing element
-    // disables rendering (as the spec and usvg require); a valid filter
-    // is ignored and the content drawn unfiltered (documented).
-    let filter_missing = !state.in_clip_path
-        && node.attribute(AId::Filter).is_some_and(|f| {
-            f.trim() != "none"
-                && values::func_iri(f).is_some()
-                && node.func_iri_attribute(AId::Filter).is_none()
-        });
+    let has_filter =
+        !state.in_clip_path && node.attribute(AId::Filter).is_some_and(|f| f != "none");
 
-    if !required && clip_link.is_none() && mask_link.is_none() && !filter_missing {
+    if !required && clip_link.is_none() && mask_link.is_none() && !has_filter {
         // Nothing of its own to hold: the content is the parent's as it
         // stands, in the same order.
         collect(cache, parent);
@@ -737,7 +770,8 @@ fn convert_group_into(
 
     let mut clip_path = None;
     let mut mask = None;
-    if clip_link.is_some() || mask_link.is_some() {
+    let mut filters = Vec::new();
+    if clip_link.is_some() || mask_link.is_some() || has_filter {
         let object_bbox = g.calculate_object_bbox();
         if let Some(link) = clip_link {
             clip_path = convert_clip_path(link, state, object_bbox, cache);
@@ -747,17 +781,25 @@ fn convert_group_into(
             mask = convert_mask(link, state, object_bbox, cache);
             mask.as_ref()?;
         }
+        if has_filter {
+            // Unlike a clip path or mask, an invalid filter drops the
+            // element.
+            filters = crate::filter_convert::convert(node, state, object_bbox, cache).ok()?;
+        }
     }
-    if filter_missing {
+    if !required && clip_path.is_none() && mask.is_none() && filters.is_empty() {
+        // The filter value came to nothing.
+        parent.children.append(&mut g.children);
         return None;
     }
     g.clip_path = clip_path;
     g.mask = mask;
+    g.filters = filters;
     g.calculate_bounding_boxes();
     Some(g)
 }
 
-fn parse_blend_mode(v: &str) -> Option<BlendMode> {
+pub(crate) fn parse_blend_mode(v: &str) -> Option<BlendMode> {
     Some(match v.trim() {
         "normal" => BlendMode::SourceOver,
         "multiply" => BlendMode::Multiply,
@@ -1260,7 +1302,7 @@ fn paint_to_user_space(paint: &mut Paint, bbox: Rect) -> bool {
 
 /// `NonZeroRect::bbox_transform` without its internal `unwrap` (it panics
 /// when the result overflows, which hostile units can arrange).
-fn bbox_transform(r: NonZeroRect, bbox: NonZeroRect) -> Option<NonZeroRect> {
+pub(crate) fn bbox_transform(r: NonZeroRect, bbox: NonZeroRect) -> Option<NonZeroRect> {
     NonZeroRect::from_xywh(
         r.x() * bbox.width() + bbox.x(),
         r.y() * bbox.height() + bbox.y(),
@@ -1414,13 +1456,13 @@ fn conv_dasharray(node: SvgNode, state: &State) -> Option<Vec<f32>> {
     Some(list)
 }
 
-fn current_color(node: SvgNode) -> values::Color {
+pub(crate) fn current_color(node: SvgNode) -> values::Color {
     node.find_attribute(AId::Color)
         .and_then(values::color)
         .unwrap_or(values::Color::BLACK)
 }
 
-fn split(c: values::Color, opacity: &mut f32) -> Color {
+pub(crate) fn split(c: values::Color, opacity: &mut f32) -> Color {
     *opacity = f32::from(c.a) / 255.0;
     Color {
         red: c.r,
@@ -1516,7 +1558,7 @@ impl BaseGradient {
     }
 }
 
-fn units_attr(node: SvgNode, name: AId, def: Units) -> Units {
+pub(crate) fn units_attr(node: SvgNode, name: AId, def: Units) -> Units {
     let n = resolve_attr(node, name);
     match n.attribute(name).map(values::trim) {
         Some("userSpaceOnUse") => Units::UserSpaceOnUse,
@@ -1555,6 +1597,7 @@ fn resolve_attr<'a>(node: SvgNode<'a>, name: AId) -> SvgNode<'a> {
                     || (shared && lt.is_gradient())
             }
             EId::Pattern => lt == EId::Pattern,
+            EId::Filter => lt == EId::Filter,
             _ => false,
         };
         if !ok {
@@ -1567,7 +1610,13 @@ fn resolve_attr<'a>(node: SvgNode<'a>, name: AId) -> SvgNode<'a> {
     node
 }
 
-fn resolve_number(node: SvgNode, name: AId, units: Units, state: &State, def: Length) -> f32 {
+pub(crate) fn resolve_number(
+    node: SvgNode,
+    name: AId,
+    units: Units,
+    state: &State,
+    def: Length,
+) -> f32 {
     resolve_attr(node, name).convert_length(name, units, state, def)
 }
 
@@ -1594,6 +1643,11 @@ fn approx_eq(a: f32, b: f32) -> bool {
     let ia = a.to_bits() as i64;
     let ib = b.to_bits() as i64;
     (ia - ib).abs() <= 4
+}
+
+/// usvg's `approx_zero_ulps(4)`.
+pub(crate) fn approx_zero(v: f32) -> bool {
+    approx_eq(v, 0.0)
 }
 
 fn convert_stops(grad: SvgNode) -> Vec<Stop> {
@@ -2236,11 +2290,7 @@ fn convert_image(node: SvgNode, state: &State, parent: &mut Group) {
         .map(values::trim)
         .unwrap_or("visible")
         == "visible";
-    let quality = match node.find_attribute(AId::ImageRendering).map(values::trim) {
-        Some("optimizeSpeed" | "crisp-edges" | "pixelated") => FilterQuality::Nearest,
-        Some("smooth") => FilterQuality::Bilinear,
-        _ => FilterQuality::Bicubic,
-    };
+    let quality = image_quality(node);
     let x = node.convert_user_length(AId::X, state, Length::zero());
     let y = node.convert_user_length(AId::Y, state, Length::zero());
     let mut width = node.convert_user_length(
@@ -2258,20 +2308,35 @@ fn convert_image(node: SvgNode, state: &State, parent: &mut Group) {
         (None, Some(_)) => width = actual.width() * (height / actual.height()),
         _ => {}
     }
-    let aspect = node.aspect();
     let Some(rect) = NonZeroRect::from_xywh(x, y, width, height) else {
         return;
     };
-    let aligned = {
-        let s = rect.size();
-        if aspect.align == Align::None {
-            Some(s)
-        } else {
-            fit_size(actual, s, aspect.slice)
-        }
-    };
-    let Some(aligned) = aligned else {
-        return;
+    let _ = place_image(kind, visible, quality, node.aspect(), actual, rect, parent);
+}
+
+/// `image-rendering` as a sampling quality.
+pub(crate) fn image_quality(node: SvgNode) -> FilterQuality {
+    match node.find_attribute(AId::ImageRendering).map(values::trim) {
+        Some("optimizeSpeed" | "crisp-edges" | "pixelated") => FilterQuality::Nearest,
+        Some("smooth") => FilterQuality::Bilinear,
+        _ => FilterQuality::Bicubic,
+    }
+}
+
+/// Appends an image of intrinsic size `actual`, fitted into `rect`.
+pub(crate) fn place_image(
+    kind: ImageKind,
+    visible: bool,
+    quality: FilterQuality,
+    aspect: AspectRatio,
+    actual: Size,
+    rect: NonZeroRect,
+    parent: &mut Group,
+) -> Option<()> {
+    let aligned = if aspect.align == Align::None {
+        rect.size()
+    } else {
+        fit_size(actual, rect.size(), aspect.slice)?
     };
     let (ax, ay) = aligned_pos(
         aspect.align,
@@ -2280,9 +2345,7 @@ fn convert_image(node: SvgNode, state: &State, parent: &mut Group) {
         rect.width() - aligned.width(),
         rect.height() - aligned.height(),
     );
-    let Some(vb) = NonZeroRect::from_xywh(ax, ay, aligned.width(), aligned.height()) else {
-        return;
-    };
+    let vb = NonZeroRect::from_xywh(ax, ay, aligned.width(), aligned.height())?;
     let image_ts = Transform::from_row(
         vb.width() / actual.width(),
         0.0,
@@ -2310,6 +2373,7 @@ fn convert_image(node: SvgNode, state: &State, parent: &mut Group) {
     } else {
         parent.children.push(Node::Group(Box::new(g)));
     }
+    Some(())
 }
 
 /// Image kinds the loader can produce.
