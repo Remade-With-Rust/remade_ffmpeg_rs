@@ -10,9 +10,11 @@ use rusty_raster::{
 };
 
 use crate::filter::Filter;
+use crate::text::Text;
 
 /// A node of the render tree.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Node {
     /// A group (possibly isolated: opacity, clip, mask, blend).
     Group(Box<Group>),
@@ -20,31 +22,54 @@ pub enum Node {
     Path(Box<Path>),
     /// An embedded image.
     Image(Box<Image>),
+    /// Text.
+    Text(Box<Text>),
 }
 
 impl Node {
     /// The fill bounding box in the parent's coordinates (group transforms
     /// are not applied).
-    pub(crate) fn bounding_box(&self) -> Option<Rect> {
+    pub fn bounding_box(&self) -> Option<Rect> {
         match self {
             Node::Group(g) => g.bounding_box,
             Node::Path(p) => Some(p.bounding_box),
             Node::Image(i) => i.size.to_rect(0.0, 0.0),
+            Node::Text(t) => t.bounding_box,
         }
     }
 
-    pub(crate) fn stroke_bounding_box(&self) -> Option<Rect> {
+    /// The same with strokes.
+    pub fn stroke_bounding_box(&self) -> Option<Rect> {
         match self {
             Node::Group(g) => g.stroke_bounding_box,
             Node::Path(p) => Some(p.stroke_bounding_box),
             Node::Image(i) => i.size.to_rect(0.0, 0.0),
+            Node::Text(t) => t.stroke_bounding_box,
         }
+    }
+
+    /// The element id, empty if it has none (and for content made by a
+    /// marker).
+    pub fn id(&self) -> &str {
+        match self {
+            Node::Group(g) => &g.id,
+            Node::Path(p) => &p.id,
+            Node::Image(i) => &i.id,
+            Node::Text(t) => &t.id,
+        }
+    }
+
+    /// Whether the node is in the tree but has nothing to draw (text that
+    /// was not laid out).
+    pub(crate) fn is_inert(&self) -> bool {
+        matches!(self, Node::Text(t) if t.flattened.is_none())
     }
 }
 
 /// A group of nodes.
 #[derive(Clone, Debug)]
 pub struct Group {
+    pub(crate) id: String,
     pub(crate) transform: Transform,
     pub(crate) abs_transform: Transform,
     /// Content painted with `context-fill` / `context-stroke` takes this
@@ -65,6 +90,7 @@ pub struct Group {
 impl Default for Group {
     fn default() -> Self {
         Group {
+            id: String::new(),
             transform: Transform::identity(),
             abs_transform: Transform::identity(),
             is_context: false,
@@ -102,6 +128,38 @@ fn expand(a: Option<Rect>, b: Option<Rect>) -> Option<Rect> {
 }
 
 impl Group {
+    /// The element id, of a `g`, `use`, `svg` or an image's group; else
+    /// empty.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Whether there is anything to draw.
+    pub(crate) fn has_content(&self) -> bool {
+        self.children.iter().any(|c| !c.is_inert())
+    }
+
+    /// The fill box of the children, in the group's coordinates.
+    pub fn bounding_box(&self) -> Option<Rect> {
+        self.bounding_box
+    }
+
+    /// The stroke box of the children, in the group's coordinates.
+    pub fn stroke_bounding_box(&self) -> Option<Rect> {
+        self.stroke_bounding_box
+    }
+
+    /// The box of what the group draws, filters included, in the group's
+    /// coordinates.
+    pub fn layer_bounding_box(&self) -> NonZeroRect {
+        self.layer_bounding_box
+    }
+
+    /// Whether the group is isolated of itself (`isolation: isolate`).
+    pub fn isolate(&self) -> bool {
+        self.isolate
+    }
+
     /// The group's transform relative to its parent.
     pub fn transform(&self) -> Transform {
         self.transform
@@ -221,6 +279,7 @@ pub enum PaintOrder {
 /// A path with resolved paint.
 #[derive(Clone, Debug)]
 pub struct Path {
+    pub(crate) id: String,
     pub(crate) abs_transform: Transform,
     pub(crate) visible: bool,
     pub(crate) fill: Option<Fill>,
@@ -233,6 +292,21 @@ pub struct Path {
 }
 
 impl Path {
+    /// The element id, or empty.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The box of the path, in its group's coordinates.
+    pub fn bounding_box(&self) -> Rect {
+        self.bounding_box
+    }
+
+    /// The box of the path with its stroke.
+    pub fn stroke_bounding_box(&self) -> Rect {
+        self.stroke_bounding_box
+    }
+
     /// The path's transform relative to the root (see
     /// [`Group::abs_transform`]).
     pub fn abs_transform(&self) -> Transform {
@@ -294,6 +368,18 @@ pub enum Paint {
     Pattern(Arc<Pattern>),
 }
 
+impl Paint {
+    /// Whether it is still in units of the painted shape's box.
+    pub(crate) fn needs_box(&self) -> bool {
+        match self {
+            Paint::Color(_) => false,
+            Paint::LinearGradient(g) => g.base.obb,
+            Paint::RadialGradient(g) => g.base.obb,
+            Paint::Pattern(p) => p.pending.is_some(),
+        }
+    }
+}
+
 /// A fill.
 #[derive(Clone, Debug)]
 pub struct Fill {
@@ -345,6 +431,31 @@ pub(crate) enum ContextElement {
 }
 
 impl Stroke {
+    /// `stroke-miterlimit`.
+    pub fn miterlimit(&self) -> f32 {
+        self.miterlimit
+    }
+
+    /// `stroke-linecap`.
+    pub fn linecap(&self) -> LineCap {
+        self.linecap
+    }
+
+    /// `stroke-linejoin`.
+    pub fn linejoin(&self) -> LineJoin {
+        self.linejoin
+    }
+
+    /// `stroke-dasharray`, an even number of lengths.
+    pub fn dasharray(&self) -> Option<&[f32]> {
+        self.dasharray.as_deref()
+    }
+
+    /// `stroke-dashoffset`.
+    pub fn dashoffset(&self) -> f32 {
+        self.dashoffset
+    }
+
     /// The paint.
     pub fn paint(&self) -> &Paint {
         &self.paint
@@ -591,6 +702,7 @@ pub enum ImageKind {
 /// parent group carries the placement transform).
 #[derive(Clone, Debug)]
 pub struct Image {
+    pub(crate) id: String,
     pub(crate) visible: bool,
     pub(crate) size: Size,
     pub(crate) quality: FilterQuality,
@@ -598,6 +710,11 @@ pub struct Image {
 }
 
 impl Image {
+    /// How the image is sampled (`image-rendering`).
+    pub fn quality(&self) -> FilterQuality {
+        self.quality
+    }
+
     /// Intrinsic size (pixels, or user units of an SVG).
     pub fn size(&self) -> Size {
         self.size

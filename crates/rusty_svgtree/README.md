@@ -109,6 +109,46 @@ huge `feMorphology` radius costs no more than a small one.
 `BackgroundImage`, `BackgroundAlpha`, `FillPaint` and `StrokePaint` inputs
 read as `SourceGraphic`, as in resvg.
 
+## Text
+
+Text is always in the tree: `Node::Text` keeps the chunks, spans, fonts,
+paints and positions. To draw it, turn on the `text` feature and give
+`Options::fonts` a `text::FontProvider`, a trait with five methods (select a
+font, a fallback, metrics, shape a run, draw a glyph). The layout on top of it
+(bidi, fallback, `textPath`, `textLength`, spacing, baselines, decorations,
+vertical writing, SVG, bitmap and `COLR` glyphs) is this crate's, and the
+result is `Text::flattened`, ordinary paths. Documents cannot load fonts.
+
+| feature | default | adds |
+|---|---|---|
+| (none) | yes | text nodes in the tree, not drawn (`Tree::skipped().text` counts them) |
+| `text` | no | layout through a font callback: `kurbo`, `unicode-bidi`, `unicode-script`, `unicode-vo` |
+| `fonts` | no | `Fonts`, a provider over font files: `fontdb`, `harfrust`, `skrifa` |
+
+There is no house font stack yet
+([thoth#6](https://github.com/Remade-With-Rust/thoth/issues/6)), which is why
+the third-party one is behind a feature that is never on by default.
+
+With `fonts` and the same font files as resvg 0.48.1, all 379 files of the
+resvg suite's `text` category are pixel-identical, and so is every other file
+of the suite except four (JPEG rounding, at most 3 levels).
+
+```rust,ignore
+let mut fonts = rusty_svgtree::Fonts::new();
+fonts.load_system_fonts();
+let opt = rusty_svgtree::Options {
+    fonts: Some(std::sync::Arc::new(fonts)),
+    ..Default::default()
+};
+```
+
+## Writing SVG
+
+`Tree::to_svg_string` writes the tree back with every style resolved. All 1718
+files of the resvg suite that parse draw the same pixels after a round trip,
+with text as paths; with `WriteOptions { preserve_text: true }` so do the 379
+text files.
+
 ## Usage
 
 ```rust
@@ -144,10 +184,8 @@ access. `Tree::skipped` says what was left out.
 
 ## Not done yet
 
-- **Text** (`<text>` is skipped; resvg was measured with its `text` feature
-  off, so the oracle compares like with like). Needs the house font stack.
-- No external `href`s (by design), no `Tree::to_svg_string` export, no
-  animation.
+- No external `href`s (by design), no animation.
+- A house font stack: see Text.
 
 ## License
 

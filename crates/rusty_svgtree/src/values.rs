@@ -362,6 +362,21 @@ pub(crate) fn length_list(text: &str) -> Option<Vec<Length>> {
     Some(out)
 }
 
+/// A length list up to its first malformed item.
+pub(crate) fn length_list_prefix(text: &str) -> Vec<Length> {
+    let mut s = Stream::new(text);
+    let mut out = Vec::new();
+    s.skip_spaces();
+    while !s.at_end() {
+        let Some(l) = s.parse_length() else {
+            break;
+        };
+        out.push(l);
+        s.skip_list_separator();
+    }
+    out
+}
+
 /// A comma/space separated number list, up to its first malformed item, and
 /// whether it had none.
 pub(crate) fn number_list(text: &str) -> (Vec<f64>, bool) {
@@ -375,6 +390,142 @@ pub(crate) fn number_list(text: &str) -> (Vec<f64>, bool) {
         }
     }
     (out, true)
+}
+
+/// A `font-family` list; `None` when it is malformed.
+pub(crate) fn font_families(text: &str) -> Option<Vec<crate::text::FontFamily>> {
+    use crate::text::FontFamily;
+    let mut out = Vec::new();
+    let mut rest = text.trim_start();
+    while !rest.is_empty() {
+        let name;
+        if let Some(q) = rest.chars().next().filter(|c| matches!(c, '\'' | '"')) {
+            let end = rest[1..].find(q)?;
+            name = Some(FontFamily::Named(rest[1..=end].to_string()));
+            rest = rest[end + 2..].trim_start();
+        } else {
+            let end = rest.find(',').unwrap_or(rest.len());
+            let mut words = String::new();
+            for w in rest[..end].split_ascii_whitespace() {
+                if !is_css_ident(w) {
+                    return None;
+                }
+                if !words.is_empty() {
+                    words.push(' ');
+                }
+                words.push_str(w);
+            }
+            rest = &rest[end..];
+            name = match words.as_str() {
+                "" => None,
+                "serif" => Some(FontFamily::Serif),
+                "sans-serif" => Some(FontFamily::SansSerif),
+                "cursive" => Some(FontFamily::Cursive),
+                "fantasy" => Some(FontFamily::Fantasy),
+                "monospace" => Some(FontFamily::Monospace),
+                _ => Some(FontFamily::Named(words)),
+            };
+        }
+        out.extend(name.filter(|n| *n != FontFamily::Named(String::new())));
+        match rest.strip_prefix(',') {
+            Some(r) => rest = r.trim_start(),
+            None if rest.is_empty() => {}
+            None => return None,
+        }
+    }
+    Some(out)
+}
+
+/// A CSS identifier, without escapes.
+fn is_css_ident(w: &str) -> bool {
+    let body = w.strip_prefix('-').unwrap_or(w);
+    let mut chars = body.chars();
+    let start = |c: char| c.is_ascii_alphabetic() || c == '_' || !c.is_ascii();
+    chars.next().is_some_and(start) && chars.all(|c| start(c) || c.is_ascii_digit() || c == '-')
+}
+
+/// The parts of a `font` shorthand.
+pub(crate) struct FontShorthand<'a> {
+    pub style: Option<&'a str>,
+    pub variant: Option<&'a str>,
+    pub weight: Option<&'a str>,
+    pub stretch: Option<&'a str>,
+    pub size: &'a str,
+    pub family: &'a str,
+}
+
+/// Parses a `font` shorthand.
+pub(crate) fn font_shorthand(text: &str) -> Option<FontShorthand<'_>> {
+    let mut f = FontShorthand {
+        style: None,
+        variant: None,
+        weight: None,
+        stretch: None,
+        size: "",
+        family: "",
+    };
+    let mut rest = text.trim_start();
+    for _ in 0..4 {
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .unwrap_or(rest.len());
+        let word = &rest[..end];
+        match word {
+            "normal" => {}
+            "small-caps" => f.variant = Some(word),
+            "italic" | "oblique" => f.style = Some(word),
+            "bold" | "bolder" | "lighter" | "100" | "200" | "300" | "400" | "500" | "600"
+            | "700" | "800" | "900" => f.weight = Some(word),
+            "ultra-condensed" | "extra-condensed" | "condensed" | "semi-condensed"
+            | "semi-expanded" | "expanded" | "extra-expanded" | "ultra-expanded" => {
+                f.stretch = Some(word);
+            }
+            _ => break,
+        }
+        rest = rest[end..].trim_start();
+    }
+    let mut s = Stream::new(rest);
+    if s.peek()?.is_ascii_digit() {
+        s.parse_length()?;
+    } else if !matches!(
+        s.consume_ident(),
+        "xx-small"
+            | "x-small"
+            | "small"
+            | "medium"
+            | "large"
+            | "x-large"
+            | "xx-large"
+            | "larger"
+            | "smaller"
+    ) {
+        return None;
+    }
+    f.size = &rest[..s.pos];
+    s.skip_spaces();
+    // The line height has no effect.
+    if s.eat(b'/') {
+        s.skip_spaces();
+        s.parse_length()?;
+        s.skip_spaces();
+    }
+    f.family = s.rest();
+    (!f.family.is_empty()).then_some(f)
+}
+
+/// `font-variation-settings`: pairs of a quoted axis tag and a number;
+/// malformed ones are dropped.
+pub(crate) fn font_variations(text: &str) -> Vec<crate::text::FontVariation> {
+    let pair = |part: &str| {
+        let part = part.trim();
+        let quote = part.chars().next().filter(|c| matches!(c, '\'' | '"'))?;
+        let (tag, value) = part[1..].split_once(quote)?;
+        Some(crate::text::FontVariation {
+            tag: tag.as_bytes().try_into().ok()?,
+            value: value.trim().parse().ok().filter(|v: &f32| v.is_finite())?,
+        })
+    };
+    text.split(',').filter_map(pair).collect()
 }
 
 /// One item of a `filter` value.
