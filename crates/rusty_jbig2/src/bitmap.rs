@@ -1,3 +1,4 @@
+use crate::kernels::{And, Combine, Narrow, Or, Replace, Wide, Xnor, Xor};
 use crate::{Error, Result};
 
 /// A 1-bit image: packed rows, most significant bit first, each row padded
@@ -159,7 +160,7 @@ impl Bitmap {
         &self.data[s..s + self.stride]
     }
 
-    #[inline]
+    #[cfg(test)]
     pub(crate) fn get(&self, x: u32, y: u32) -> u32 {
         self.row(i64::from(y))
             .get((x >> 3) as usize)
@@ -236,8 +237,7 @@ impl Bitmap {
             let s0 = (y0 - y) as usize * src.stride + (sx >> 3) as usize;
             let w = Narrow {
                 rows: (y1 - y0) as usize,
-                skip,
-                lead,
+                rotate: skip.wrapping_sub(lead) & 63,
                 mask: (!0u64 << (64 - bits)) >> lead,
             };
             w.run::<C>(
@@ -260,172 +260,6 @@ impl Bitmap {
         for yy in y0..y1 {
             let start = yy as usize * self.stride;
             w.row::<C>(&mut self.data[start + b0..start + b1], src.row(yy - y));
-        }
-    }
-}
-
-/// The word a combination operator works on.
-trait Word:
-    Copy
-    + std::ops::BitAnd<Output = Self>
-    + std::ops::BitOr<Output = Self>
-    + std::ops::BitXor<Output = Self>
-    + std::ops::Not<Output = Self>
-{
-}
-impl Word for u8 {}
-impl Word for u64 {}
-
-/// A combination operator: `s` onto `d` where `m` is set.
-trait Combine {
-    /// Whether clear padding bits combine to set ones.
-    const SETS_PADDING: bool = false;
-    fn f<T: Word>(d: T, s: T, m: T) -> T;
-}
-
-struct Or;
-struct And;
-struct Xor;
-struct Xnor;
-struct Replace;
-
-impl Combine for Or {
-    #[inline]
-    fn f<T: Word>(d: T, s: T, m: T) -> T {
-        d | (s & m)
-    }
-}
-impl Combine for And {
-    #[inline]
-    fn f<T: Word>(d: T, s: T, m: T) -> T {
-        d & (s | !m)
-    }
-}
-impl Combine for Xor {
-    #[inline]
-    fn f<T: Word>(d: T, s: T, m: T) -> T {
-        d ^ (s & m)
-    }
-}
-impl Combine for Xnor {
-    const SETS_PADDING: bool = true;
-    #[inline]
-    fn f<T: Word>(d: T, s: T, m: T) -> T {
-        d ^ (!s & m)
-    }
-}
-impl Combine for Replace {
-    #[inline]
-    fn f<T: Word>(d: T, s: T, m: T) -> T {
-        (d & !m) | (s & m)
-    }
-}
-
-/// A draw whose rows each lie within one 64-bit word of the source and of the
-/// destination. Words are big-endian, so the leftmost pixel is the top bit.
-struct Narrow {
-    rows: usize,
-    /// Bit of the source's first byte the rows start at.
-    skip: u32,
-    /// Bit of the destination's first byte they start at.
-    lead: u32,
-    /// The destination bits drawn to.
-    mask: u64,
-}
-
-impl Narrow {
-    /// Rows start at byte `d0` of `dst` (at least 8 bytes) and `s0` of `src`
-    /// and follow in steps of their strides.
-    fn run<C: Combine>(
-        &self,
-        (dst, dstride, mut d0): (&mut [u8], usize, usize),
-        (src, sstride, mut s0): (&[u8], usize, usize),
-    ) {
-        let mut pad = [0u8; 72];
-        let src = if src.len() <= 64 {
-            // Every row of a small source gets a whole word to load.
-            pad[..src.len()].copy_from_slice(src);
-            &pad
-        } else {
-            src
-        };
-        let (skip, lead) = (self.skip, self.lead);
-        // The operators are bitwise, so only the source needs swapping.
-        let m = self.mask.to_be();
-        let mut left = self.rows;
-        while left > 0 {
-            let d = dst.get_mut(d0..).and_then(<[u8]>::first_chunk_mut::<8>);
-            let s = src.get(s0..).and_then(<[u8]>::first_chunk::<8>);
-            let (Some(d), Some(s)) = (d, s) else { break };
-            let v = ((u64::from_be_bytes(*s) << skip) >> lead).to_be();
-            *d = C::f(u64::from_ne_bytes(*d), v, m).to_ne_bytes();
-            d0 += dstride;
-            s0 += sstride;
-            left -= 1;
-        }
-        // Rows with less than a word left in one of the buffers: the last
-        // word there, shifted.
-        let (dend, send) = (dst.len() - 8, src.len() - 8);
-        while left > 0 {
-            let (dat, sat) = (d0.min(dend), s0.min(send));
-            let d = dst.get_mut(dat..).and_then(<[u8]>::first_chunk_mut::<8>);
-            let s = src.get(sat..).and_then(<[u8]>::first_chunk::<8>);
-            let (Some(d), Some(s)) = (d, s) else { break };
-            let k = (d0 - dat) * 8;
-            let v = (u64::from_be_bytes(*s) << ((s0 - sat) * 8) << skip) >> lead;
-            *d = C::f(u64::from_be_bytes(*d), v >> k, self.mask >> k).to_be_bytes();
-            d0 += dstride;
-            s0 += sstride;
-            left -= 1;
-        }
-    }
-}
-
-/// Any other draw, in bytes: the source's shifted ones between two masked
-/// ones of the destination.
-struct Wide {
-    /// The source byte the first destination byte begins in, -1 if that is
-    /// before the row, and the bit it begins at.
-    first: i64,
-    sh: u32,
-    head: u8,
-    tail: u8,
-}
-
-impl Wide {
-    fn row<C: Combine>(&self, d: &mut [u8], s: &[u8]) {
-        let sh = self.sh;
-        let at = |k: i64| -> u32 {
-            usize::try_from(k)
-                .ok()
-                .and_then(|k| s.get(k))
-                .map_or(0, |&v| u32::from(v))
-        };
-        let end = |i: usize| -> u8 {
-            let k = self.first + i as i64;
-            (((at(k) << 8) | at(k + 1)) >> (8 - sh)) as u8
-        };
-        let n = d.len();
-        if n == 1 {
-            d[0] = C::f(d[0], end(0), self.head & self.tail);
-            return;
-        }
-        d[0] = C::f(d[0], end(0), self.head);
-        d[n - 1] = C::f(d[n - 1], end(n - 1), self.tail);
-        // Source bits under whole destination bytes are all in the row.
-        let mid = &mut d[1..n - 1];
-        let from = (self.first + 1) as usize;
-        let Some(hi) = s.get(from..from + mid.len()) else {
-            return;
-        };
-        if sh == 0 {
-            for (d, a) in mid.iter_mut().zip(hi) {
-                *d = C::f(*d, *a, 0xFF);
-            }
-        } else if let Some(lo) = s.get(from + 1..from + 1 + mid.len()) {
-            for ((d, a), b) in mid.iter_mut().zip(hi).zip(lo) {
-                *d = C::f(*d, (a << sh) | (b >> (8 - sh)), 0xFF);
-            }
         }
     }
 }
