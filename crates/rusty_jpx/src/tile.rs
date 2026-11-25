@@ -3,7 +3,7 @@
 
 use crate::codestream::{ceil_shift, Params, Progression, Siz};
 use crate::dwt::{Lifting, Plane};
-use crate::error::{JpxError, JpxResult};
+use crate::error::{try_vec, JpxError, JpxResult};
 use crate::kernels::dequantize;
 use crate::t1::{Segment, MAX_PLANES, STYLE_BYPASS, STYLE_TERMALL, T1};
 use crate::tagtree::{Bits, TagTree};
@@ -627,6 +627,8 @@ impl Resolution {
 pub(crate) struct Scratch {
     t1: T1,
     lifting: Lifting,
+    /// Planes to use again, their contents of no use.
+    pub spare: Vec<Vec<i32>>,
     bytes: Vec<u8>,
     segments: Vec<Segment>,
 }
@@ -642,13 +644,38 @@ impl TileComp {
         let top = self.rect();
         let w = top[2].saturating_sub(top[0]) as usize;
         let h = top[3].saturating_sub(top[1]) as usize;
-        let mut plane = Plane::zeroed(w * h, !self.reversible)?;
+        // A used buffer has to be overwritten all over: block by block when
+        // every precinct was seen.
+        let mut used = false;
+        let mut data = Vec::new();
+        if let Some(spare) = scratch.spare.pop() {
+            data = spare;
+            used = data.len() >= w * h;
+        }
+        if used {
+            data.truncate(w * h);
+            let seen = |r: &Resolution| r.precincts.iter().all(Option::is_some);
+            if !self.res[..self.keep].iter().all(seen) {
+                data.fill(0);
+                used = false;
+            }
+        } else {
+            data = try_vec(w * h)?;
+        }
+        let mut plane = Plane {
+            data,
+            reals: !self.reversible,
+        };
         for res in &self.res[..self.keep] {
             for precinct in res.precincts.iter().flatten() {
                 for (band, info) in precinct.bands.iter().zip(&res.bands) {
                     for block in &band.blocks {
-                        if !block.chunks.is_empty() {
-                            self.block(block, info, body, scratch, &mut plane, w)?;
+                        if !self.block(block, info, body, scratch, &mut plane, w)? && used {
+                            let first = block.y as usize * w + block.x as usize;
+                            let rows = plane.data[first..].chunks_mut(w);
+                            for row in rows.take(usize::from(block.h)) {
+                                row[..usize::from(block.w)].fill(0);
+                            }
                         }
                     }
                 }
@@ -660,6 +687,8 @@ impl TileComp {
         Ok(plane)
     }
 
+    /// Decode a code-block into the plane; `false` when there is nothing to
+    /// decode.
     fn block(
         &self,
         block: &Block,
@@ -668,11 +697,11 @@ impl TileComp {
         s: &mut Scratch,
         plane: &mut Plane,
         stride: usize,
-    ) -> JpxResult<()> {
+    ) -> JpxResult<bool> {
         let planes =
             (band.planes + u32::from(self.roi)).saturating_sub(u32::from(block.zero_planes));
-        if planes == 0 {
-            return Ok(());
+        if planes == 0 || block.chunks.is_empty() {
+            return Ok(false);
         }
         if planes > MAX_PLANES {
             return Err(JpxError::Unsupported("more than 30 magnitude bit-planes"));
@@ -724,6 +753,6 @@ impl TileComp {
         let first = block.y as usize * stride + block.x as usize;
         let step = plane.reals.then_some(band.step);
         dequantize(&s.t1.data, (w, h), &mut plane.data[first..], stride, step);
-        Ok(())
+        Ok(true)
     }
 }

@@ -145,14 +145,32 @@ fn decode_tile(
         }
         inverse_mct(&mut planes)?;
         for (c, plane) in planes.into_iter().enumerate() {
-            store(siz, c, reduce, rects[c], plane, sizes[c], &mut out[c])?;
+            store(
+                siz,
+                c,
+                reduce,
+                rects[c],
+                plane,
+                sizes[c],
+                scratch,
+                &mut out[c],
+            )?;
         }
         rest.start = 3;
     }
     for c in rest {
         let comp = &tile.comps[c];
         let plane = comp.reconstruct(&body, scratch)?;
-        store(siz, c, reduce, comp.rect(), plane, sizes[c], &mut out[c])?;
+        store(
+            siz,
+            c,
+            reduce,
+            comp.rect(),
+            plane,
+            sizes[c],
+            scratch,
+            &mut out[c],
+        )?;
     }
     Ok(complete)
 }
@@ -168,6 +186,7 @@ fn inverse_mct(planes: &mut [Plane]) -> JpxResult<()> {
 }
 
 /// DC level shift, clamp and copy of a tile-component into its component.
+#[allow(clippy::too_many_arguments)]
 fn store(
     siz: &Siz,
     c: usize,
@@ -175,6 +194,7 @@ fn store(
     rect: [u32; 4],
     plane: Plane,
     (w, h): (u64, u64),
+    scratch: &mut Scratch,
     out: &mut Vec<i32>,
 ) -> JpxResult<()> {
     let k = siz.comps[c];
@@ -200,5 +220,6 @@ fn store(
     for (dst, src) in rows.zip(plane.data.chunks_exact(tw)) {
         kernels::level_into(&mut dst[x..x + tw], src, level, plane.reals);
     }
+    scratch.spare.push(plane.data);
     Ok(())
 }

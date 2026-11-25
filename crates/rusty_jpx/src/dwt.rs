@@ -4,7 +4,7 @@
 //! the top left corner, HL to its right, LH below, HH diagonal. Each call
 //! merges one level in place.
 
-use crate::error::{try_grow, try_vec, JpxResult};
+use crate::error::{try_grow, JpxResult};
 use crate::kernels::{synthesize_columns, synthesize_rows, COLUMN_SCRATCH};
 
 /// Samples of a tile-component.
@@ -23,13 +23,6 @@ pub(crate) struct Lifting {
 }
 
 impl Plane {
-    pub fn zeroed(n: usize, reals: bool) -> JpxResult<Self> {
-        Ok(Plane {
-            data: try_vec(n)?,
-            reals,
-        })
-    }
-
     /// Merge one decomposition level: `lo` and `hi` are the areas of the two
     /// resolutions, `stride` the width of the plane.
     pub fn synthesize(
