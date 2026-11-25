@@ -176,15 +176,20 @@ fn unknown_length_with_fewer_rows() {
 fn composition_matches_the_definition() {
     let mut r = Rng(99);
     let at = nominal_at(3, false);
-    for i in 0..200 {
+    for i in 0..400 {
+        // From 200 on, the first region is the whole page.
+        let whole = i >= 200;
         let black = r.below(2) == 0;
         let mut page = Img::new(50, 20);
         page.px.fill(u8::from(black));
         let mut s = page_info(50, 20, u8::from(black) << 2 | 0x40, 0);
         for n in 0..3 {
-            let (w, h) = (r.range(1, 70), r.range(1, 30));
+            let (mut w, mut h) = (r.range(1, 70), r.range(1, 30));
+            let (mut x, mut y) = (r.range(0, 60), r.range(0, 25));
+            if whole && n == 0 {
+                (w, h, x, y) = (50, 20, 0, 0);
+            }
             let m = Img::random(&mut r, w, h);
-            let (x, y) = (r.range(0, 60), r.range(0, 25));
             let op = ((i + n) % 5) as u8;
             let d = generic_data(&m, x as u32, y as u32, op, 3, false, &at, false);
             s.extend(segment(n + 1, 39, &[], &d));

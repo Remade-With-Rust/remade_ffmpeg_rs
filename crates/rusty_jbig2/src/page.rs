@@ -1,5 +1,6 @@
 //! Segment dispatch and page composition (7.4, 8.2).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -150,7 +151,7 @@ impl Decoder<'_> {
         self.budget.charge(256 + s.refs.len() as u64 * 16)?;
         match s.kind {
             kind::SYMBOL_DICT => {
-                let input = self.symbols(&s.refs)?;
+                let input = Self::symbols(&self.resources, &mut self.budget, &s.refs)?;
                 let tables = self.tables(&s.refs);
                 let previous = s
                     .refs
@@ -160,7 +161,7 @@ impl Decoder<'_> {
                         Some(Resource::Symbols(d)) => Some(d),
                         _ => None,
                     });
-                let dict = symbol::decode(s.data, &input, &tables, previous, &mut self.budget)?;
+                let dict = symbol::decode(s.data, input, &tables, previous, &mut self.budget)?;
                 self.resources.insert(s.number, Resource::Symbols(dict));
             }
             kind::PATTERN_DICT => {
@@ -276,23 +277,30 @@ impl Decoder<'_> {
     }
 
     /// The symbols of every dictionary referred to, in order.
-    fn symbols(&mut self, refs: &[u32]) -> Result<Vec<Arc<Bitmap>>> {
+    fn symbols<'r>(
+        resources: &'r HashMap<u32, Resource>,
+        budget: &mut Budget,
+        refs: &[u32],
+    ) -> Result<Cow<'r, [Arc<Bitmap>]>> {
         let mut dicts = Vec::new();
         for r in refs {
-            match self.resources.get(r) {
+            match resources.get(r) {
                 Some(Resource::Symbols(d)) => dicts.push(d),
                 Some(_) => {}
-                None if self.opts.lenient => {}
+                None if budget.lenient => {}
                 None => return Err(Error::Invalid("referred-to segment not found")),
             }
         }
         let n: usize = dicts.iter().map(|d| d.symbols.len()).sum();
-        self.budget.symbols(n as u64)?;
+        budget.symbols(n as u64)?;
+        if let [d] = dicts[..] {
+            return Ok(Cow::Borrowed(&d.symbols));
+        }
         let mut out = Vec::with_capacity(n);
         for d in dicts {
             out.extend_from_slice(&d.symbols);
         }
-        Ok(out)
+        Ok(Cow::Owned(out))
     }
 
     fn tables(&self, refs: &[u32]) -> Vec<Arc<Table>> {
@@ -368,16 +376,23 @@ impl Decoder<'_> {
                 None => return Err(Error::Invalid("referred-to region not found")),
             }
         }
-        let reference = if let Some(r) = reference {
+        let extracted;
+        let reference = if let Some(r) = &reference {
             r
         } else {
             self.budget.bitmap(u64::from(info.w), u64::from(info.h))?;
-            let p = self
+            let page = self
                 .page
                 .as_mut()
-                .ok_or(Error::Invalid("segment before page information"))?;
-            p.pixels()
-                .extract(i64::from(info.x), i64::from(info.y), info.w, info.h)
+                .ok_or(Error::Invalid("segment before page information"))?
+                .pixels();
+            if (info.x, info.y, info.w, info.h) == (0, 0, page.w, page.h) {
+                &*page
+            } else {
+                let (x, y) = (i64::from(info.x), i64::from(info.y));
+                extracted = page.extract(x, y, info.w, info.h);
+                &extracted
+            }
         };
         if (reference.w, reference.h) != (info.w, info.h) {
             return Err(Error::Invalid("refinement of a region of another size"));
@@ -386,7 +401,7 @@ impl Decoder<'_> {
         let mut cx = vec![0; t.contexts()];
         let mut a = Arith::new(b.rest());
         let r = Reference {
-            bitmap: &reference,
+            bitmap: reference,
             dx: 0,
             dy: 0,
         };
@@ -442,7 +457,7 @@ impl Decoder<'_> {
             template,
             read_final_oob: false,
         };
-        let symbols = self.symbols(&s.refs)?;
+        let symbols = Self::symbols(&self.resources, &mut self.budget, &s.refs)?;
         let mut gr = vec![0u8; if refine { template.contexts() } else { 0 }];
         self.budget.charge(gr.len() as u64 / 8)?;
         if huff {
