@@ -489,6 +489,21 @@ macro_rules! dispatch {
     };
 }
 
+/// `n` zeros from the allocator's zeroed memory, which for a large buffer is
+/// usually fresh pages that need no clearing; `None` when it refuses.
+pub(crate) fn zeros(n: usize) -> Option<Vec<i32>> {
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    let layout = std::alloc::Layout::array::<i32>(n).ok()?;
+    // SAFETY: the layout is not empty; it is the one a vector of `n` values
+    // gives back, and they are all initialized.
+    unsafe {
+        let p = std::alloc::alloc_zeroed(layout).cast::<i32>();
+        (!p.is_null()).then(|| Vec::from_raw_parts(p, n, n))
+    }
+}
+
 // ---------------------------------------------------------------- lifting
 
 /// One lifting step: a sample and its two neighbours.
