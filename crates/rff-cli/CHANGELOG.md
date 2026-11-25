@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.17](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-cli-v0.4.16...rff-cli-v0.4.17) - 2026-11-25
+
+### Added
+
+- *(rff-cli)* -show_chapters, -map_chapters, -map N:d ([#114](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/114))
+
 ## [0.4.16](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-cli-v0.4.15...rff-cli-v0.4.16) - 2026-11-24
 
 ### Fixed
