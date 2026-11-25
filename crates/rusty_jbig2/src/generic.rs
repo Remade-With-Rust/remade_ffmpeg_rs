@@ -233,10 +233,10 @@ pub(crate) fn decode(
         h,
     };
     match t.id {
-        0 => r.run::<T0, { T0::N }>(a, cx),
-        1 => r.run::<T1, { T1::N }>(a, cx),
-        2 => r.run::<T2, { T2::N }>(a, cx),
-        _ => r.run::<T3, { T3::N }>(a, cx),
+        0 => r.pick::<T0, { T0::N }>(a, cx),
+        1 => r.pick::<T1, { T1::N }>(a, cx),
+        2 => r.pick::<T2, { T2::N }>(a, cx),
+        _ => r.pick::<T3, { T3::N }>(a, cx),
     }
 }
 
@@ -250,7 +250,22 @@ struct Region<'r> {
 }
 
 impl Region<'_> {
-    fn run<S: Shape, const N: usize>(&self, coder: &mut Arith<'_>, cx: &mut [u8]) -> Bitmap {
+    fn pick<S: Shape, const N: usize>(&self, coder: &mut Arith<'_>, cx: &mut [u8]) -> Bitmap {
+        if self.moved.is_empty() && self.skip.is_none() {
+            self.run::<S, N, true>(coder, cx)
+        } else {
+            self.run::<S, N, false>(coder, cx)
+        }
+    }
+
+    /// `PLAIN`: no moved AT pixels, no skipping. Each a function of its own,
+    /// so that the plain one's registers are not shared out to the other.
+    #[inline(never)]
+    fn run<S: Shape, const N: usize, const PLAIN: bool>(
+        &self,
+        coder: &mut Arith<'_>,
+        cx: &mut [u8],
+    ) -> Bitmap {
         let (w, h) = (self.w, self.h);
         let mut out = Bitmap::new(w, h, false);
         let stride = out.stride;
@@ -289,7 +304,7 @@ impl Region<'_> {
                 if y > 0 {
                     cur.copy_from_slice(up(1));
                 }
-            } else if self.moved.is_empty() && self.skip.is_none() {
+            } else if PLAIN {
                 let up = |n: usize| if n > y { white } else { up(n) };
                 a = row_nominal::<S, N>(a, cx, up(2), up(1), cur, w);
             } else {
@@ -334,40 +349,57 @@ impl Region<'_> {
         let (r2, r1) = (up(2), up(1));
         let last = cur.len() - 1;
         let mut c = first::<S>(r2, r1);
+        let byte = |r: &[u8]| u32::from(r.first().copied().unwrap_or(0));
+        let (mut w2, mut w1) = (byte(r2), byte(r1));
         for i in 0..cur.len() {
             let sk = skip.get(i).copied().unwrap_or(0);
             let x0 = i as i64 * 8;
-            let (w2, w1) = (fetch32(r2, x0) >> 16, fetch32(r1, x0) >> 16);
+            let after = |r: &[u8]| u32::from(r.get(i + 1).copied().unwrap_or(0));
+            w2 = (w2 << 8) & 0xFFFF | after(r2);
+            w1 = (w1 << 8) & 0xFFFF | after(r1);
             let mut next = entering::<S>(w2, w1);
-            let mut moved = [0u32; 8];
+            let mut views = [0u8; 12];
             // Whether any of the moved pixels is black, or white.
-            let (mut any, mut all) = (0, 0xFF);
-            for &(bit, ax, row) in far {
-                let v = fetch32(row.unwrap_or(&cur[..i]), x0 + ax) >> 24;
-                any |= v;
-                all &= v;
-                spread(&mut moved, v, 1 << bit);
+            let (mut any, mut all) = (0u8, 0xFFu8);
+            for (v, &(_, ax, row)) in views.iter_mut().zip(far) {
+                *v = (fetch32(row.unwrap_or(&cur[..i]), x0 + ax) >> 24) as u8;
+                any |= *v;
+                all &= *v;
             }
             if i != last && sk == 0 {
-                if c | next | any | (hist & 0xFF) == 0 && a.run(cx[0], 0, 8) {
+                if c | next | u32::from(any) | (hist & 0xFF) == 0 && a.run(cx[0], 0, 8) {
                     hist <<= 8;
                     continue;
                 }
                 if c == S::BLACK as u32
                     && next == S::ENTER_BLACK
-                    && hist & all & 0xFF == 0xFF
+                    && hist & u32::from(all) == 0xFF
                     && a.run(cx[S::BLACK & (N - 1)], 1, 8)
                 {
                     cur[i] = 0xFF;
                     continue;
                 }
             }
+            let mut moved = [0u16; 8];
+            for (&v, &(bit, _, _)) in views.iter().zip(far) {
+                spread(&mut moved, v, 1 << bit);
+            }
             let n = if i == last { (self.w - 1) % 8 + 1 } else { 8 };
+            if sk == 0 && near.is_empty() {
+                for &moved in &moved[..n as usize] {
+                    let d = a.bit(&mut cx[((c & keep) | u32::from(moved)) as usize & (N - 1)]);
+                    hist = (hist << 1) | d;
+                    c = advance::<S>(c, d, next);
+                    next <<= 1;
+                }
+                cur[i] = (hist << (8 - n)) as u8;
+                continue;
+            }
             for (j, moved) in (0..n).zip(moved) {
                 let d = if (sk >> (7 - j)) & 1 == 1 {
                     0
                 } else {
-                    let mut c = (c & keep) | moved;
+                    let mut c = (c & keep) | u32::from(moved);
                     for &(bit, back) in near {
                         c |= ((hist >> back) & 1) << bit;
                     }
@@ -386,9 +418,9 @@ impl Region<'_> {
 /// Set `bit` in those of `out` whose bit of `v` is set, most significant
 /// first.
 #[inline]
-fn spread(out: &mut [u32; 8], v: u32, bit: u32) {
-    for (o, m) in out.iter_mut().zip([0x80, 0x40, 0x20, 0x10, 8, 4, 2, 1]) {
-        *o |= if v & m != 0 { bit } else { 0 };
+fn spread(out: &mut [u16; 8], v: u8, bit: u16) {
+    for (o, m) in out.iter_mut().zip([0x80u16, 0x40, 0x20, 0x10, 8, 4, 2, 1]) {
+        *o |= if u16::from(v) & m != 0 { bit } else { 0 };
     }
 }
 
