@@ -1387,6 +1387,12 @@ fn lfe_band_limit(spec: &mut [f32]) {
 /// per channel (ISO 14496-3 §4.5.3) less the element (7) and frame (59) overhead.
 const MAX_CHANNEL_BITS: usize = 6144 - 7 - 59;
 
+/// What TNS can add to a channel's body, which the rate loop does not count:
+/// 64 bits of `tns_data` (order 12) and the zero sections that hold `max_sfb`
+/// up (two 9-bit headers), rounded up. Kept free under [`MAX_CHANNEL_BITS`], or
+/// a block at the buffer's limit came out a byte over it.
+const TNS_RESERVE_BITS: usize = 96;
+
 /// Input samples are clamped to ±8× full scale (NaN becomes silence) at the push
 /// boundary. Real audio is untouched; hostile values (±Inf, 1e30) would otherwise
 /// drive every band to maximal escape codes and a block no rate decision can
@@ -2942,8 +2948,9 @@ fn encode_channel_element(
                 let offsets =
                     perceptual_offsets(&filtered, swb, sample_rate, psy.tonality_smr, target_bits);
                 let xp = Xpow::new(&filtered);
+                let tns_target = target_bits.min(MAX_CHANNEL_BITS - TNS_RESERVE_BITS);
                 let (_, sf, (mut cbs, _, msfb, quant)) =
-                    rate_loop_coded(&xp, swb, &offsets, target_bits);
+                    rate_loop_coded(&xp, swb, &offsets, tns_target);
                 // Hold max_sfb at or above tns_max, padding with ZERO bands, so
                 // the decoder's TNS span is exactly the one we filtered.
                 let msfb = msfb.max(tns_max);
@@ -8377,6 +8384,41 @@ mod fidelity_129 {
         // Past what a 6144-bit frame holds: every band is at its no-clamp floor.
         let (_, snr, _) = gain_snr(&mono, 1, 0, sr, 512);
         assert!(snr > 78.0, "mono: {snr:.1} dB");
+    }
+
+    /// TNS data is not in the rate loop's count: at the buffer's limit it took
+    /// a block to 769 bytes (found by the `encode` fuzz target).
+    #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret")]
+    fn a_tns_block_fits_the_decoder_buffer() {
+        let mut s = 8u64.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let mut noise = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        let pcm: Vec<f32> = (0..48_000)
+            .map(|i| {
+                let p = i % 4800;
+                let hit = if p < 2400 {
+                    0.0
+                } else {
+                    0.6 * (-((p - 2400) as f32) / 400.0).exp()
+                };
+                (hit + 0.002) * noise() + 0.1 * (i as f32 * 0.05).sin()
+            })
+            .collect();
+        let mut e = AacEncoder::new(AacEncoderConfig {
+            bitrate_bps: u32::MAX,
+            tns: true,
+            ..Default::default()
+        });
+        e.push_pcm(&pcm, 1, 48_000).unwrap();
+        e.finish();
+        while let Ok(p) = e.next_packet() {
+            assert!(p.data.len() <= 768, "{} bytes", p.data.len());
+        }
     }
 
     /// The surplus policy leaves every stream under its rate, and every
