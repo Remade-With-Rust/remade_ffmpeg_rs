@@ -36,13 +36,16 @@ impl Bitmap1 {
     /// bits stay zero.
     #[must_use]
     pub fn into_pdf_samples(mut self) -> Vec<u8> {
+        // All of it at once, then the padding.
+        for b in &mut self.data {
+            *b = !*b;
+        }
         let mask = tail_mask(self.width);
-        for row in self.data.chunks_exact_mut(self.stride.max(1)) {
-            for b in row.iter_mut() {
-                *b = !*b;
-            }
-            if let Some(l) = row.last_mut() {
-                *l &= mask;
+        if mask != 0xFF {
+            for row in self.data.chunks_exact_mut(self.stride.max(1)) {
+                if let Some(l) = row.last_mut() {
+                    *l &= mask;
+                }
             }
         }
         self.data
