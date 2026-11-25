@@ -111,15 +111,24 @@ impl<'r> Window<'r> {
 /// reference's.
 #[inline]
 fn contexts8<const ONE: bool>(p: u16, q: [u16; 3]) -> [u16; 8] {
+    /// Four lanes of 16 bits.
+    const LANES: u64 = 0x0001_0001_0001_0001;
     let mut out = [0; 8];
-    for (o, m) in out.iter_mut().zip([1u16, 2, 4, 8, 16, 32, 64, 128]) {
-        // Three pixels around pixel `j`, the product being a shift by `j`.
-        let three = |w: u16| w.wrapping_mul(m) >> 13;
-        *o = if ONE {
-            three(p) << 7 | (three(q[0]) & 2) << 4 | three(q[1]) << 2 | (three(q[2]) & 3)
+    for (half, out) in out.chunks_exact_mut(4).enumerate() {
+        // The three pixels around pixel `j` of the half at the top of lane
+        // `j`: ten pixels' worth of bits leave room for what is shifted out of
+        // the lane below.
+        let lanes = |w: u16| u64::from((w & 0xFFC0) << (4 * half)) * 0x0008_0004_0002_0001;
+        // From there to bit `to`, those of `three`.
+        let put = |w: u16, three: u64, to: u32| (lanes(w) >> (13 - to)) & (LANES * (three << to));
+        let x = if ONE {
+            put(p, 7, 7) | (lanes(q[0]) >> 9) & (LANES << 5) | put(q[1], 7, 2) | put(q[2], 3, 0)
         } else {
-            three(p) << 10 | three(q[0]) << 6 | three(q[1]) << 3 | three(q[2])
+            put(p, 7, 10) | put(q[0], 7, 6) | put(q[1], 7, 3) | put(q[2], 7, 0)
         };
+        for (j, o) in out.iter_mut().enumerate() {
+            *o = (x >> (16 * j)) as u16;
+        }
     }
     out
 }
