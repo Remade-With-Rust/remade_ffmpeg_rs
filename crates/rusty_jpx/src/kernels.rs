@@ -886,64 +886,109 @@ fn mirror(i: isize, n: usize) -> usize {
 /// A vertical transform, in one sweep over the rows: symmetric extension and
 /// lifting commute, so the edges need no cases of their own.
 trait Sweep {
-    /// # Safety
-    ///
-    /// `c` describes readable rows of `2 * N` samples and `out` has `2 * N`
-    /// samples for each of them; the two do not overlap.
-    unsafe fn run<I: Isa>(c: Column, out: *mut i32);
+    /// How far the output lags: a step at low-pass position `i` finishes the
+    /// rows `i - LAG` (low-pass) and `i - LAG - 1` (high-pass).
+    const LAG: isize;
+    /// What a step leaves for the next one.
+    type State<I: Isa>: Copy;
+    /// From the high-pass row before the first low-pass one.
+    unsafe fn start<I: Isa>(high: *const i32) -> Self::State<I>;
+    /// Take the low-pass row at `i` and the high-pass row at `i + 1`; return
+    /// the two finished rows, high-pass first.
+    unsafe fn step<I: Isa>(
+        state: &mut Self::State<I>,
+        low: *const i32,
+        high: *const i32,
+    ) -> (Pair<I>, Pair<I>);
 }
 
 struct Sweep53;
 impl Sweep for Sweep53 {
+    const LAG: isize = 0;
+    /// High-pass input, low-pass output.
+    type State<I: Isa> = (Pair<I>, Pair<I>);
     #[inline(always)]
-    unsafe fn run<I: Isa>(c: Column, out: *mut i32) {
-        let n = 2 * I::N;
-        let h = c.h as isize;
-        // `i` runs over the low-pass positions; each step finishes the rows
-        // i and i - 1.
-        let mut i = -isize::from(c.odd);
-        let mut d = Pair::<I>::load(c.at(i - 1));
-        let mut e = d;
-        while i <= h {
-            let d1 = Pair::<I>::load(c.at(i + 1));
-            let e1 = Pair::<I>::load(c.at(i)).lift::<Update53>(d, d1);
-            if i > 0 {
-                let o = d.lift::<Predict53>(e, e1);
-                o.store(out.add((i - 1) as usize * n));
-            }
-            if i >= 0 && i < h {
-                e1.store(out.add(i as usize * n));
-            }
-            (d, e) = (d1, e1);
-            i += 2;
-        }
+    unsafe fn start<I: Isa>(high: *const i32) -> Self::State<I> {
+        let d = Pair::load(high);
+        (d, d)
+    }
+    #[inline(always)]
+    unsafe fn step<I: Isa>(
+        state: &mut Self::State<I>,
+        low: *const i32,
+        high: *const i32,
+    ) -> (Pair<I>, Pair<I>) {
+        let (d, e) = *state;
+        let d1 = Pair::<I>::load(high);
+        let e1 = Pair::<I>::load(low).lift::<Update53>(d, d1);
+        *state = (d1, e1);
+        (d.lift::<Predict53>(e, e1), e1)
     }
 }
 
 struct Sweep97;
 impl Sweep for Sweep97 {
+    const LAG: isize = 2;
+    type State<I: Isa> = [Pair<I>; 4];
     #[inline(always)]
-    unsafe fn run<I: Isa>(c: Column, out: *mut i32) {
-        let n = 2 * I::N;
-        let h = c.h as isize;
-        // `i` runs over the low-pass positions; each step finishes the rows
-        // i - 2 and i - 3.
-        let mut i = -2 - isize::from(c.odd);
-        let mut d0 = Pair::<I>::load(c.at(i - 1)).scale(1.0 / K);
-        let (mut s1, mut d1, mut s2) = (d0, d0, d0);
-        while i <= h + 2 {
-            let d0n = Pair::<I>::load(c.at(i + 1)).scale(1.0 / K);
-            let s1n = Pair::<I>::load(c.at(i)).lift::<ScaleDelta>(d0, d0n);
-            let d1n = d0.lift::<Gamma>(s1, s1n);
-            let s2n = s1.lift::<Beta>(d1, d1n);
-            if i > 2 {
-                let d2 = d1.lift::<Alpha>(s2, s2n);
-                d2.store(out.add((i - 3) as usize * n));
+    unsafe fn start<I: Isa>(high: *const i32) -> Self::State<I> {
+        [Pair::load(high).scale(1.0 / K); 4]
+    }
+    #[inline(always)]
+    unsafe fn step<I: Isa>(
+        state: &mut Self::State<I>,
+        low: *const i32,
+        high: *const i32,
+    ) -> (Pair<I>, Pair<I>) {
+        let [d0, s1, d1, s2] = *state;
+        let d0n = Pair::<I>::load(high).scale(1.0 / K);
+        let s1n = Pair::<I>::load(low).lift::<ScaleDelta>(d0, d0n);
+        let d1n = d0.lift::<Gamma>(s1, s1n);
+        let s2n = s1.lift::<Beta>(d1, d1n);
+        *state = [d0n, s1n, d1n, s2n];
+        (d1.lift::<Alpha>(s2, s2n), s2n)
+    }
+}
+
+/// # Safety
+///
+/// `c` describes readable rows of `2 * N` samples and `out` has `2 * N`
+/// samples for each of them; the two do not overlap.
+#[inline(always)]
+unsafe fn sweep<I: Isa, S: Sweep>(c: Column, out: *mut i32) {
+    let n = 2 * I::N;
+    let h = c.h as isize;
+    // `i` runs over the low-pass positions, from where the first complete
+    // output needs it.
+    let odd = isize::from(c.odd);
+    let mut i = -S::LAG - odd;
+    let mut state = S::start::<I>(c.at(i - 1));
+    let row = |i: isize| out.wrapping_add((i as usize).wrapping_mul(n));
+    while i <= h + S::LAG {
+        if i > S::LAG && i + 1 < h {
+            // Away from the edges.
+            let mut low = c.at(i);
+            let mut high = c.at(i + 1);
+            let mut to = row(i - S::LAG - 1);
+            let count = (h - 1 - i + 1) / 2;
+            for _ in 0..count {
+                let (a, b) = S::step::<I>(&mut state, low, high);
+                a.store(to);
+                b.store(to.add(n));
+                low = low.wrapping_add(c.stride);
+                high = high.wrapping_add(c.stride);
+                to = to.wrapping_add(2 * n);
             }
-            if i > 1 && i < h + 2 {
-                s2n.store(out.add((i - 2) as usize * n));
+            i += 2 * count;
+        } else {
+            let (a, b) = S::step::<I>(&mut state, c.at(i), c.at(i + 1));
+            let done = i - S::LAG;
+            if done > 0 {
+                a.store(row(done - 1));
             }
-            (d0, s1, d1, s2) = (d0n, s1n, d1n, s2n);
+            if done >= 0 && done < h {
+                b.store(row(done));
+            }
             i += 2;
         }
     }
@@ -974,7 +1019,7 @@ unsafe fn column_loop<I: Isa, S: Sweep>(
     let mut x = 0;
     while x + n <= w {
         c.base = p.add(x);
-        S::run::<I>(c, col);
+        sweep::<I, S>(c, col);
         for y in 0..h {
             Pair::<I>::load(col.add(y * n)).store(p.add(y * stride + x));
         }
@@ -988,7 +1033,7 @@ unsafe fn column_loop<I: Isa, S: Sweep>(
         }
         c.base = strip;
         c.stride = n;
-        S::run::<I>(c, col);
+        sweep::<I, S>(c, col);
         for y in 0..h {
             std::ptr::copy_nonoverlapping(col.add(y * n), p.add(y * stride + x), w - x);
         }
