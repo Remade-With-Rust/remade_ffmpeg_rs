@@ -15,6 +15,8 @@
 //! they check every length that the pointer arithmetic relies on.
 #![allow(unsafe_code)]
 
+use std::marker::PhantomData;
+
 /// 1.5 * 2^23: adding it leaves an integer of up to 22 bits in the low
 /// mantissa bits, rounded to nearest, halves to even.
 const ROUND: f32 = 12_582_912.0;
@@ -570,6 +572,79 @@ impl Lift for Alpha {
 
 // ------------------------------------------------------------------- rows
 
+/// An operation on sample `i`, or on the `N` samples from it on.
+trait Each {
+    unsafe fn at<I: Isa>(&self, i: usize);
+}
+
+/// # Safety
+///
+/// `e` may be applied to every index from `first` up to `end`, which is not
+/// less.
+#[inline(always)]
+unsafe fn each<I: Isa, E: Each>(e: &E, first: usize, end: usize) {
+    let n = end - first;
+    let mut i = first;
+    for _ in 0..n / (2 * I::N) {
+        e.at::<I>(i);
+        e.at::<I>(i + I::N);
+        i += 2 * I::N;
+    }
+    if n & I::N != 0 {
+        e.at::<I>(i);
+        i += I::N;
+    }
+    // Written as a remainder, so that the compiler sees how short it is.
+    for i in i..i + (n & (I::N - 1)) {
+        e.at::<Scalar>(i);
+    }
+}
+
+/// `dst[i] = f(t[i], left[i], left[i + 1])`.
+struct Step<L>(*mut i32, *const i32, *const i32, PhantomData<L>);
+impl<L: Lift> Each for Step<L> {
+    #[inline(always)]
+    unsafe fn at<I: Isa>(&self, i: usize) {
+        let (a, b) = (self.2.wrapping_add(i), self.2.wrapping_add(i + 1));
+        let v = L::apply::<I>(I::load(self.1.add(i)), I::load(a), I::load(b));
+        I::store(self.0.add(i), v);
+    }
+}
+
+/// Row, high and low: `row[2 i] = f(high[i], low[i - 1], low[i])`, followed by
+/// `low[i]`.
+struct HighLow<L>(*mut i32, *const i32, *const i32, PhantomData<L>);
+impl<L: Lift> Each for HighLow<L> {
+    #[inline(always)]
+    unsafe fn at<I: Isa>(&self, i: usize) {
+        let b = I::load(self.2.add(i));
+        let v = L::apply::<I>(I::load(self.1.add(i)), I::load(self.2.add(i - 1)), b);
+        store_pairs::<I>(self.0.add(2 * i), v, b);
+    }
+}
+
+/// Row, high and low: `row[2 i] = low[i]`, followed by
+/// `f(high[i], low[i], low[i + 1])`.
+struct LowHigh<L>(*mut i32, *const i32, *const i32, PhantomData<L>);
+impl<L: Lift> Each for LowHigh<L> {
+    #[inline(always)]
+    unsafe fn at<I: Isa>(&self, i: usize) {
+        let a = I::load(self.2.add(i));
+        let v = L::apply::<I>(I::load(self.1.add(i)), a, I::load(self.2.add(i + 1)));
+        store_pairs::<I>(self.0.add(2 * i), a, v);
+    }
+}
+
+/// # Safety
+///
+/// `p` has room for `2 * N` samples.
+#[inline(always)]
+unsafe fn store_pairs<I: Isa>(p: *mut i32, a: I::R, b: I::R) {
+    let (x, y) = I::zip(a, b);
+    I::store(p, x);
+    I::store(p.add(I::N), y);
+}
+
 /// `dst[i] = f(t[i], s[i - 1], s[i])` when `lead` (`t`'s first sample comes
 /// before `s`'s first), else `f(t[i], s[i], s[i + 1])`; missing neighbours are
 /// mirrored.
@@ -595,18 +670,8 @@ unsafe fn step<I: Isa, L: Lift>(
     };
     // The left neighbour of t[i] is s[i - first].
     let left = s.wrapping_sub(first);
-    let mut i = first;
-    while i + I::N <= end {
-        let (a, b) = (left.wrapping_add(i), left.wrapping_add(i + 1));
-        let v = L::apply::<I>(I::load(t.add(i)), I::load(a), I::load(b));
-        I::store(dst.add(i), v);
-        i += I::N;
-    }
-    while i < end {
-        let (a, b) = (left.wrapping_add(i), left.wrapping_add(i + 1));
-        *dst.add(i) = L::apply::<Scalar>(*t.add(i), *a, *b);
-        i += 1;
-    }
+    each::<I, _>(&Step(dst, t, left, PhantomData::<L>), first, end.max(first));
+    let i = end.max(first);
     if i < n {
         let a = *left.wrapping_add(i);
         *dst.add(i) = L::apply::<Scalar>(*t.add(i), a, a);
@@ -633,48 +698,19 @@ unsafe fn predict_row<I: Isa, L: Lift>(
     // The output never overtakes the high-pass samples still to be read:
     // 2 (i + N) <= lw + i + N as long as i + N <= lw.
     let high = row.add(lw).cast_const();
-    let mut i = 0;
     if odd {
         // The neighbours of high[i] are low[i - 1] and low[i].
         *row = L::apply::<Scalar>(*high, *low, *low);
         *row.add(1) = *low;
-        i = 1;
-        while i + I::N <= lw {
-            let b = I::load(low.add(i));
-            let v = L::apply::<I>(I::load(high.add(i)), I::load(low.add(i - 1)), b);
-            let (x, y) = I::zip(v, b);
-            I::store(row.add(2 * i), x);
-            I::store(row.add(2 * i + I::N), y);
-            i += I::N;
-        }
-        while i < lw {
-            let b = *low.add(i);
-            let v = L::apply::<Scalar>(*high.add(i), *low.add(i - 1), b);
-            *row.add(2 * i) = v;
-            *row.add(2 * i + 1) = b;
-            i += 1;
-        }
+        each::<I, _>(&HighLow(row, high, low, PhantomData::<L>), 1, lw);
         if hw > lw {
-            let a = *low.add(i - 1);
-            *row.add(2 * i) = L::apply::<Scalar>(*high.add(i), a, a);
+            let a = *low.add(lw - 1);
+            *row.add(2 * lw) = L::apply::<Scalar>(*high.add(lw), a, a);
         }
     } else {
         // The neighbours of high[i] are low[i] and low[i + 1].
-        while i + I::N < lw {
-            let a = I::load(low.add(i));
-            let v = L::apply::<I>(I::load(high.add(i)), a, I::load(low.add(i + 1)));
-            let (x, y) = I::zip(a, v);
-            I::store(row.add(2 * i), x);
-            I::store(row.add(2 * i + I::N), y);
-            i += I::N;
-        }
-        while i + 1 < lw {
-            let a = *low.add(i);
-            let v = L::apply::<Scalar>(*high.add(i), a, *low.add(i + 1));
-            *row.add(2 * i) = a;
-            *row.add(2 * i + 1) = v;
-            i += 1;
-        }
+        each::<I, _>(&LowHigh(row, high, low, PhantomData::<L>), 0, lw - 1);
+        let i = lw - 1;
         let a = *low.add(i);
         if hw == lw {
             *row.add(2 * i + 1) = L::apply::<Scalar>(*high.add(i), a, a);
@@ -977,29 +1013,8 @@ pub(crate) fn synthesize_columns(
 
 // ----------------------------------------------------------- sample by sample
 
-/// An operation on sample `i`, or on the `N` samples from it on.
-trait Each {
-    unsafe fn at<I: Isa>(&self, i: usize);
-}
-
-/// # Safety
-///
-/// `e` may be applied to every index below `n`.
-#[inline(always)]
-unsafe fn each<I: Isa, E: Each>(e: &E, n: usize) {
-    let mut i = 0;
-    while i + I::N <= n {
-        e.at::<I>(i);
-        i += I::N;
-    }
-    while i < n {
-        e.at::<Scalar>(i);
-        i += 1;
-    }
-}
-
-dispatch!(each_rct = each::<Rct>(e: &Rct, n: usize));
-dispatch!(each_ict = each::<Ict>(e: &Ict, n: usize));
+dispatch!(each_rct = each::<Rct>(e: &Rct, first: usize, end: usize));
+dispatch!(each_ict = each::<Ict>(e: &Ict, first: usize, end: usize));
 
 /// Inverse RCT (G.2).
 struct Rct([*mut i32; 3]);
@@ -1039,9 +1054,9 @@ pub(crate) fn inverse_mct(planes: [&mut [i32]; 3], reals: bool) {
     // SAFETY: each plane has `n` samples and they are distinct.
     unsafe {
         if reals {
-            each_ict(&Ict(planes), n);
+            each_ict(&Ict(planes), 0, n);
         } else {
-            each_rct(&Rct(planes), n);
+            each_rct(&Rct(planes), 0, n);
         }
     }
 }
@@ -1103,19 +1118,33 @@ unsafe fn dequant_stripe<I: Isa, D: Dequant>(
     rows: usize,
     step: f32,
 ) {
-    let mut x = 0;
-    while x + I::N <= w {
-        let v = I::load_columns(src.add(4 * x));
-        for (i, &v) in v.iter().enumerate().take(rows) {
-            I::store(dst.add(i * stride + x), D::apply::<I>(v, step));
+    let e = Stripe {
+        src,
+        dst,
+        stride,
+        rows,
+        step,
+        kind: PhantomData::<D>,
+    };
+    each::<I, _>(&e, 0, w);
+}
+
+struct Stripe<D> {
+    src: *const i32,
+    dst: *mut i32,
+    stride: usize,
+    rows: usize,
+    step: f32,
+    kind: PhantomData<D>,
+}
+impl<D: Dequant> Each for Stripe<D> {
+    #[inline(always)]
+    unsafe fn at<I: Isa>(&self, x: usize) {
+        let v = I::load_columns(self.src.add(4 * x));
+        for (i, &v) in v.iter().enumerate().take(self.rows) {
+            let p = self.dst.add(i * self.stride + x);
+            I::store(p, D::apply::<I>(v, self.step));
         }
-        x += I::N;
-    }
-    while x < w {
-        for i in 0..rows {
-            *dst.add(i * stride + x) = D::apply::<Scalar>(*src.add(4 * x + i), step);
-        }
-        x += 1;
     }
 }
 
@@ -1212,17 +1241,17 @@ impl Each for LevelReal {
     }
 }
 
-dispatch!(each_level_int = each::<LevelInt>(e: &LevelInt, n: usize));
-dispatch!(each_level_real = each::<LevelReal>(e: &LevelReal, n: usize));
+dispatch!(each_level_int = each::<LevelInt>(e: &LevelInt, first: usize, end: usize));
+dispatch!(each_level_real = each::<LevelReal>(e: &LevelReal, first: usize, end: usize));
 
 /// # Safety
 ///
 /// `src` and `dst` have `n` samples and are the same or disjoint.
 unsafe fn level(src: *const i32, dst: *mut i32, n: usize, level: Level, reals: bool) {
     if !reals {
-        each_level_int(&LevelInt { src, dst, level }, n);
+        each_level_int(&LevelInt { src, dst, level }, 0, n);
     } else if level.bits <= 20 {
-        each_level_real(&LevelReal { src, dst, level }, n);
+        each_level_real(&LevelReal { src, dst, level }, 0, n);
     } else {
         for i in 0..n {
             *dst.add(i) = (float(*src.add(i)).round_ties_even() as i32)
