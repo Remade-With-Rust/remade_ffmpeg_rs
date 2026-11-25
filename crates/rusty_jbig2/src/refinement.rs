@@ -61,9 +61,11 @@ pub(crate) fn decode(
     h: u32,
 ) -> Bitmap {
     if t.one {
-        run::<true, { 1 << 10 }>(a, cx, t, tpgron, r, w, h)
+        run::<true, false, { 1 << 10 }>(a, cx, t, tpgron, r, w, h)
+    } else if t.at == [NOMINAL; 2] {
+        run::<false, false, { 1 << 13 }>(a, cx, t, tpgron, r, w, h)
     } else {
-        run::<false, { 1 << 13 }>(a, cx, t, tpgron, r, w, h)
+        run::<false, true, { 1 << 13 }>(a, cx, t, tpgron, r, w, h)
     }
 }
 
@@ -103,6 +105,25 @@ impl<'r> Window<'r> {
     fn advance(&mut self) -> u16 {
         self.load();
         (self.bytes >> (8 - self.sh)) as u16
+    }
+
+    /// Whether this and the next eight views are white.
+    #[inline]
+    fn white(&self) -> bool {
+        let after = match self.row.get(self.next..).map(<[u8]>::first_chunk::<8>) {
+            Some(Some(v)) => *v == [0; 8],
+            // Partly outside: not worth finding out. All of it: white.
+            Some(None) => self.next == self.row.len(),
+            None => self.next < self.next.wrapping_add(8),
+        };
+        after && self.bytes & 0x00FF_FFFF == 0
+    }
+
+    /// Skip eight views that are white.
+    #[inline]
+    fn skip(&mut self) {
+        self.bytes = 0;
+        self.next = self.next.wrapping_add(8);
     }
 }
 
@@ -145,7 +166,7 @@ fn typical(q: [u16; 3]) -> (u8, u8) {
 }
 
 #[inline(never)]
-fn run<const ONE: bool, const N: usize>(
+fn run<const ONE: bool, const CUSTOM: bool, const N: usize>(
     coder: &mut Arith<'_>,
     cx: &mut [u8],
     t: RefTemplate,
@@ -165,7 +186,6 @@ fn run<const ONE: bool, const N: usize>(
     }
     let mut a = *coder;
     let (ra1, ra2) = (t.at[0], t.at[1]);
-    let custom = !ONE && t.at != [NOMINAL; 2];
     // RA1 at most seven back on this row is in the history.
     let near = ra1.1 == 0 && ra1.0 > -8;
     let left = if ONE { 6 } else { 9 };
@@ -192,12 +212,15 @@ fn run<const ONE: bool, const N: usize>(
         let ra2_row = r.bitmap.row(ry + i64::from(ra2.1));
         let mut hist = 0u32;
         let last = stride - 1;
-        for i in 0..stride {
+        let mut at = 0;
+        while at < stride {
+            let i = at;
+            at += 1;
             let above = p.advance();
             let q = [q0.advance(), q1.advance(), q2.advance()];
             let n = if i == last { (w - 1) % 8 + 1 } else { 8 };
             let (mut v1, mut v2) = (0, 0);
-            if custom {
+            if CUSTOM {
                 let x0 = i as i64 * 8;
                 let x1 = x0 + i64::from(ra1.0);
                 let row = if ra1.1 < 0 { ra1_row } else { &cur[..i] };
@@ -210,6 +233,14 @@ fn run<const ONE: bool, const N: usize>(
                 if sure == 0xFF && i != last {
                     cur[i] = value;
                     hist = u32::from(value);
+                    if !CUSTOM && value == 0 {
+                        while at + 8 < stride && [&p, &q0, &q1, &q2].iter().all(|w| w.white()) {
+                            for w in [&mut p, &mut q0, &mut q1, &mut q2] {
+                                w.skip();
+                            }
+                            at += 8;
+                        }
+                    }
                     continue;
                 }
             }
@@ -219,11 +250,22 @@ fn run<const ONE: bool, const N: usize>(
                 let all = above & q[0] & q[1] & q[2];
                 if u32::from(any >> 6) | (hist & 0xFF) | u32::from(v1 | v2) == 0 {
                     if a.run(cx[0], 0, 8) {
+                        if !CUSTOM {
+                            while at + 8 < stride
+                                && [&p, &q0, &q1, &q2].iter().all(|w| w.white())
+                                && a.run(cx[0], 0, 64)
+                            {
+                                for w in [&mut p, &mut q0, &mut q1, &mut q2] {
+                                    w.skip();
+                                }
+                                at += 8;
+                            }
+                        }
                         continue;
                     }
                 } else if all >> 6 == 0x3FF
                     && hist & 0xFF == 0xFF
-                    && (!custom || v2 == 0xFF && (near || v1 == 0xFF))
+                    && (!CUSTOM || v2 == 0xFF && (near || v1 == 0xFF))
                     && a.run(cx[N - 1], 1, 8)
                 {
                     cur[i] = 0xFF;
@@ -231,7 +273,7 @@ fn run<const ONE: bool, const N: usize>(
                 }
             }
             let mut contexts = contexts8::<ONE>(above, q);
-            if custom {
+            if CUSTOM {
                 for c in &mut contexts {
                     *c &= !(1 << 12 | 1 << 8);
                 }
@@ -240,7 +282,7 @@ fn run<const ONE: bool, const N: usize>(
                 }
                 spread(&mut contexts, v2, 1 << 8);
             }
-            if sure == 0 && !(custom && near) {
+            if sure == 0 && !(CUSTOM && near) {
                 for &c in &contexts[..n as usize] {
                     let c = u32::from(c) | (hist & 1) << left;
                     hist = (hist << 1) | a.bit(&mut cx[c as usize & (N - 1)]);
@@ -254,7 +296,7 @@ fn run<const ONE: bool, const N: usize>(
                     continue;
                 }
                 let mut c = u32::from(c) | (hist & 1) << left;
-                if custom && near {
+                if CUSTOM && near {
                     c |= ((hist >> (u32::from(ra1.0.unsigned_abs()) - 1)) & 1) << 12;
                 }
                 hist = (hist << 1) | a.bit(&mut cx[c as usize & (N - 1)]);
