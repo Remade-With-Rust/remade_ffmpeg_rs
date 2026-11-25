@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="240" height="160" viewBox="0 0 240 160">
+  <filter id="p" primitiveUnits="objectBoundingBox" x="-.2" y="-.2" width="1.4" height="1.4"><feGaussianBlur stdDeviation=".05 .02"/><feOffset dx=".1" dy=".1"/></filter>
+  <filter id="us" filterUnits="userSpaceOnUse" x="90" y="10" width="60" height="50"><feGaussianBlur stdDeviation="4" x="100" y="20" width="40" height="30"/></filter>
+  <filter id="base" filterUnits="userSpaceOnUse" x="160" y="10" width="70" height="60"><feFlood flood-color="olive" x="165" y="15" width="30" height="20"/></filter>
+  <filter id="ref" xlink:href="#base" width="50"/>
+  <filter id="clip"><feOffset dx="8" dy="4"/><feFlood x="20" y="100" width="10" height="20" result="k"/><feMerge><feMergeNode in="SourceGraphic"/><feMergeNode in="k"/></feMerge></filter>
+  <filter id="empty"/>
+  <rect x="15" y="15" width="55" height="35" fill="coral" filter="url(#p)"/><rect x="95" y="15" width="50" height="40" fill="slateblue" filter="url(#us)"/>
+  <rect x="170" y="20" width="50" height="40" filter="url(#ref)"/><g filter="url(#base)" transform="translate(0 70)"/>
+  <rect x="15" y="90" width="55" height="45" fill="teal" filter="url(#clip)" clip-path="url(#cp)" mask="url(#mk)"/>
+  <rect x="95" y="90" width="50" height="40" filter="url(#empty)"/><rect x="160" y="130" width="20" height="20" filter="url(#nope)"/><rect x="190" y="130" width="20" height="20" filter="bogus(1)"/>
+  <clipPath id="cp"><circle cx="45" cy="112" r="28"/></clipPath><mask id="mk"><rect x="0" y="80" width="70" height="60" fill="#bbb"/></mask>
+</svg>

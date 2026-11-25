@@ -42,6 +42,31 @@ pub(crate) enum EId {
     Pattern,
     Marker,
     Filter,
+    FeBlend,
+    FeColorMatrix,
+    FeComponentTransfer,
+    FeComposite,
+    FeConvolveMatrix,
+    FeDiffuseLighting,
+    FeDisplacementMap,
+    FeDistantLight,
+    FeDropShadow,
+    FeFlood,
+    FeFuncA,
+    FeFuncB,
+    FeFuncG,
+    FeFuncR,
+    FeGaussianBlur,
+    FeImage,
+    FeMerge,
+    FeMergeNode,
+    FeMorphology,
+    FeOffset,
+    FePointLight,
+    FeSpecularLighting,
+    FeSpotLight,
+    FeTile,
+    FeTurbulence,
 }
 
 impl EId {
@@ -70,6 +95,31 @@ impl EId {
             "pattern" => EId::Pattern,
             "marker" => EId::Marker,
             "filter" => EId::Filter,
+            "feBlend" => EId::FeBlend,
+            "feColorMatrix" => EId::FeColorMatrix,
+            "feComponentTransfer" => EId::FeComponentTransfer,
+            "feComposite" => EId::FeComposite,
+            "feConvolveMatrix" => EId::FeConvolveMatrix,
+            "feDiffuseLighting" => EId::FeDiffuseLighting,
+            "feDisplacementMap" => EId::FeDisplacementMap,
+            "feDistantLight" => EId::FeDistantLight,
+            "feDropShadow" => EId::FeDropShadow,
+            "feFlood" => EId::FeFlood,
+            "feFuncA" => EId::FeFuncA,
+            "feFuncB" => EId::FeFuncB,
+            "feFuncG" => EId::FeFuncG,
+            "feFuncR" => EId::FeFuncR,
+            "feGaussianBlur" => EId::FeGaussianBlur,
+            "feImage" => EId::FeImage,
+            "feMerge" => EId::FeMerge,
+            "feMergeNode" => EId::FeMergeNode,
+            "feMorphology" => EId::FeMorphology,
+            "feOffset" => EId::FeOffset,
+            "fePointLight" => EId::FePointLight,
+            "feSpecularLighting" => EId::FeSpecularLighting,
+            "feSpotLight" => EId::FeSpotLight,
+            "feTile" => EId::FeTile,
+            "feTurbulence" => EId::FeTurbulence,
             _ => return None,
         })
     }
@@ -124,9 +174,9 @@ macro_rules! attribute_ids {
 
 /// A set of attribute ids, one bit each.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct AttrSet([u64; 2]);
+struct AttrSet([u64; 3]);
 
-const _: () = assert!(AId::COUNT <= 128);
+const _: () = assert!(AId::COUNT <= 192);
 
 impl AttrSet {
     #[inline]
@@ -143,7 +193,11 @@ impl AttrSet {
 
     #[inline]
     fn union(self, other: AttrSet) -> AttrSet {
-        AttrSet([self.0[0] | other.0[0], self.0[1] | other.0[1]])
+        AttrSet([
+            self.0[0] | other.0[0],
+            self.0[1] | other.0[1],
+            self.0[2] | other.0[2],
+        ])
     }
 }
 
@@ -249,6 +303,54 @@ attribute_ids! {
     RequiredExtensions = "requiredExtensions",
     RequiredFeatures = "requiredFeatures",
     SystemLanguage = "systemLanguage",
+    FilterUnits = "filterUnits",
+    PrimitiveUnits = "primitiveUnits",
+    In = "in",
+    In2 = "in2",
+    Result = "result",
+    Type = "type",
+    Values = "values",
+    TableValues = "tableValues",
+    Slope = "slope",
+    Intercept = "intercept",
+    Amplitude = "amplitude",
+    Exponent = "exponent",
+    Mode = "mode",
+    Operator = "operator",
+    K1 = "k1",
+    K2 = "k2",
+    K3 = "k3",
+    K4 = "k4",
+    Order = "order",
+    KernelMatrix = "kernelMatrix",
+    Divisor = "divisor",
+    Bias = "bias",
+    TargetX = "targetX",
+    TargetY = "targetY",
+    EdgeMode = "edgeMode",
+    PreserveAlpha = "preserveAlpha",
+    StdDeviation = "stdDeviation",
+    Dx = "dx",
+    Dy = "dy",
+    Radius = "radius",
+    Scale = "scale",
+    XChannelSelector = "xChannelSelector",
+    YChannelSelector = "yChannelSelector",
+    BaseFrequency = "baseFrequency",
+    NumOctaves = "numOctaves",
+    Seed = "seed",
+    StitchTiles = "stitchTiles",
+    SurfaceScale = "surfaceScale",
+    DiffuseConstant = "diffuseConstant",
+    SpecularConstant = "specularConstant",
+    SpecularExponent = "specularExponent",
+    Azimuth = "azimuth",
+    Elevation = "elevation",
+    Z = "z",
+    PointsAtX = "pointsAtX",
+    PointsAtY = "pointsAtY",
+    PointsAtZ = "pointsAtZ",
+    LimitingConeAngle = "limitingConeAngle",
 }
 
 impl AId {
@@ -340,6 +442,12 @@ impl AId {
                 | AId::Transform
                 | AId::TransformOrigin
         )
+    }
+
+    /// Whether the value `inherit` is meaningful: for anything else it is an
+    /// invalid value, kept as it stands (usvg's `allows_inherit_value`).
+    fn allows_inherit(self) -> bool {
+        self.is_presentation()
     }
 
     /// Whether the attribute is inherited by descendants.
@@ -951,6 +1059,7 @@ pub(crate) fn build(xml: &XmlDoc, limits: Limits) -> Result<Document<'_>, Error>
     b.doc.links = links;
     fix_recursive_links(&mut b.doc, EId::ClipPath, AId::ClipPath);
     fix_recursive_links(&mut b.doc, EId::Mask, AId::Mask);
+    fix_recursive_fe_images(&mut b.doc);
     fix_recursive_patterns(&mut b.doc, AId::Fill);
     fix_recursive_patterns(&mut b.doc, AId::Stroke);
     Ok(b.doc)
@@ -1194,11 +1303,12 @@ fn append_attribute<'x>(
     replace: bool,
 ) {
     let value = value.trimmed();
-    let resolved: Option<(Value<'x>, bool)> = if value.as_str() == "inherit" {
-        resolve_inherit(doc, parent, name)
-    } else {
-        Some((value.keep(), important))
-    };
+    let resolved: Option<(Value<'x>, bool)> =
+        if value.as_str() == "inherit" && name.allows_inherit() {
+            resolve_inherit(doc, parent, name)
+        } else {
+            Some((value.keep(), important))
+        };
     let Some((value, important)) = resolved else {
         return;
     };
@@ -1254,6 +1364,7 @@ fn resolve_inherit<'x>(doc: &Document<'x>, parent: NodeId, name: AId) -> Option<
         | AId::StopOpacity
         | AId::StrokeOpacity => "1",
         AId::ClipRule | AId::FillRule => "nonzero",
+        AId::ColorInterpolationFilters => "linearRGB",
         AId::Display => "inline",
         AId::Overflow => "visible",
         AId::StrokeDashoffset => "0",
@@ -1350,5 +1461,37 @@ fn fix_recursive_patterns(doc: &mut Document, attr: AId) {
     }
     for id in fixes {
         doc.set_attribute_value(id, attr, "none");
+    }
+}
+
+/// An `feImage` referencing an element that is filtered by the same filter:
+/// the element's `filter` becomes `none`, as in usvg. Longer cycles are
+/// caught by the converter's recursion guard.
+fn fix_recursive_fe_images(doc: &mut Document) {
+    let mut fixes: Vec<NodeId> = Vec::new();
+    {
+        let d = &*doc;
+        for fe in d
+            .root()
+            .descendants()
+            .filter(|n| n.tag_name() == Some(EId::FeImage))
+        {
+            let Some(link) = fe.href() else {
+                continue;
+            };
+            let (Some(value), Some(filter)) = (link.attribute(AId::Filter), fe.parent()) else {
+                continue;
+            };
+            let (funcs, _) = crate::values::filter_functions(value);
+            let recursive = funcs.iter().any(
+                |f| matches!(f, crate::values::FilterFunc::Url(id) if *id == filter.element_id()),
+            );
+            if recursive {
+                fixes.push(link.id);
+            }
+        }
+    }
+    for id in fixes {
+        doc.set_attribute_value(id, AId::Filter, "none");
     }
 }

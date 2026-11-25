@@ -9,6 +9,8 @@ use rusty_raster::{
     SpreadMode, Transform,
 };
 
+use crate::filter::Filter;
+
 /// A node of the render tree.
 #[derive(Clone, Debug)]
 pub enum Node {
@@ -49,6 +51,7 @@ pub struct Group {
     pub(crate) isolate: bool,
     pub(crate) clip_path: Option<Arc<ClipPath>>,
     pub(crate) mask: Option<Arc<Mask>>,
+    pub(crate) filters: Vec<Arc<Filter>>,
     pub(crate) children: Vec<Node>,
     pub(crate) bounding_box: Option<Rect>,
     pub(crate) stroke_bounding_box: Option<Rect>,
@@ -64,6 +67,7 @@ impl Default for Group {
             isolate: false,
             clip_path: None,
             mask: None,
+            filters: Vec::new(),
             children: Vec::new(),
             bounding_box: None,
             stroke_bounding_box: None,
@@ -117,6 +121,11 @@ impl Group {
         self.mask.as_deref()
     }
 
+    /// The filters, applied in order before the clip path and mask.
+    pub fn filters(&self) -> &[Arc<Filter>] {
+        &self.filters
+    }
+
     /// Child nodes, in paint order.
     pub fn children(&self) -> &[Node] {
         &self.children
@@ -128,6 +137,7 @@ impl Group {
             || self.opacity != 1.0
             || self.clip_path.is_some()
             || self.mask.is_some()
+            || !self.filters.is_empty()
             || self.blend_mode != BlendMode::SourceOver
     }
 
@@ -172,7 +182,15 @@ impl Group {
             self.bounding_box = bbox;
             self.stroke_bounding_box = stroke_bbox;
         }
-        if let Some(r) = layer_bbox.and_then(|r| r.to_non_zero_rect()) {
+        // The filter regions take the place of the content's box.
+        let filter_bbox = self
+            .filters
+            .iter()
+            .fold(None, |b, f| expand(b, Some(f.rect.to_rect())));
+        if let Some(r) = filter_bbox
+            .or(layer_bbox)
+            .and_then(|r| r.to_non_zero_rect())
+        {
             self.layer_bounding_box = r;
         }
     }
