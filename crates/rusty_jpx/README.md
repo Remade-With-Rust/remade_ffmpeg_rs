@@ -95,19 +95,22 @@ OpenJPEG; below 1 is faster here):
 
 | Image | rusty_jpx | OpenJPEG | ratio | pairs won |
 |---|---:|---:|---:|---:|
-| 2592x1944 RGB, 9/7, 10:1 | 236 ms | 267 ms | 0.89 | 10/12 |
-| same, 512x512 tiles, 20:1 | 134 ms | 177 ms | 0.76 | 12/12 |
-| same, 5/3 lossless | 640 ms | 656 ms | 0.98 | 11/12 |
-| same, 5/3 lossless, bypass | 669 ms | 675 ms | 0.99 | 8/12 |
-| 3906x2602 YCbCr 4:2:0, 9/7 (`zoo1`) | 602 ms | 613 ms | 0.98 | 6/12 |
-| 2K frame, 12-bit (`movie_00000`) | 31 ms | 34 ms | 0.92 | 10/12 |
+| 2592x1944 RGB, 9/7, 10:1 | 191 ms | 260 ms | 0.74 | 12/12 |
+| same, 512x512 tiles, 20:1 | 109 ms | 178 ms | 0.61 | 12/12 |
+| same, 5/3 lossless | 563 ms | 671 ms | 0.84 | 12/12 |
+| same, 5/3 lossless, bypass | 535 ms | 642 ms | 0.83 | 12/12 |
+| 3906x2602 YCbCr 4:2:0, 9/7 (`zoo1`) | 472 ms | 575 ms | 0.82 | 12/12 |
+| 2K frame, 5/3 (`movie_00000`) | 22 ms | 37 ms | 0.59 | 12/12 |
 
-Method: i7-14650HX, WSL2, `taskset` to one core, 12 process pairs in
-alternating order, best of 2 decodes per process, rusty_alloc 2.6.0, rustc
-1.99, thin LTO; OpenJPEG built by CMake Release (gcc, its SSE2 paths). The
-box was shared: null pairs (OpenJPEG against itself) read 0.76-1.13 on the
-short images and 0.97-1.08 on the long ones, so ratios of 0.9 and up are
-level.
+Method: i7-14650HX (AVX2), WSL2, `taskset` to one core, 12 rounds of processes
+in alternating order, best of 2 decodes per process, rusty_alloc 2.6.0, rustc
+1.99, thin LTO; OpenJPEG built by CMake Release (gcc, its SSE2 paths, no AVX2).
+The box was shared: null pairs (OpenJPEG against itself) read 0.91-1.36, so
+treat the ratios as accurate to about 10%.
+
+The wavelet, colour and sample kernels use AVX2 where the processor has it,
+and SSE2 or NEON otherwise; every kernel gives the same result to the bit as
+its scalar version. `unsafe` code is confined to that module.
 
 ## Provenance
 
