@@ -50,6 +50,15 @@ pub(crate) fn try_vec<T: Clone + Default>(n: usize) -> JpxResult<Vec<T>> {
     Ok(v)
 }
 
+/// `v` with room for `n` values, whatever they are: a buffer for reuse.
+pub(crate) fn try_grow(v: &mut Vec<i32>, n: usize) -> JpxResult<&mut [i32]> {
+    if v.len() < n {
+        *v = Vec::new();
+        *v = try_vec(n)?;
+    }
+    Ok(v)
+}
+
 /// Big-endian field reader over a marker segment or box.
 pub(crate) struct Fields<'a>(pub &'a [u8]);
 

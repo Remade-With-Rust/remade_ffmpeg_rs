@@ -4,7 +4,7 @@
 //! the top left corner, HL to its right, LH below, HH diagonal. Each call
 //! merges one level in place.
 
-use crate::error::{try_vec, JpxResult};
+use crate::error::{try_grow, try_vec, JpxResult};
 use crate::kernels::{synthesize_columns, synthesize_rows, COLUMN_SCRATCH};
 
 /// Samples of a tile-component.
@@ -13,6 +13,13 @@ pub(crate) struct Plane {
     pub data: Vec<i32>,
     /// Which of the two.
     pub reals: bool,
+}
+
+/// Buffers of [`Plane::synthesize`], for reuse; their contents do not matter.
+#[derive(Default)]
+pub(crate) struct Lifting {
+    row: Vec<i32>,
+    columns: Vec<i32>,
 }
 
 impl Plane {
@@ -25,7 +32,13 @@ impl Plane {
 
     /// Merge one decomposition level: `lo` and `hi` are the areas of the two
     /// resolutions, `stride` the width of the plane.
-    pub fn synthesize(&mut self, stride: usize, lo: [u32; 4], hi: [u32; 4]) -> JpxResult<()> {
+    pub fn synthesize(
+        &mut self,
+        stride: usize,
+        lo: [u32; 4],
+        hi: [u32; 4],
+        scratch: &mut Lifting,
+    ) -> JpxResult<()> {
         let w = hi[2].saturating_sub(hi[0]) as usize;
         let h = hi[3].saturating_sub(hi[1]) as usize;
         let lw = lo[2].saturating_sub(lo[0]) as usize;
@@ -45,14 +58,14 @@ impl Plane {
         };
 
         if w > 1 {
-            let mut tmp = try_vec(lw)?;
-            synthesize_rows(p, stride, (lw, w - lw), h, odd_x, reals, &mut tmp);
+            let tmp = try_grow(&mut scratch.row, lw)?;
+            synthesize_rows(p, stride, (lw, w - lw), h, odd_x, reals, tmp);
         } else if odd_x {
             p.iter_mut().step_by(stride).take(h).for_each(halve);
         }
         if h > 1 {
-            let mut col = try_vec(COLUMN_SCRATCH * h)?;
-            synthesize_columns(p, stride, w, (h, lh), odd_y, reals, &mut col);
+            let col = try_grow(&mut scratch.columns, COLUMN_SCRATCH * h)?;
+            synthesize_columns(p, stride, w, (h, lh), odd_y, reals, col);
         } else if odd_y {
             p[..w].iter_mut().for_each(halve);
         }
@@ -120,13 +133,23 @@ mod tests {
                 let want = reference53(low, high, x0 == 1);
                 let row = data.clone();
                 let mut row = plane(row);
-                row.synthesize(n as usize, [lo, 0, hi, 1], [x0, 0, x0 + n, 1])
-                    .unwrap();
+                row.synthesize(
+                    n as usize,
+                    [lo, 0, hi, 1],
+                    [x0, 0, x0 + n, 1],
+                    &mut Lifting::default(),
+                )
+                .unwrap();
                 assert_eq!(row.data, want, "row {n} {x0}");
                 let col = data.clone();
                 let mut col = plane(col);
-                col.synthesize(1, [0, lo, 1, hi], [0, x0, 1, x0 + n])
-                    .unwrap();
+                col.synthesize(
+                    1,
+                    [0, lo, 1, hi],
+                    [0, x0, 1, x0 + n],
+                    &mut Lifting::default(),
+                )
+                .unwrap();
                 assert_eq!(col.data, want, "column {n} {x0}");
             }
         }

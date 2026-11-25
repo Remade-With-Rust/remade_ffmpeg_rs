@@ -2,7 +2,7 @@
 //! (ISO/IEC 15444-1 Annex B).
 
 use crate::codestream::{ceil_shift, Params, Progression, Siz};
-use crate::dwt::Plane;
+use crate::dwt::{Lifting, Plane};
 use crate::error::{JpxError, JpxResult};
 use crate::kernels::dequantize;
 use crate::t1::{Segment, MAX_PLANES, STYLE_BYPASS, STYLE_TERMALL, T1};
@@ -626,6 +626,7 @@ impl Resolution {
 #[derive(Default)]
 pub(crate) struct Scratch {
     t1: T1,
+    lifting: Lifting,
     bytes: Vec<u8>,
     segments: Vec<Segment>,
 }
@@ -654,7 +655,7 @@ impl TileComp {
             }
         }
         for pair in self.res[..self.keep].windows(2) {
-            plane.synthesize(w, pair[0].rect, pair[1].rect)?;
+            plane.synthesize(w, pair[0].rect, pair[1].rect, &mut scratch.lifting)?;
         }
         Ok(plane)
     }
