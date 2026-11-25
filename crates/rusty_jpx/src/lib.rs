@@ -17,6 +17,10 @@
 //!
 //! Malformed input returns an error; it does not panic, and it does not
 //! allocate or loop beyond [`Limits`].
+//!
+//! The API is safe. `unsafe` code is confined to one module, the sample
+//! kernels (AVX2, SSE2 and NEON, with a scalar twin that the tests hold them
+//! to).
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 

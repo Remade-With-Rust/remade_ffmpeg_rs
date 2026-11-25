@@ -1711,7 +1711,6 @@ mod tests {
                                 each::<I, _>(&e, 0, p.len());
                             } else {
                                 each::<Scalar, _>(&e, 0, p.len());
-                                return;
                             }
                         }
                     };

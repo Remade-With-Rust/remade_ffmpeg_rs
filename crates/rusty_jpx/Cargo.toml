@@ -7,7 +7,7 @@ license = "Apache-2.0"
 repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
 homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
 authors = ["Mata Network <https://www.mata.network>"]
-description = "Pure-Rust JPEG 2000 decoder: J2K codestreams and JP2/JPX files (PDF JPXDecode). Reversible 5/3 exact against OpenJPEG, irreversible 9/7, tiles, precincts, all progressions, ROI, reduced resolution, palette, ICC and alpha. Malformed input errors, never panics. No C, no unsafe, no dependencies."
+description = "Pure-Rust JPEG 2000 decoder: J2K codestreams and JP2/JPX files (PDF JPXDecode). Reversible 5/3 exact against OpenJPEG, irreversible 9/7, tiles, precincts, all progressions, ROI, reduced resolution, palette, ICC and alpha. Malformed input errors, never panics. No C, no dependencies."
 readme = "README.md"
 keywords = ["jpeg2000", "jp2", "jpx", "image", "decoder"]
 categories = ["multimedia::images"]
@@ -21,4 +21,5 @@ include = ["/LICENSE", "/README.md", "/src/"]
 rusty_alloc-api.workspace = true
 
 [lints.rust]
+# Allowed in src/kernels.rs (the SIMD kernels) and nowhere else.
 unsafe_code = "deny"

@@ -328,18 +328,17 @@ impl Place<'_> {
     fn cleanup(&mut self, src: &mut Mq, cx: &mut Contexts, bp: u32, zc: &[Ctx; 512], h: u32) {
         let mut f = self.cur[1].get();
         let value = 3 << bp;
-        let m;
-        if f & (SIG_ALL | PI_ALL) == 0 && h == 4 {
+        let m = if f & (SIG_ALL | PI_ALL) == 0 && h == 4 {
             if src.decode(cx, Ctx::Run) == 0 {
                 return;
             }
             let mut k = src.decode(cx, Ctx::Uni) << 1;
             k |= src.decode(cx, Ctx::Uni);
             self.newly(src, cx, &mut f, k, value);
-            m = (0o1110 << (3 * k)) & EACH;
+            (0o1110 << (3 * k)) & EACH
         } else {
-            m = !((f >> 4) | (f >> PI)) & EACH;
-        }
+            !((f >> 4) | (f >> PI)) & EACH
+        };
         if m != 0 {
             macro_rules! at {
                 ($k:expr) => {

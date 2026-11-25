@@ -1,8 +1,8 @@
 # rusty_jpx
 
 Pure-Rust JPEG 2000 (ISO/IEC 15444-1) decoder: raw codestreams and JP2/JPX
-files, including PDF `JPXDecode` streams. `#![forbid(unsafe_code)]`, no C, no
-dependencies, single-threaded.
+files, including PDF `JPXDecode` streams. No C, no dependencies,
+single-threaded.
 
 Part of **[remade_ffmpeg_rs](https://github.com/Remade-With-Rust/remade_ffmpeg_rs)**
 by **[Mata Network](https://www.mata.network/)**.
