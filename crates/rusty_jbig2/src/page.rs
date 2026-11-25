@@ -298,7 +298,7 @@ impl Decoder<'_> {
         let id = ((flags >> 1) & 3) as u8;
         let t = Template::parse(id, id == 0 && flags & 0x10 != 0, &mut b)?;
         self.budget.charge(t.contexts() as u64 / 8)?;
-        let mut cx = vec![0; t.contexts()];
+        let mut cx = vec![0; t.table()];
         let mut a = Arith::new(b.rest());
         let tpgdon = flags & 8 != 0;
         Ok(generic::decode(

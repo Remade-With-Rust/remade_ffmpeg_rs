@@ -129,7 +129,7 @@ pub(crate) fn decode(
 
     // 7.4.2.2: start from zero statistics or the previous dictionary's.
     let mut cx = Contexts {
-        gb: vec![0; hd.template.as_ref().map_or(0, Template::contexts)],
+        gb: vec![0; hd.template.as_ref().map_or(0, Template::table)],
         template: hd.template.clone(),
         gr: vec![0; hd.ref_template.map_or(0, RefTemplate::contexts)],
         ref_template: hd.ref_template,

@@ -58,7 +58,7 @@ fn split(all: &Bitmap, pw: u32, ph: u32, n: u64, budget: &mut Budget) -> Result<
 
 fn contexts(t: &Template, budget: &mut Budget) -> Result<Vec<u8>> {
     budget.charge(t.contexts() as u64 / 8)?;
-    Ok(vec![0; t.contexts()])
+    Ok(vec![0; t.table()])
 }
 
 /// The halftone region's data after the region segment information field.

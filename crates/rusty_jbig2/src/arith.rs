@@ -58,24 +58,25 @@ const QE: [(u16, u8, u8, u8); 47] = [
 /// Entries past the 47 states are unreachable.
 #[derive(Clone, Copy)]
 struct State {
-    qe: u16,
+    /// Scaled as [`Arith::a`] is.
+    qe: u32,
     nmps: u8,
     nlps: u8,
 }
 
-const STATES: [State; 128] = {
+static STATES: [State; 256] = {
     let mut t = [State {
-        qe: 0x5601,
+        qe: 0x5601 << 16,
         nmps: 0,
         nlps: 0,
-    }; 128];
+    }; 256];
     let mut i = 0;
     while i < 47 {
         let (qe, nm, nl, sw) = QE[i];
         let mut mps = 0u8;
         while mps < 2 {
             t[i * 2 + mps as usize] = State {
-                qe,
+                qe: (qe as u32) << 16,
                 nmps: (nm << 1) | mps,
                 nlps: (nl << 1) | (mps ^ sw),
             };
@@ -93,6 +94,7 @@ const STATES: [State; 128] = {
 pub(crate) struct Arith<'a> {
     data: &'a [u8],
     pos: usize,
+    /// The interval, 16 bits up so that it compares with `c` as it is.
     a: u32,
     c: u32,
     ct: u32,
@@ -103,7 +105,7 @@ impl<'a> Arith<'a> {
         let mut d = Self {
             data,
             pos: 0,
-            a: 0x8000,
+            a: 0x8000 << 16,
             c: 0,
             ct: 0,
         };
@@ -141,7 +143,7 @@ impl<'a> Arith<'a> {
     /// RENORMD, with the shift that does not need a new byte inline.
     #[inline]
     fn renorm(&mut self) {
-        let n = self.a.leading_zeros().saturating_sub(16);
+        let n = self.a.leading_zeros();
         self.a <<= n;
         if n <= self.ct {
             self.c <<= n;
@@ -167,13 +169,14 @@ impl<'a> Arith<'a> {
         self
     }
 
-    /// Decode eight decisions at once if all are the more probable symbol `d`
-    /// of one context and none renormalises; otherwise do nothing.
+    /// Decode `n` (at most 64) decisions at once if all are the more probable
+    /// symbol `d` of one context and none renormalises; otherwise do nothing.
     #[inline]
-    pub(crate) fn run8(&mut self, cx: u8, d: u8) -> bool {
-        let eight = u32::from(STATES[usize::from(cx & 127)].qe) * 8;
-        if cx & 1 == d && self.a >= 0x8000 + eight && (self.c >> 16) < self.a - eight {
-            self.a -= eight;
+    pub(crate) fn run(&mut self, cx: u8, d: u8, n: u32) -> bool {
+        let qe = u64::from(STATES[usize::from(cx)].qe) * u64::from(n);
+        let a = u64::from(self.a);
+        if cx & 1 == d && a >= (0x8000 << 16) + qe && u64::from(self.c) < a - qe {
+            self.a -= qe as u32;
             return true;
         }
         false
@@ -182,18 +185,18 @@ impl<'a> Arith<'a> {
     /// DECODE (E.3.2, G.1): one decision in the given context.
     #[inline]
     pub(crate) fn bit(&mut self, cx: &mut u8) -> u32 {
-        let st = STATES[usize::from(*cx & 127)];
+        let st = &STATES[usize::from(*cx)];
         let mps = u32::from(*cx & 1);
-        let qe = u32::from(st.qe);
+        let qe = st.qe;
         self.a -= qe;
         let lps;
-        if (self.c >> 16) < self.a {
-            if self.a & 0x8000 != 0 {
+        if self.c < self.a {
+            if self.a & (0x8000 << 16) != 0 {
                 return mps;
             }
             lps = self.a < qe;
         } else {
-            self.c -= self.a << 16;
+            self.c -= self.a;
             lps = self.a >= qe;
             self.a = qe;
         }
