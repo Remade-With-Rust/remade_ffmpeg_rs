@@ -53,18 +53,20 @@ const STATES: [(u16, u8, u8, u8); 47] = [
     (0x5601, 46, 46, 0),
 ];
 
-/// One context, packed so that a decision needs a single load:
-/// `Qe << 16 | MPS-successor << 9 | LPS-successor << 2 | MPS`.
-/// Successors index this table (state * 2 + MPS).
-static TABLE: [u32; 128] = {
-    let mut t = [0u32; 128];
+/// A context: `Qe << 48 | state * 2 + MPS`.
+const fn context(i: usize) -> u64 {
+    ((STATES[i / 2].0 as u64) << 48) | i as u64
+}
+
+/// Contexts after an MPS (even index) and an LPS (odd), by `state * 4 + MPS *
+/// 2`.
+static NEXT: [u64; 256] = {
+    let mut t = [0; 256];
     let mut i = 0;
     while i < 94 {
-        let (qe, nm, nl, sw) = STATES[i / 2];
-        let mps = (i & 1) as u32;
-        let nm = nm as u32 * 2 + mps;
-        let nl = nl as u32 * 2 + (mps ^ sw as u32);
-        t[i] = ((qe as u32) << 16) | (nm << 9) | (nl << 2) | mps;
+        let (_, nm, nl, sw) = STATES[i / 2];
+        t[2 * i] = context(nm as usize * 2 + (i & 1));
+        t[2 * i + 1] = context(nl as usize * 2 + ((i & 1) ^ sw as usize));
         i += 1;
     }
     t
@@ -77,107 +79,127 @@ pub(crate) const CTX_UNI: usize = 18;
 /// The 19 context states of a code-block (rounded up so that a masked index
 /// is always in range).
 #[derive(Clone, Copy)]
-pub(crate) struct Contexts([u32; 32]);
+pub(crate) struct Contexts([u64; 32]);
 
 impl Contexts {
     /// Initial states (Table D.7).
     pub fn new() -> Self {
-        let mut c = [TABLE[0]; 32];
-        c[0] = TABLE[4 * 2];
-        c[CTX_RUN] = TABLE[3 * 2];
-        c[CTX_UNI] = TABLE[46 * 2];
+        let mut c = [context(0); 32];
+        c[0] = context(4 * 2);
+        c[CTX_RUN] = context(3 * 2);
+        c[CTX_UNI] = context(46 * 2);
         Self(c)
     }
 }
 
-/// MQ decoder registers (software conventions, C.3).
+/// MQ decoder registers (software conventions, C.3), at the top of 64 bits,
+/// so that there is room for several bytes below `Chigh`.
 ///
-/// `data` must end with the two bytes `FF FF`: the decoder stops at them and
-/// feeds ones from there on, as the standard asks for at a marker.
+/// Past its end the data reads as `FF FF`, which makes the decoder feed ones
+/// from there on, as the standard asks for at a marker.
 #[derive(Clone, Copy)]
 pub(crate) struct Mq<'a> {
     data: &'a [u8],
+    /// Of the last byte read.
     pos: usize,
-    a: u32,
-    c: u32,
+    a: u64,
+    c: u64,
+    /// Valid bits below `Chigh`.
     ct: u32,
+}
+
+/// Shift `C` by `n` (at most 15) bits, more than the `ct` that are valid.
+#[inline(never)]
+fn shift_in(data: &[u8], pos: usize, c: u64, ct: u32, n: u32) -> (usize, u64, u32) {
+    let (mut pos, mut c, mut n) = (pos, c << ct, n - ct);
+    if let Some(&[last, b0, b1, b2, b3, b4]) = data.get(pos..).and_then(|d| d.first_chunk()) {
+        // Five plain bytes.
+        let v = u32::from_be_bytes([b0, b1, b2, b3]);
+        if last != 0xFF && !has_ff(v) {
+            c += (u64::from(v) << 16) | (u64::from(b4) << 8);
+            return (pos + 5, c << n, 40 - n);
+        }
+    }
+    let at = |i: usize| data.get(i).copied().unwrap_or(0xFF);
+    loop {
+        // A byte after FF has seven bits, and one that carries into the bits
+        // before it.
+        let next = u64::from(at(pos + 1));
+        let ct;
+        if at(pos) != 0xFF {
+            pos += 1;
+            c = c.wrapping_add(next << 40);
+            ct = 8;
+        } else if next > 0x8F {
+            c = c.wrapping_add(0xFF << 40);
+            ct = 8;
+        } else {
+            pos += 1;
+            c = c.wrapping_add(next << 41);
+            ct = 7;
+        }
+        let s = n.min(ct);
+        c <<= s;
+        n -= s;
+        if n == 0 {
+            return (pos, c, ct - s);
+        }
+    }
+}
+
+/// Whether one of four bytes is FF.
+#[inline(always)]
+fn has_ff(v: u32) -> bool {
+    let z = !v;
+    z.wrapping_sub(0x0101_0101) & v & 0x8080_8080 != 0
 }
 
 impl<'a> Mq<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        let mut m = Mq {
+        let first = data.first().copied().unwrap_or(0xFF);
+        let (pos, c, ct) = shift_in(data, 0, u64::from(first) << 48, 0, 7);
+        Mq {
             data,
-            pos: 0,
-            a: 0x8000,
-            c: u32::from(data[0]) << 16,
-            ct: 0,
-        };
-        m.byte_in();
-        m.c <<= 7;
-        m.ct -= 7;
-        m
-    }
-
-    #[inline]
-    fn byte_in(&mut self) {
-        let next = self.data.get(self.pos + 1).copied().unwrap_or(0xFF);
-        if self.data.get(self.pos).copied().unwrap_or(0xFF) == 0xFF {
-            if next > 0x8F {
-                self.c += 0xFF00;
-                self.ct = 8;
-            } else {
-                self.pos += 1;
-                self.c += u32::from(next) << 9;
-                self.ct = 7;
-            }
-        } else {
-            self.pos += 1;
-            self.c += u32::from(next) << 8;
-            self.ct = 8;
-        }
-    }
-
-    #[inline(always)]
-    fn renorm(&mut self) {
-        let mut n = self.a.leading_zeros() - 16;
-        loop {
-            if self.ct == 0 {
-                self.byte_in();
-            }
-            let s = n.min(self.ct);
-            self.a <<= s;
-            self.c <<= s;
-            self.ct -= s;
-            n -= s;
-            if n == 0 {
-                break;
-            }
+            pos,
+            a: 0x8000 << 48,
+            c,
+            ct,
         }
     }
 
     /// Decode one decision in context `ctx`.
     #[inline(always)]
     pub fn decode(&mut self, cx: &mut Contexts, ctx: usize) -> u32 {
-        let e = cx.0[ctx & 31];
-        let qe = e >> 16;
-        self.a -= qe;
-        // `swapped`: the sub-interval sizes are inverted (conditional
-        // exchange), so the smaller one belongs to the MPS.
-        let swapped = self.a < qe;
-        let lps = if (self.c >> 16) < qe {
-            self.a = qe;
-            !swapped
+        let ctx = ctx & 31;
+        let e = cx.0[ctx];
+        let qe = e & !0xFF;
+        let mut a = self.a.wrapping_sub(qe);
+        let (c, low) = self.c.overflowing_sub(qe);
+        // The sub-interval sizes may be inverted (conditional exchange): then
+        // the smaller one belongs to the MPS.
+        let lps = if low {
+            let lps = a >= qe;
+            a = qe;
+            lps
         } else {
-            self.c -= qe << 16;
-            if self.a & 0x8000 != 0 {
-                return e & 1;
+            self.c = c;
+            if a >> 63 != 0 {
+                self.a = a;
+                return e as u32 & 1;
             }
-            swapped
+            a < qe
         };
-        let next = if lps { e >> 2 } else { e >> 9 };
-        cx.0[ctx & 31] = TABLE[(next & 127) as usize];
-        self.renorm();
-        (e & 1) ^ u32::from(lps)
+        let i = e as usize & 0x7F;
+        cx.0[ctx] = NEXT[2 * i + usize::from(lps)];
+        let n = 63 - (a | 1).ilog2();
+        self.a = a << n;
+        if n <= self.ct {
+            self.c <<= n;
+            self.ct -= n;
+        } else {
+            (self.pos, self.c, self.ct) = shift_in(self.data, self.pos, self.c, self.ct, n);
+        }
+        (i as u32 ^ u32::from(lps)) & 1
     }
 }
 

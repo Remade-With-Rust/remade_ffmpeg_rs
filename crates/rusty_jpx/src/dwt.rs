@@ -120,11 +120,13 @@ mod tests {
                 let want = reference53(low, high, x0 == 1);
                 let row = data.clone();
                 let mut row = plane(row);
-                row.synthesize(n as usize, [lo, 0, hi, 1], [x0, 0, x0 + n, 1]).unwrap();
+                row.synthesize(n as usize, [lo, 0, hi, 1], [x0, 0, x0 + n, 1])
+                    .unwrap();
                 assert_eq!(row.data, want, "row {n} {x0}");
                 let col = data.clone();
                 let mut col = plane(col);
-                col.synthesize(1, [0, lo, 1, hi], [0, x0, 1, x0 + n]).unwrap();
+                col.synthesize(1, [0, lo, 1, hi], [0, x0, 1, x0 + n])
+                    .unwrap();
                 assert_eq!(col.data, want, "column {n} {x0}");
             }
         }

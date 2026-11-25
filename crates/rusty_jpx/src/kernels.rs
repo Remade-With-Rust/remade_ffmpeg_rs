@@ -1047,13 +1047,7 @@ dispatch!(dequant_real = dequant_loop::<ToReal>(src: *const i32, dst: *mut i32, 
 /// Coefficients of a code-block, `w` a row (bit 31 the sign, below it twice
 /// the magnitude), into a plane of rows `stride` apart: times half of `step`
 /// as reals, or halved towards zero as integers when there is no step.
-pub(crate) fn dequantize(
-    src: &[u32],
-    w: usize,
-    dst: &mut [i32],
-    stride: usize,
-    step: Option<f32>,
-) {
+pub(crate) fn dequantize(src: &[u32], w: usize, dst: &mut [i32], stride: usize, step: Option<f32>) {
     if w == 0 || src.is_empty() {
         return;
     }
