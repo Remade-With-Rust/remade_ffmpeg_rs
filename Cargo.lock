@@ -5997,6 +5997,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2bef7c9990a884b694dfe2d7b6dba4b1c502862879783a2223d4437368e56ae"
 
 [[package]]
+name = "rusty_jpx"
+version = "0.1.0"
+dependencies = [
+ "rusty_alloc-api",
+]
+
+[[package]]
 name = "rusty_json_turbo"
 version = "0.3.2"
 source = "git+https://github.com/Remade-With-Rust/rusty_json_turbo?branch=master#d33e58019d8f04ffb561689252fac2f3e0cdfd43"
