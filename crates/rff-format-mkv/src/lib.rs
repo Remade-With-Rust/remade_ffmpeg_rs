@@ -31,6 +31,8 @@
 //!   `read_header` fail with [`Error::Unsupported`] naming the track: the file
 //!   is refused rather than any track's ciphertext handed out as frames.
 //!
+//! * `Chapters` ↔ [`Demuxer::chapters`] / [`rff_format::Muxer::set_chapters`].
+//!
 //! Random access ([`Demuxer::sample_index`], issue #114): opened over a
 //! seekable input (the `matroska`/`webm` seekable factories, which a local
 //! file gets), the demuxer builds a per-stream frame table on the first call
@@ -44,6 +46,9 @@
 //! quirks, not the codec's stored form.
 
 #[cfg(test)]
+mod chapter_tests;
+mod chapters;
+#[cfg(test)]
 mod codec_tests;
 mod encoding;
 mod index;
@@ -56,7 +61,7 @@ mod props;
 #[cfg(test)]
 mod props_tests;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 
 use rff_core::{
@@ -64,7 +69,7 @@ use rff_core::{
     MediaType, Packet, Rational, Result, SampleFormat,
 };
 use rff_format::avc::{avcc_to_annexb, parse_avcc, AvcConfig};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, SeekInput, Stream};
+use rff_format::{Chapter, Demuxer, Format, FormatRegistry, Input, MuxCaps, SeekInput, Stream};
 
 pub use mux::{MkvMuxer, MkvStreamingMuxer};
 
@@ -1030,6 +1035,8 @@ struct MkvDemuxer {
     parsed: bool,
     /// `Info` and global `Tags` ([`Demuxer::metadata`]).
     metadata: rff_core::Dictionary,
+    /// [`Demuxer::chapters`].
+    chapters: Vec<Chapter>,
 }
 
 impl MkvDemuxer {
@@ -1065,6 +1072,7 @@ impl MkvDemuxer {
             index: None,
             parsed: false,
             metadata: rff_core::Dictionary::new(),
+            chapters: Vec::new(),
             shared: None,
         }
     }
@@ -1084,6 +1092,11 @@ impl MkvDemuxer {
         // the header walk met it before the first Cluster.
         let mut tags_at: Option<u64> = None;
         let mut tags_read = false;
+        // The same for `Chapters`, and what both say of chapters.
+        let mut chapters_at: Option<u64> = None;
+        let mut chapters_read = false;
+        let mut open_ends = Vec::new();
+        let mut chapter_tags: Vec<props::ChapterTag> = Vec::new();
         loop {
             let Some(h) = self.src.header()? else {
                 self.walk.done = true;
@@ -1134,13 +1147,20 @@ impl MkvDemuxer {
                 }
                 // Tags before the Clusters (rff writes them there), and the
                 // SeekHead, which says where later Tags are.
-                ID_TAGS | ID_SEEK_HEAD if h.size <= MAX_HEADER_ELEMENT => {
+                ID_TAGS | ID_CHAPTERS | ID_SEEK_HEAD if h.size <= MAX_HEADER_ELEMENT => {
                     let body = self.src.body(self.walk.bounded(&h))?;
                     if h.id == ID_TAGS {
                         props::read_tags(&mut self.metadata, &body);
+                        props::read_chapter_tags(&mut chapter_tags, &body);
                         tags_read = true;
+                    } else if h.id == ID_CHAPTERS {
+                        if !chapters_read {
+                            (self.chapters, open_ends) = chapters::read(&body);
+                            chapters_read = true;
+                        }
                     } else {
                         tags_at = tags_at.or_else(|| seek_target(&body, ID_TAGS));
+                        chapters_at = chapters_at.or_else(|| seek_target(&body, ID_CHAPTERS));
                     }
                 }
                 // Children of an unknown-size Info/Tracks descended into.
@@ -1171,17 +1191,37 @@ impl MkvDemuxer {
             self.walk.done = true;
             return Err(no_tracks());
         }
-        // Tags after the Clusters (FFmpeg writes them at the end): read them
-        // through the SeekHead when the input can seek there and back.
-        if let (false, Some(rel), true) = (tags_read, tags_at, self.src.seekable()) {
-            let at = self.src.base + segment_data.saturating_add(rel);
-            if let Ok(head) = self.src.read_at(at, 12) {
-                let mut e = Ebml::new(&head);
-                if let (Some(ID_TAGS), Some((size, false))) = (e.read_id(), e.read_size()) {
-                    if size <= MAX_HEADER_ELEMENT {
-                        if let Ok(body) = self.src.read_at(at + e.pos as u64, size) {
-                            props::read_tags(&mut self.metadata, &body);
-                        }
+        // Tags and Chapters after the Clusters (FFmpeg writes Tags at the end):
+        // read them through the SeekHead when the input can seek there and back.
+        if self.src.seekable() {
+            let later = |read: bool, at: Option<u64>| at.filter(|_| !read);
+            if let Some(rel) = later(chapters_read, chapters_at) {
+                if let Some(body) = self.element_at(segment_data.saturating_add(rel), ID_CHAPTERS) {
+                    (self.chapters, open_ends) = chapters::read(&body);
+                }
+            }
+            if let Some(rel) = later(tags_read, tags_at) {
+                if let Some(body) = self.element_at(segment_data.saturating_add(rel), ID_TAGS) {
+                    props::read_tags(&mut self.metadata, &body);
+                    props::read_chapter_tags(&mut chapter_tags, &body);
+                }
+            }
+        }
+        if !self.chapters.is_empty() {
+            let scale = i128::from(self.t.timestamp_scale);
+            let duration_us = self
+                .duration_ticks
+                .and_then(|d| i64::try_from(i128::from(d) * scale / 1000).ok());
+            rff_format::chapter::fill_ends(&mut self.chapters, &open_ends, duration_us);
+            let mut by_uid = HashMap::new();
+            for (i, c) in self.chapters.iter().enumerate() {
+                by_uid.entry(c.id).or_insert(i);
+            }
+            for (uid, name, value) in chapter_tags {
+                if let Some(&i) = by_uid.get(&uid) {
+                    let md = &mut self.chapters[i].metadata;
+                    if md.get(&name).is_none() {
+                        md.set(name, value);
                     }
                 }
             }
@@ -1192,6 +1232,23 @@ impl MkvDemuxer {
             // reports N/A for Matroska too), so `nb_frames` stays `None`.
         }
         Ok(())
+    }
+
+    /// The body of the element `id` whose header is at `rel` (from where the
+    /// demuxer started reading); the walk stays where it is.
+    fn element_at(&mut self, rel: u64, id: u32) -> Option<Vec<u8>> {
+        let at = self.src.base.checked_add(rel)?;
+        let head = self.src.read_at(at, 12).ok()?;
+        let mut e = Ebml::new(&head);
+        if e.read_id() != Some(id) {
+            return None;
+        }
+        match e.read_size() {
+            Some((size, false)) if size <= MAX_HEADER_ELEMENT => {
+                self.src.read_at(at.checked_add(e.pos as u64)?, size).ok()
+            }
+            _ => None,
+        }
     }
 
     /// Walk Cluster children until a block yields a packet. `None` = done.
@@ -1678,6 +1735,10 @@ impl Demuxer for MkvDemuxer {
 
     fn metadata(&self) -> Option<&rff_core::Dictionary> {
         Some(&self.metadata)
+    }
+
+    fn chapters(&self) -> &[Chapter] {
+        &self.chapters
     }
 }
 
