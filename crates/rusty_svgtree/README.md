@@ -7,8 +7,8 @@
 simplified render tree (the shape of usvg's: styles resolved, lengths in user
 units, `use` expanded, paint servers in user space); `render` draws it with
 the house [`rusty_raster`](https://crates.io/crates/rusty_raster) rasteriser. XML comes from the
-house [`rusty_xml`](https://crates.io/crates/rusty_xml) parser, embedded PNG
-and JPEG from `rusty_png` and `rusty_jpeg`. `#![forbid(unsafe_code)]`, no C.
+house [`rusty_xml`](https://crates.io/crates/rusty_xml) parser, embedded PNG,
+JPEG, GIF and WebP from the house codecs, embedded SVG and svgz from this crate. `#![forbid(unsafe_code)]`, no C.
 
 Part of **[remade_ffmpeg_rs](https://github.com/Remade-With-Rust/remade_ffmpeg_rs)**
 by **[Mata Network](https://www.mata.network/)**.
@@ -128,25 +128,26 @@ rusty_svgtree::render(&tree, Transform::identity(), &mut pixmap.as_mut());
 ## Limits
 
 All in `Options`, all with safe defaults: `max_nodes` (500,000 elements after
-`use` expansion), `max_depth` (256), `max_image_pixels` (64 Mi),
-`max_canvas_pixels` (2^28; larger documents are `Error::InvalidSize`, not an
-allocation), `max_layer_bytes` (1 GiB held at once by group layers and
+`use` expansion), `max_depth` (1024), `max_image_pixels` (64 Mi),
+`max_canvas_pixels` (none: a document's size allocates nothing, and `render`
+draws at the size of the caller's pixmap), `max_svgz_bytes` (256 MiB
+decompressed), `max_layer_bytes` (1 GiB held at once by group layers and
 clip/mask/filter scratch; a group past it is skipped) and `max_filter_work`
 (2^33 pixel operations per `render`; an element whose filter would exceed it
 is not drawn). Fixed internal work budgets
 bound style-sheet matching, `use` cycle checks and the re-conversion of shared
 clip paths, patterns and markers. `use` reference cycles are
 skipped (resvg instead fails the whole document); clip-path, mask and pattern
-cycles are broken. Only `data:` image URIs are loaded: no file or network
-access.
+cycles are broken. Embedded documents share the limits of the one around them
+and nest 8 deep. Only `data:` image URIs are loaded: no file or network
+access. `Tree::skipped` says what was left out.
 
 ## Not done yet
 
 - **Text** (`<text>` is skipped; resvg was measured with its `text` feature
   off, so the oracle compares like with like). Needs the house font stack.
-- Context paints (`context-fill`/`context-stroke`) carry solid colours only.
-- No GIF/WebP/nested-SVG images, no external `href`s, no `Tree::to_svg_string`
-  export, no animation.
+- No external `href`s (by design), no `Tree::to_svg_string` export, no
+  animation.
 
 ## License
 

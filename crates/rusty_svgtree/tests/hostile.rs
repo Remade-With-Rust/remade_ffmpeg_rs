@@ -810,3 +810,137 @@ fn deep_content_behind_every_reference() {
         }
     });
 }
+
+// ------------------------------------------------------- nested images --
+
+fn data_svg(svg: &str) -> String {
+    // Percent-encoded, so that a level costs little more than its content.
+    let mut out = String::from("data:image/svg+xml,");
+    for c in svg.bytes() {
+        match c {
+            b'%' | b'"' | b'<' | b'&' | b'#' => out.push_str(&format!("%{c:02x}")),
+            _ => out.push(c as char),
+        }
+    }
+    out
+}
+
+const NS: &str = r#"xmlns="http://www.w3.org/2000/svg" width="20" height="20""#;
+
+#[test]
+fn nested_documents_stop_at_a_depth() {
+    let mut svg = format!(r#"<svg {NS}><rect width="9" height="9"/></svg>"#);
+    for _ in 0..11 {
+        svg = format!(
+            r#"<svg {NS}><image width="20" height="20" href="{}"/></svg>"#,
+            data_svg(&svg)
+        );
+        assert!(svg.len() < 10 << 20);
+    }
+    let tree = run(svg.as_bytes()).unwrap();
+    assert_eq!(tree.skipped().images, 0);
+    // The innermost tree reports what it left out.
+    fn missing(tree: &Tree) -> bool {
+        fn group(g: &rusty_svgtree::Group) -> bool {
+            g.children().iter().any(|n| match n {
+                rusty_svgtree::Node::Group(g) => group(g),
+                rusty_svgtree::Node::Image(i) => match i.kind() {
+                    rusty_svgtree::ImageKind::Svg(t) => missing(t),
+                    _ => false,
+                },
+                _ => false,
+            })
+        }
+        tree.skipped().images > 0 || group(tree.root())
+    }
+    assert!(missing(&tree));
+}
+
+#[test]
+fn nested_documents_share_the_node_limit() {
+    // Each of 400 documents expands to some 40,000 elements.
+    let mut bomb = format!(r#"<svg {NS}><g id="a0"><rect width="9" height="9"/></g>"#);
+    for i in 1..13 {
+        bomb.push_str(&format!(
+            r##"<g id="a{i}"><use href="#a{p}"/><use href="#a{p}"/></g>"##,
+            p = i - 1
+        ));
+    }
+    bomb.push_str("</svg>");
+    let mut body = String::new();
+    for i in 0..400 {
+        // Different text each time: nothing is shared.
+        let svg = data_svg(&bomb.replace("<svg ", &format!(r#"<svg id="n{i}" "#)));
+        body.push_str(&format!(r#"<image width="9" height="9" href="{svg}"/>"#));
+    }
+    let start = std::time::Instant::now();
+    let tree = run(&doc(&body)).unwrap();
+    assert!(tree.skipped().images > 300, "{:?}", tree.skipped());
+    assert!(start.elapsed().as_secs() < 60, "{:?}", start.elapsed());
+}
+
+#[test]
+fn nested_document_used_many_times() {
+    let mut inner = format!(r#"<svg {NS}>"#);
+    for _ in 0..5000 {
+        inner.push_str(r#"<path d="M0 0h1"/>"#);
+    }
+    inner.push_str("</svg>");
+    let mut body = format!(
+        r#"<image id="i" width="9" height="9" href="{}"/>"#,
+        data_svg(&inner)
+    );
+    for _ in 0..20_000 {
+        body.push_str(r##"<use href="#i"/>"##);
+    }
+    let opt = Options {
+        max_nodes: 100_000,
+        ..Options::default()
+    };
+    let start = std::time::Instant::now();
+    let tree = run_with(&doc(&body), &opt).unwrap();
+    assert!(tree.skipped().images > 0);
+    assert!(start.elapsed().as_secs() < 60, "{:?}", start.elapsed());
+}
+
+#[test]
+fn nested_documents_have_no_access_either() {
+    let inner = format!(
+        r#"<svg {NS}><image width="20" height="20" href="/etc/hostname.png"/><image width="20" height="20" href="file:///C:/Windows/Web/Screen/img100.jpg"/></svg>"#
+    );
+    let svg = doc(&format!(
+        r#"<image width="9" height="9" href="{}"/>"#,
+        data_svg(&inner)
+    ));
+    let tree = run(&svg).unwrap();
+    let mut p = Pixmap::new(100, 100).unwrap();
+    rusty_svgtree::render(&tree, Transform::identity(), &mut p.as_mut());
+    assert!(p.data().iter().all(|b| *b == 0));
+}
+
+#[cfg(feature = "svgz")]
+#[test]
+fn svgz_bomb_is_an_error() {
+    let svg = format!(r#"<svg {NS}>{}</svg>"#, " ".repeat(8 << 20));
+    let mut gz = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
+    gz.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(svg.as_bytes(), 6));
+    gz.extend_from_slice(&[0; 8]);
+    let opt = Options {
+        max_svgz_bytes: 1 << 20,
+        ..Options::default()
+    };
+    assert_eq!(run_with(&gz, &opt).err(), Some(Error::MalformedGzip));
+    // A wrong checksum is an error as well.
+    assert_eq!(run(&gz).err(), Some(Error::MalformedGzip));
+}
+
+#[test]
+fn broken_images_are_reported() {
+    let svg = doc(
+        r#"<image href="data:image/gif;base64,R0lGODlh//8=" width="9" height="9"/><image href="data:image/webp;base64,UklGRg==" width="9" height="9"/><image href="x.png" width="9" height="9"/><text>a</text>"#,
+    );
+    let tree = run(&svg).unwrap();
+    assert_eq!(tree.skipped().images, 3);
+    assert_eq!(tree.skipped().text, 1);
+    assert!(run(&doc("<rect/>")).unwrap().skipped().is_empty());
+}

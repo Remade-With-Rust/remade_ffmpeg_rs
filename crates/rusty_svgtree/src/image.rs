@@ -565,6 +565,47 @@ mod tests {
         assert_eq!(base64_decode(b"!!!"), b"");
     }
 
+    #[cfg(feature = "svgz")]
+    fn gzip(data: &[u8], flags: u8, extra: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x1f, 0x8b, 8, flags, 0, 0, 0, 0, 0, 255];
+        out.extend_from_slice(extra);
+        out.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(data, 6));
+        out.extend_from_slice(&crc32(data).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out
+    }
+
+    #[cfg(feature = "svgz")]
+    #[test]
+    fn gunzip_members_headers_and_damage() {
+        let text: Vec<u8> = (0..200_000u32)
+            .map(|i| (i % 251 * (i >> 12)) as u8)
+            .collect();
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+        assert_eq!(gunzip(&gzip(&text, 0, b""), 1 << 20).unwrap(), text);
+        // Every optional header field.
+        let all = gzip(&text, 4 | 8 | 16 | 2, b"\x03\x00abcname\0comment\0hh");
+        assert_eq!(gunzip(&all, 1 << 20).unwrap(), text);
+        // Two members; trailing padding.
+        let mut two = gzip(b"ab", 0, b"");
+        two.extend_from_slice(&gzip(b"cd", 0, b""));
+        two.extend_from_slice(&[0; 7]);
+        assert_eq!(gunzip(&two, 16).unwrap(), b"abcd");
+        // Exactly at the limit, and one past it.
+        let g = gzip(&text, 0, b"");
+        assert!(gunzip(&g, 200_000).is_some());
+        assert!(gunzip(&g, 199_999).is_none());
+        // Cut anywhere, or with any byte of the trailer changed.
+        for n in 2..g.len() {
+            assert!(gunzip(&g[..n], 1 << 20).is_none());
+        }
+        for i in g.len() - 8..g.len() {
+            let mut bad = g.clone();
+            bad[i] ^= 1;
+            assert!(gunzip(&bad, 1 << 20).is_none());
+        }
+    }
+
     /// Opaque pixels skip the premultiply: it would not change them.
     #[test]
     fn premultiply_by_255_is_identity() {

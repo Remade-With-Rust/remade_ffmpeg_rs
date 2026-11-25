@@ -1108,6 +1108,7 @@ mod tests {
                     }),
                     opacity: [1.0, 0.5][(next() % 2) as usize],
                     rule: [FillRule::Winding, FillRule::EvenOdd][(next() % 2) as usize],
+                    context: None,
                 }),
                 stroke: None,
                 paint_order: PaintOrder::FillAndStroke,
