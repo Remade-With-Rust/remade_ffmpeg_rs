@@ -15,7 +15,7 @@
 
 use std::cell::Cell;
 
-use crate::mq::{Contexts, Mq, Raw, CTX_MAG, CTX_RUN, CTX_UNI};
+use crate::mq::{Contexts, Ctx, Mq, Raw};
 
 /// Code-block style bits (Table A.19).
 pub(crate) const STYLE_BYPASS: u8 = 1;
@@ -39,16 +39,16 @@ const NEIGHBOURS: u32 = 0x1EF;
 
 /// Zero-coding contexts (Table D.1) by neighbourhood, for each of the three
 /// subband classes (LL/LH, HL, HH).
-static ZC: [[u8; 512]; 3] = {
-    let mut t = [[0u8; 512]; 3];
+static ZC: [[Ctx; 512]; 3] = {
+    let mut t = [[Ctx::C0; 512]; 3];
     let mut v = 0;
     while v < 512 {
         let h = ((v >> 3) & 1) + ((v >> 5) & 1);
         let w = ((v >> 1) & 1) + ((v >> 7) & 1);
         let d = (v & 1) + ((v >> 2) & 1) + ((v >> 6) & 1) + ((v >> 8) & 1);
-        t[0][v] = zc_lh(h, w, d);
-        t[1][v] = zc_lh(w, h, d);
-        t[2][v] = zc_hh(h + w, d);
+        t[0][v] = Ctx::new(zc_lh(h, w, d) as usize);
+        t[1][v] = Ctx::new(zc_lh(w, h, d) as usize);
+        t[2][v] = Ctx::new(zc_hh(h + w, d) as usize);
         v += 1;
     }
     t
@@ -83,9 +83,10 @@ const fn zc_hh(hv: usize, d: usize) -> u8 {
 }
 
 /// Sign contexts (Tables D.2, D.3): index bits are (negative, significant)
-/// for up, left, right, down; the value is `context | flip << 7`.
-static SC: [u8; 256] = {
-    let mut t = [0u8; 256];
+/// for up, left, right, down; the value is the context and
+/// whether the decision is inverted.
+static SC: [(Ctx, u8); 256] = {
+    let mut t = [(Ctx::C0, 0); 256];
     let mut v = 0;
     while v < 256 {
         let mut s = [0i32; 4];
@@ -100,12 +101,12 @@ static SC: [u8; 256] = {
         let h = clamp1(left + right);
         let w = clamp1(up + down);
         let (flip, h, w) = if h < 0 || (h == 0 && w < 0) {
-            (0x80, -h, -w)
+            (1, -h, -w)
         } else {
             (0, h, w)
         };
         let ctx = if h == 0 { 9 + w } else { 12 + w };
-        t[v] = ctx as u8 | flip;
+        t[v] = (Ctx::new(ctx as usize), flip);
         v += 1;
     }
     t
@@ -123,29 +124,29 @@ const fn clamp1(v: i32) -> i32 {
 
 /// Where a pass gets its decisions from: the MQ coder or raw bits.
 trait Source: Copy {
-    fn decision(&mut self, cx: &mut Contexts, ctx: usize) -> u32;
+    fn decision(&mut self, cx: &mut Contexts, ctx: Ctx) -> u32;
     /// A sign, given its [`SC`] entry.
-    fn sign(&mut self, cx: &mut Contexts, sc: u8) -> u32;
+    fn sign(&mut self, cx: &mut Contexts, sc: (Ctx, u8)) -> u32;
 }
 
 impl Source for Mq<'_> {
     #[inline(always)]
-    fn decision(&mut self, cx: &mut Contexts, ctx: usize) -> u32 {
+    fn decision(&mut self, cx: &mut Contexts, ctx: Ctx) -> u32 {
         self.decode(cx, ctx)
     }
     #[inline(always)]
-    fn sign(&mut self, cx: &mut Contexts, sc: u8) -> u32 {
-        self.decode(cx, usize::from(sc & 31)) ^ u32::from(sc >> 7)
+    fn sign(&mut self, cx: &mut Contexts, sc: (Ctx, u8)) -> u32 {
+        self.decode(cx, sc.0) ^ u32::from(sc.1)
     }
 }
 
 impl Source for Raw<'_> {
     #[inline(always)]
-    fn decision(&mut self, _: &mut Contexts, _: usize) -> u32 {
+    fn decision(&mut self, _: &mut Contexts, _: Ctx) -> u32 {
         self.bit()
     }
     #[inline(always)]
-    fn sign(&mut self, _: &mut Contexts, _: u8) -> u32 {
+    fn sign(&mut self, _: &mut Contexts, _: (Ctx, u8)) -> u32 {
         self.bit()
     }
 }
@@ -193,7 +194,7 @@ fn set(word: &Cell<u32>, bits: u32) {
 impl Place<'_> {
     /// Sign-coding table entry of sample `k` (`f` is the flag word).
     #[inline(always)]
-    fn sign_entry(&self, f: u32, k: u32) -> u8 {
+    fn sign_entry(&self, f: u32, k: u32) -> (Ctx, u8) {
         let down = if k == 3 {
             (f >> 25) & 0x40
         } else {
@@ -242,7 +243,7 @@ impl Place<'_> {
         src: &mut S,
         cx: &mut Contexts,
         bp: u32,
-        zc: &[u8; 512],
+        zc: &[Ctx; 512],
         h: u32,
     ) {
         let mut f = self.cur[1].get();
@@ -262,7 +263,7 @@ impl Place<'_> {
             ($k:expr) => {
                 if m & (1 << (3 * $k)) != 0 {
                     let nb = (f >> (3 * $k)) & 0x1FF;
-                    if src.decision(cx, usize::from(zc[nb as usize])) != 0 {
+                    if src.decision(cx, zc[nb as usize]) != 0 {
                         self.newly(src, cx, &mut f, $k, value);
                         m |= (8 << (3 * $k)) & fresh;
                     }
@@ -281,6 +282,8 @@ impl Place<'_> {
         if h > 3 {
             at!(3);
         }
+        // The last sample has no successor to update it for.
+        let _ = m;
         self.cur[1].set(f);
     }
 
@@ -297,9 +300,11 @@ impl Place<'_> {
             ($k:expr) => {
                 if m & (1 << (3 * $k)) != 0 {
                     let ctx = if (f >> (MU + 3 * $k)) & 1 != 0 {
-                        CTX_MAG + 2
+                        Ctx::C16
+                    } else if (f >> (3 * $k)) & NEIGHBOURS != 0 {
+                        Ctx::C15
                     } else {
-                        CTX_MAG + usize::from((f >> (3 * $k)) & NEIGHBOURS != 0)
+                        Ctx::C14
                     };
                     let bit = src.decision(cx, ctx);
                     // The sample holds the midpoint of the plane above: move it by
@@ -321,16 +326,16 @@ impl Place<'_> {
 
     /// Cleanup (D.3.4) of the column's first `h` samples.
     #[inline(always)]
-    fn cleanup(&mut self, src: &mut Mq, cx: &mut Contexts, bp: u32, zc: &[u8; 512], h: u32) {
+    fn cleanup(&mut self, src: &mut Mq, cx: &mut Contexts, bp: u32, zc: &[Ctx; 512], h: u32) {
         let mut f = self.cur[1].get();
         let value = 3 << bp;
         let m;
         if f & (SIG_ALL | PI_ALL) == 0 && h == 4 {
-            if src.decode(cx, CTX_RUN) == 0 {
+            if src.decode(cx, Ctx::Run) == 0 {
                 return;
             }
-            let mut k = src.decode(cx, CTX_UNI) << 1;
-            k |= src.decode(cx, CTX_UNI);
+            let mut k = src.decode(cx, Ctx::Uni) << 1;
+            k |= src.decode(cx, Ctx::Uni);
             self.newly(src, cx, &mut f, k, value);
             m = (0o1110 << (3 * k)) & EACH;
         } else {
@@ -341,7 +346,7 @@ impl Place<'_> {
                 ($k:expr) => {
                     if m & (1 << (3 * $k)) != 0 {
                         let nb = (f >> (3 * $k)) & 0x1FF;
-                        if src.decode(cx, usize::from(zc[nb as usize])) != 0 {
+                        if src.decode(cx, zc[nb as usize]) != 0 {
                             self.newly(src, cx, &mut f, $k, value);
                         }
                     }
@@ -407,7 +412,7 @@ impl T1 {
                         self.cleanup(&mut mq, &mut cx, bp, zc);
                         if style & STYLE_SEGSYM != 0 {
                             for _ in 0..4 {
-                                mq.decode(&mut cx, CTX_UNI);
+                                mq.decode(&mut cx, Ctx::Uni);
                             }
                         }
                     }
@@ -452,7 +457,13 @@ impl T1 {
     // The passes work on a local copy of the coder, so that its registers are
     // the machine's.
 
-    fn significance<S: Source>(&mut self, src: &mut S, cx: &mut Contexts, bp: u32, zc: &[u8; 512]) {
+    fn significance<S: Source>(
+        &mut self,
+        src: &mut S,
+        cx: &mut Contexts,
+        bp: u32,
+        zc: &[Ctx; 512],
+    ) {
         let mut s = *src;
         self.columns(
             #[inline(always)]
@@ -470,7 +481,7 @@ impl T1 {
         *src = s;
     }
 
-    fn cleanup(&mut self, src: &mut Mq, cx: &mut Contexts, bp: u32, zc: &[u8; 512]) {
+    fn cleanup(&mut self, src: &mut Mq, cx: &mut Contexts, bp: u32, zc: &[Ctx; 512]) {
         let mut s = *src;
         self.columns(
             #[inline(always)]

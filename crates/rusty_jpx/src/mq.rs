@@ -72,22 +72,37 @@ static NEXT: [u64; 256] = {
     t
 };
 
-pub(crate) const CTX_MAG: usize = 14;
-pub(crate) const CTX_RUN: usize = 17;
-pub(crate) const CTX_UNI: usize = 18;
+/// The contexts of a code-block (Table D.1 to D.4): 0 to 8 zero coding, 9 to
+/// 13 signs, 14 to 16 magnitude refinement, 17 runs and 18 the uniform one.
+/// An enumeration, so that indexing by one needs no check.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+#[rustfmt::skip]
+pub(crate) enum Ctx {
+    C0, C1, C2, C3, C4, C5, C6, C7, C8, C9, C10, C11, C12, C13, C14, C15, C16, Run, Uni,
+}
 
-/// The 19 context states of a code-block (rounded up so that a masked index
-/// is always in range).
+impl Ctx {
+    /// Context `n`, below 17.
+    pub const fn new(n: usize) -> Self {
+        use Ctx::*;
+        [
+            C0, C1, C2, C3, C4, C5, C6, C7, C8, C9, C10, C11, C12, C13, C14, C15, C16,
+        ][n]
+    }
+}
+
+/// The context states of a code-block.
 #[derive(Clone, Copy)]
-pub(crate) struct Contexts([u64; 32]);
+pub(crate) struct Contexts([u64; 19]);
 
 impl Contexts {
     /// Initial states (Table D.7).
     pub fn new() -> Self {
-        let mut c = [context(0); 32];
-        c[0] = context(4 * 2);
-        c[CTX_RUN] = context(3 * 2);
-        c[CTX_UNI] = context(46 * 2);
+        let mut c = [context(0); 19];
+        c[Ctx::C0 as usize] = context(4 * 2);
+        c[Ctx::Run as usize] = context(3 * 2);
+        c[Ctx::Uni as usize] = context(46 * 2);
         Self(c)
     }
 }
@@ -169,8 +184,8 @@ impl<'a> Mq<'a> {
 
     /// Decode one decision in context `ctx`.
     #[inline(always)]
-    pub fn decode(&mut self, cx: &mut Contexts, ctx: usize) -> u32 {
-        let ctx = ctx & 31;
+    pub fn decode(&mut self, cx: &mut Contexts, ctx: Ctx) -> u32 {
+        let ctx = ctx as usize;
         let e = cx.0[ctx];
         let qe = e & !0xFF;
         let mut a = self.a.wrapping_sub(qe);
@@ -266,7 +281,7 @@ mod tests {
         let mut mq = Mq::new(&coded);
         let mut cx = Contexts::new();
         for want in plain {
-            let got = (0..8).fold(0, |a, _| (a << 1) | mq.decode(&mut cx, 1));
+            let got = (0..8).fold(0, |a, _| (a << 1) | mq.decode(&mut cx, Ctx::C1));
             assert_eq!(got, want);
         }
     }
@@ -276,7 +291,7 @@ mod tests {
         let mut mq = Mq::new(&[0xFF, 0xFF]);
         let mut cx = Contexts::new();
         for i in 0..100_000 {
-            mq.decode(&mut cx, i % 19);
+            mq.decode(&mut cx, Ctx::new(i % 17));
         }
     }
 }
