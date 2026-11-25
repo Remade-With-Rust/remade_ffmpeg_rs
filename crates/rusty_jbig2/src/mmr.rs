@@ -588,7 +588,7 @@ mod tests {
                     let want = (0..n as usize).fold(0, |v, i| v << 1 | bit(pos + i));
                     assert_eq!(r.peek(n), want);
                 }
-                k = k * 5 + 3;
+                k = (k * 5 + 3) % 1009;
                 let n = k % 13 + 1;
                 r.consume(n as u32);
                 pos += n;

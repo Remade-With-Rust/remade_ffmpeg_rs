@@ -138,8 +138,9 @@ fn contexts8<const ONE: bool>(p: u16, q: [u16; 3]) -> [u16; 8] {
     for (half, out) in out.chunks_exact_mut(4).enumerate() {
         // The three pixels around pixel `j` of the half at the top of lane
         // `j`: ten pixels' worth of bits leave room for what is shifted out of
-        // the lane below.
-        let lanes = |w: u16| u64::from((w & 0xFFC0) << (4 * half)) * 0x0008_0004_0002_0001;
+        // the lane below (and above the top one, dropped).
+        let lanes =
+            |w: u16| u64::from((w & 0xFFC0) << (4 * half)).wrapping_mul(0x0008_0004_0002_0001);
         // From there to bit `to`, those of `three`.
         let put = |w: u16, three: u64, to: u32| (lanes(w) >> (13 - to)) & (LANES * (three << to));
         let x = if ONE {
