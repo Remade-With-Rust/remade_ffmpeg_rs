@@ -2,6 +2,7 @@
 
 use crate::arith::Arith;
 use crate::bitmap::{fetch32, Bitmap};
+use crate::generic::spread;
 use crate::huffman::Bits;
 use crate::{Error, Result};
 
@@ -59,15 +60,107 @@ pub(crate) fn decode(
     w: u32,
     h: u32,
 ) -> Bitmap {
+    if t.one {
+        run::<true, { 1 << 10 }>(a, cx, t, tpgron, r, w, h)
+    } else {
+        run::<false, { 1 << 13 }>(a, cx, t, tpgron, r, w, h)
+    }
+}
+
+/// A row seen through a window that moves right by bytes: the byte that a
+/// given position falls in and the two after it.
+struct Window<'r> {
+    row: &'r [u8],
+    /// The next byte to come in; far out of range when left of the row.
+    next: usize,
+    bytes: u32,
+    sh: u32,
+}
+
+impl<'r> Window<'r> {
+    /// Ready to [`Window::advance`] to bit `pos`.
+    fn new(row: &'r [u8], pos: i64) -> Self {
+        let mut w = Self {
+            row,
+            next: (pos >> 3) as usize,
+            bytes: 0,
+            sh: (pos & 7) as u32,
+        };
+        w.load();
+        w.load();
+        w
+    }
+
+    #[inline]
+    fn load(&mut self) {
+        let b = self.row.get(self.next).map_or(0, |&b| u32::from(b));
+        self.bytes = (self.bytes << 8) | b;
+        self.next = self.next.wrapping_add(1);
+    }
+
+    /// The 16 pixels from here on, and eight further the next time.
+    #[inline]
+    fn advance(&mut self) -> u16 {
+        self.load();
+        (self.bytes >> (8 - self.sh)) as u16
+    }
+}
+
+/// The contexts of eight pixels but for the one to their left. The rows begin
+/// with the pixel left of the first one's: `p` above in this bitmap, `q` the
+/// reference's.
+#[inline]
+fn contexts8<const ONE: bool>(p: u16, q: [u16; 3]) -> [u16; 8] {
+    let mut out = [0; 8];
+    for (o, m) in out.iter_mut().zip([1u16, 2, 4, 8, 16, 32, 64, 128]) {
+        // Three pixels around pixel `j`, the product being a shift by `j`.
+        let three = |w: u16| w.wrapping_mul(m) >> 13;
+        *o = if ONE {
+            three(p) << 7 | (three(q[0]) & 2) << 4 | three(q[1]) << 2 | (three(q[2]) & 3)
+        } else {
+            three(p) << 10 | three(q[0]) << 6 | three(q[1]) << 3 | three(q[2])
+        };
+    }
+    out
+}
+
+/// For eight pixels: which have a uniform 3x3 neighbourhood in the reference,
+/// and which a black one.
+#[inline]
+fn typical(q: [u16; 3]) -> (u8, u8) {
+    let and = q[0] & q[1] & q[2];
+    let or = q[0] | q[1] | q[2];
+    let black = and & and << 1 & and >> 1;
+    let white = !(or | or << 1 | or >> 1);
+    (((black | white) >> 7) as u8, (black >> 7) as u8)
+}
+
+#[inline(never)]
+fn run<const ONE: bool, const N: usize>(
+    coder: &mut Arith<'_>,
+    cx: &mut [u8],
+    t: RefTemplate,
+    tpgron: bool,
+    r: &Reference<'_>,
+    w: u32,
+    h: u32,
+) -> Bitmap {
     let mut out = Bitmap::new(w, h, false);
     let stride = out.stride;
+    let Some(cx) = cx.first_chunk_mut::<N>() else {
+        debug_assert!(false, "context array size");
+        return out;
+    };
     if w == 0 {
         return out;
     }
+    let mut a = *coder;
     let (ra1, ra2) = (t.at[0], t.at[1]);
-    let custom = !t.one && t.at != [NOMINAL; 2];
-    let mask = t.contexts() - 1;
-    let sltp = if t.one { 0x08 } else { 0x10 };
+    let custom = !ONE && t.at != [NOMINAL; 2];
+    // RA1 at most seven back on this row is in the history.
+    let near = ra1.1 == 0 && ra1.0 > -8;
+    let left = if ONE { 6 } else { 9 };
+    let sltp = if ONE { 0x08 } else { 0x10 };
     let mut ltp = 0;
     for y in 0..i64::from(h) {
         if tpgron {
@@ -83,65 +176,83 @@ pub(crate) fn decode(
                 &above[s..s + stride]
             }
         };
-        let prev = up(1);
         let ry = y - r.dy;
-        let refs = [r.bitmap.row(ry - 1), r.bitmap.row(ry), r.bitmap.row(ry + 1)];
+        let row = |k: i64| Window::new(r.bitmap.row(ry + k), -r.dx - 1);
+        let (mut p, mut q0, mut q1, mut q2) = (Window::new(up(1), -1), row(-1), row(0), row(1));
+        let ra1_row = up(-i64::from(ra1.1));
         let ra2_row = r.bitmap.row(ry + i64::from(ra2.1));
         let mut hist = 0u32;
         let last = stride - 1;
         for i in 0..stride {
-            let x0 = i as i64 * 8;
-            // Each window starts one pixel left of x0.
-            let p = fetch32(prev, x0 - 1);
-            let rx = x0 - r.dx - 1;
-            let q = [
-                fetch32(refs[0], rx),
-                fetch32(refs[1], rx),
-                fetch32(refs[2], rx),
-            ];
-            let (a1, a2) = if custom {
-                let x1 = x0 + i64::from(ra1.0);
-                (
-                    if ra1.1 < 0 {
-                        fetch32(up(-i64::from(ra1.1)), x1)
-                    } else {
-                        // Same row: only used far enough back to be stored.
-                        fetch32(&cur[..i], x1)
-                    },
-                    fetch32(ra2_row, rx + 1 + i64::from(ra2.0)),
-                )
-            } else {
-                (0, 0)
-            };
+            let above = p.advance();
+            let q = [q0.advance(), q1.advance(), q2.advance()];
             let n = if i == last { (w - 1) % 8 + 1 } else { 8 };
-            for j in 0..n {
-                let s = 29 - j;
-                let (q0, q1, q2) = ((q[0] >> s) & 7, (q[1] >> s) & 7, (q[2] >> s) & 7);
-                if ltp == 1 && q0 == q1 && q1 == q2 && (q0 == 0 || q0 == 7) {
-                    hist = (hist << 1) | (q0 & 1);
+            let (mut v1, mut v2) = (0, 0);
+            if custom {
+                let x0 = i as i64 * 8;
+                let x1 = x0 + i64::from(ra1.0);
+                let row = if ra1.1 < 0 { ra1_row } else { &cur[..i] };
+                v1 = (fetch32(row, x1) >> 24) as u8;
+                v2 = (fetch32(ra2_row, x0 - r.dx + i64::from(ra2.0)) >> 24) as u8;
+            }
+            let (mut sure, mut value) = (0, 0);
+            if ltp == 1 {
+                (sure, value) = typical(q);
+                if sure == 0xFF && i != last {
+                    cur[i] = value;
+                    hist = u32::from(value);
                     continue;
                 }
-                let h1 = hist & 1;
-                let p3 = (p >> s) & 7;
-                let mut c = if t.one {
-                    p3 << 7 | h1 << 6 | ((q0 >> 1) & 1) << 5 | q1 << 2 | (q2 & 3)
-                } else {
-                    p3 << 10 | h1 << 9 | q0 << 6 | q1 << 3 | q2
-                };
-                if custom {
-                    let v1 = if ra1.1 < 0 || ra1.0 <= -8 {
-                        a1 >> (31 - j)
-                    } else {
-                        // Same row: ra1.0 is -1 to -7.
-                        hist >> (u32::from(ra1.0.unsigned_abs()) - 1)
-                    };
-                    let v2 = a2 >> (31 - j);
-                    c = (c & !(1 << 12 | 1 << 8)) | (v1 & 1) << 12 | (v2 & 1) << 8;
+            }
+            if sure == 0 && i != last {
+                // The ten pixels of each row that the eight contexts have.
+                let any = above | q[0] | q[1] | q[2];
+                let all = above & q[0] & q[1] & q[2];
+                if u32::from(any >> 6) | (hist & 0xFF) | u32::from(v1 | v2) == 0 {
+                    if a.run(cx[0], 0, 8) {
+                        continue;
+                    }
+                } else if all >> 6 == 0x3FF
+                    && hist & 0xFF == 0xFF
+                    && (!custom || v2 == 0xFF && (near || v1 == 0xFF))
+                    && a.run(cx[N - 1], 1, 8)
+                {
+                    cur[i] = 0xFF;
+                    continue;
                 }
-                hist = (hist << 1) | a.bit(&mut cx[c as usize & mask]);
+            }
+            let mut contexts = contexts8::<ONE>(above, q);
+            if custom {
+                for c in &mut contexts {
+                    *c &= !(1 << 12 | 1 << 8);
+                }
+                if !near {
+                    spread(&mut contexts, v1, 1 << 12);
+                }
+                spread(&mut contexts, v2, 1 << 8);
+            }
+            if sure == 0 && !(custom && near) {
+                for &c in &contexts[..n as usize] {
+                    let c = u32::from(c) | (hist & 1) << left;
+                    hist = (hist << 1) | a.bit(&mut cx[c as usize & (N - 1)]);
+                }
+                cur[i] = (hist << (8 - n)) as u8;
+                continue;
+            }
+            for (j, &c) in (0..n).zip(&contexts) {
+                if (sure >> (7 - j)) & 1 == 1 {
+                    hist = (hist << 1) | u32::from((value >> (7 - j)) & 1);
+                    continue;
+                }
+                let mut c = u32::from(c) | (hist & 1) << left;
+                if custom && near {
+                    c |= ((hist >> (u32::from(ra1.0.unsigned_abs()) - 1)) & 1) << 12;
+                }
+                hist = (hist << 1) | a.bit(&mut cx[c as usize & (N - 1)]);
             }
             cur[i] = (hist << (8 - n)) as u8;
         }
     }
+    *coder = a;
     out
 }

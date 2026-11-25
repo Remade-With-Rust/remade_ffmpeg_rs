@@ -418,7 +418,7 @@ impl Region<'_> {
 /// Set `bit` in those of `out` whose bit of `v` is set, most significant
 /// first.
 #[inline]
-fn spread(out: &mut [u16; 8], v: u8, bit: u16) {
+pub(crate) fn spread(out: &mut [u16; 8], v: u8, bit: u16) {
     for (o, m) in out.iter_mut().zip([0x80u16, 0x40, 0x20, 0x10, 8, 4, 2, 1]) {
         *o |= if u16::from(v) & m != 0 { bit } else { 0 };
     }
