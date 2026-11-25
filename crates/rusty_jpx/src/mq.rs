@@ -292,4 +292,124 @@ mod tests {
             mq.decode(&mut cx, Ctx::new(i % 17));
         }
     }
+
+    /// The decoder of the standard's flow charts (C.3), bit by bit.
+    struct Book<'a> {
+        data: &'a [u8],
+        pos: usize,
+        a: u32,
+        c: u32,
+        ct: u32,
+        states: [(usize, u32); 19],
+    }
+
+    impl<'a> Book<'a> {
+        fn new(data: &'a [u8]) -> Self {
+            let mut states = [(0, 0); 19];
+            states[0].0 = 4;
+            states[17].0 = 3;
+            states[18].0 = 46;
+            let mut b = Book {
+                data,
+                pos: 0,
+                a: 0x8000,
+                c: 0,
+                ct: 0,
+                states,
+            };
+            b.c = b.at(0) << 16;
+            b.byte_in();
+            b.c <<= 7;
+            b.ct -= 7;
+            b
+        }
+
+        fn at(&self, i: usize) -> u32 {
+            self.data.get(i).map_or(0xFF, |&b| b.into())
+        }
+
+        fn byte_in(&mut self) {
+            let next = self.at(self.pos + 1);
+            if self.at(self.pos) != 0xFF {
+                self.pos += 1;
+                self.c = self.c.wrapping_add(next << 8);
+                self.ct = 8;
+            } else if next > 0x8F {
+                self.c = self.c.wrapping_add(0xFF00);
+                self.ct = 8;
+            } else {
+                self.pos += 1;
+                self.c = self.c.wrapping_add(next << 9);
+                self.ct = 7;
+            }
+        }
+
+        fn decode(&mut self, ctx: usize) -> u32 {
+            let (state, mps) = self.states[ctx];
+            let (qe, nm, nl, switch) = STATES[state];
+            let qe = u32::from(qe);
+            self.a -= qe;
+            let lps;
+            if self.c >> 16 < qe {
+                lps = self.a >= qe;
+                self.a = qe;
+            } else {
+                self.c -= qe << 16;
+                if self.a & 0x8000 != 0 {
+                    return mps;
+                }
+                lps = self.a < qe;
+            }
+            self.states[ctx] = if lps {
+                (nl.into(), mps ^ u32::from(switch))
+            } else {
+                (nm.into(), mps)
+            };
+            while self.a & 0x8000 == 0 {
+                if self.ct == 0 {
+                    self.byte_in();
+                }
+                self.a <<= 1;
+                self.c <<= 1;
+                self.ct -= 1;
+            }
+            mps ^ u32::from(lps)
+        }
+    }
+
+    /// Any bytes at all, those that no encoder writes included, and past the
+    /// end of them.
+    #[test]
+    fn matches_the_book() {
+        let mut seed = 7u64;
+        let mut random = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) as usize
+        };
+        for round in 0..3000 {
+            let n = random() % 200;
+            let data: Vec<u8> = (0..n)
+                .map(|_| match (round % 4, random()) {
+                    // Many FF, and what may follow them.
+                    (0, r) if r % 3 == 0 => 0xFF,
+                    (0, r) if r % 3 == 1 => 0x80 + (r / 3 % 0x12) as u8,
+                    (1, r) if r % 16 == 0 => 0xFF,
+                    (2, _) => 0xFF,
+                    (_, r) => r as u8,
+                })
+                .collect();
+            let mut mq = Mq::new(&data);
+            let mut cx = Contexts::new();
+            let mut book = Book::new(&data);
+            for i in 0..4000 {
+                let n = random() % 19;
+                let ctx = match n {
+                    17 => Ctx::Run,
+                    18 => Ctx::Uni,
+                    n => Ctx::new(n),
+                };
+                assert_eq!(mq.decode(&mut cx, ctx), book.decode(n), "{round} {i}");
+            }
+        }
+    }
 }

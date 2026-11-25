@@ -970,7 +970,7 @@ unsafe fn sweep<I: Isa, S: Sweep>(c: Column, out: *mut i32) {
             let mut low = c.at(i);
             let mut high = c.at(i + 1);
             let mut to = row(i - S::LAG - 1);
-            let count = (h - 1 - i + 1) / 2;
+            let count = (h - i) / 2;
             for _ in 0..count {
                 let (a, b) = S::step::<I>(&mut state, low, high);
                 a.store(to);
@@ -1333,4 +1333,407 @@ pub(crate) fn level_into(dst: &mut [i32], src: &[i32], l: Level, reals: bool) {
     assert!(dst.len() == src.len());
     // SAFETY: equal lengths, and the slices are distinct.
     unsafe { level(src.as_ptr(), dst.as_mut_ptr(), src.len(), l, reals) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            (self.0 >> 33) as u32
+        }
+
+        /// Integers: small, any, and the extremes.
+        fn ints(&mut self, n: usize) -> Vec<i32> {
+            let full = |r: &mut Self| ((r.next() << 8) ^ r.next()) as i32;
+            (0..n)
+                .map(|_| match self.next() % 8 {
+                    0 => [i32::MIN, i32::MAX, -1, 0, 1, i32::MIN + 1][self.next() as usize % 6],
+                    1 => full(self),
+                    _ => (self.next() % 4096) as i32 - 2048,
+                })
+                .collect()
+        }
+
+        /// Reals, as bits: ordinary values and, if `odd`, all the others.
+        fn reals(&mut self, n: usize, odd: bool) -> Vec<i32> {
+            (0..n)
+                .map(|_| match self.next() % 16 {
+                    0 if odd => real(
+                        [
+                            f32::NAN,
+                            f32::INFINITY,
+                            f32::NEG_INFINITY,
+                            -0.0,
+                            f32::MAX,
+                            f32::MIN_POSITIVE / 8.0,
+                        ][self.next() as usize % 6],
+                    ),
+                    1 => real((self.next() as f32 - 1e9) * 1e3),
+                    _ => real((self.next() % 8_000_000) as f32 * 0.001 - 4000.0),
+                })
+                .collect()
+        }
+
+        fn samples(&mut self, n: usize, reals: bool) -> Vec<i32> {
+            if reals {
+                self.reals(n, true)
+            } else {
+                self.ints(n)
+            }
+        }
+    }
+
+    /// Equal bits, except that one NaN is like another.
+    fn assert_same(a: &[i32], b: &[i32], reals: bool, what: &str) {
+        assert_eq!(a.len(), b.len());
+        for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
+            let nan = reals && float(x).is_nan() && float(y).is_nan();
+            assert!(x == y || nan, "{what}: {i}: {x:#x} {y:#x}");
+        }
+    }
+
+    /// Run `$body` for every vector instruction set of this machine,
+    /// inside a function compiled for it.
+    macro_rules! on_each_isa {
+        ($body:ident) => {
+            $body::<Baseline>("baseline");
+            #[cfg(target_arch = "x86_64")]
+            if std::is_x86_feature_detected!("avx2") {
+                #[target_feature(enable = "avx2")]
+                unsafe fn run() {
+                    $body::<x86::Avx2>("avx2");
+                }
+                // SAFETY: just detected.
+                unsafe { run() }
+            }
+        };
+    }
+
+    /// Scalar and `I` on copies of the same samples, at every alignment.
+    fn twins<I: Isa>(
+        what: &str,
+        data: &[i32],
+        reals: bool,
+        run: impl Fn(&mut [i32], bool),
+        offsets: usize,
+    ) {
+        for offset in 0..offsets {
+            let mut a = vec![0; offset];
+            a.extend_from_slice(data);
+            let mut b = a.clone();
+            run(&mut a[offset..], false);
+            run(&mut b[offset..], true);
+            assert_same(&a, &b, reals, what);
+        }
+    }
+
+    #[test]
+    fn rows_match_scalar() {
+        #[inline(always)]
+        fn check<I: Isa>(isa: &str) {
+            let mut rng = Rng(1);
+            for w in 2..75usize {
+                for odd in [false, true] {
+                    for reals in [false, true] {
+                        let lw = (w + usize::from(!odd)) / 2;
+                        let (hw, stride, h) = (w - lw, w + 3, 3);
+                        let data = rng.samples(stride * h, reals);
+                        let run = |p: &mut [i32], simd: bool| {
+                            let mut tmp = vec![0; lw + 1];
+                            let (p, t) = (p.as_mut_ptr(), tmp.as_mut_ptr());
+                            // SAFETY: `h` rows of `w`, `tmp` of `lw`.
+                            unsafe {
+                                match (simd, reals) {
+                                    (false, false) => {
+                                        row_loop::<Scalar, Row53>(p, stride, h, (lw, hw), odd, t)
+                                    }
+                                    (false, true) => {
+                                        row_loop::<Scalar, Row97>(p, stride, h, (lw, hw), odd, t)
+                                    }
+                                    (true, false) => {
+                                        row_loop::<I, Row53>(p, stride, h, (lw, hw), odd, t)
+                                    }
+                                    (true, true) => {
+                                        row_loop::<I, Row97>(p, stride, h, (lw, hw), odd, t)
+                                    }
+                                }
+                            }
+                        };
+                        twins::<I>(
+                            &format!("{isa} row {w} {odd} {reals}"),
+                            &data,
+                            reals,
+                            run,
+                            8,
+                        );
+                    }
+                }
+            }
+        }
+        on_each_isa!(check);
+    }
+
+    #[test]
+    fn columns_match_scalar() {
+        #[inline(always)]
+        fn check<I: Isa>(isa: &str) {
+            let mut rng = Rng(2);
+            for h in 2..27usize {
+                for w in [1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 33, 50] {
+                    for odd in [false, true] {
+                        for reals in [false, true] {
+                            let lh = (h + usize::from(!odd)) / 2;
+                            let stride = w + 2;
+                            let data = rng.samples(stride * h, reals);
+                            let run = |p: &mut [i32], simd: bool| {
+                                let mut col = vec![0; COLUMN_SCRATCH * h];
+                                let (p, c) = (p.as_mut_ptr(), col.as_mut_ptr());
+                                // SAFETY: `h` rows of `w`, scratch as asked for.
+                                unsafe {
+                                    match (simd, reals) {
+                                        (false, false) => column_loop::<Scalar, Sweep53>(
+                                            p,
+                                            stride,
+                                            w,
+                                            (h, lh),
+                                            odd,
+                                            c,
+                                        ),
+                                        (false, true) => column_loop::<Scalar, Sweep97>(
+                                            p,
+                                            stride,
+                                            w,
+                                            (h, lh),
+                                            odd,
+                                            c,
+                                        ),
+                                        (true, false) => {
+                                            column_loop::<I, Sweep53>(p, stride, w, (h, lh), odd, c)
+                                        }
+                                        (true, true) => {
+                                            column_loop::<I, Sweep97>(p, stride, w, (h, lh), odd, c)
+                                        }
+                                    }
+                                }
+                            };
+                            let what = format!("{isa} column {w}x{h} {odd} {reals}");
+                            twins::<I>(&what, &data, reals, run, 3);
+                        }
+                    }
+                }
+            }
+        }
+        on_each_isa!(check);
+    }
+
+    /// The 9/7 by the book: scaling, then four lifting passes over the
+    /// interleaved signal, mirrored at its ends.
+    fn reference97(low: &[i32], high: &[i32], odd: bool) -> Vec<i32> {
+        let n = low.len() + high.len();
+        let is_low = |i: usize| (i % 2 == 1) == odd;
+        let (mut l, mut h) = (low.iter(), high.iter());
+        let mut y: Vec<f32> = (0..n)
+            .map(|i| {
+                if is_low(i) {
+                    float(*l.next().unwrap()) * K
+                } else {
+                    float(*h.next().unwrap()) * (1.0 / K)
+                }
+            })
+            .collect();
+        for (c, lows) in [(DELTA, true), (GAMMA, false), (BETA, true), (ALPHA, false)] {
+            let src = y.clone();
+            for i in (0..n).filter(|&i| is_low(i) == lows) {
+                let left = if i == 0 { src[1] } else { src[i - 1] };
+                let right = if i + 1 == n { src[n - 2] } else { src[i + 1] };
+                y[i] = src[i] - c * (left + right);
+            }
+        }
+        y.into_iter().map(real).collect()
+    }
+
+    #[test]
+    fn nine_seven_matches_direct_synthesis() {
+        let mut rng = Rng(3);
+        for n in 2..80usize {
+            for odd in [false, true] {
+                let lw = (n + usize::from(!odd)) / 2;
+                let data = rng.reals(n, false);
+                let want = reference97(&data[..lw], &data[lw..], odd);
+                let mut row = data.clone();
+                let mut tmp = vec![0; lw];
+                synthesize_rows(&mut row, n, (lw, n - lw), 1, odd, true, &mut tmp);
+                assert_eq!(row, want, "row {n} {odd}");
+                let mut col = vec![0; COLUMN_SCRATCH * n];
+                // In the strip, and in the columns that are left over.
+                for w in [1, 2 * Scalar::N, 16, 19] {
+                    let mut p: Vec<i32> = data.iter().flat_map(|&v| vec![v; w]).collect();
+                    synthesize_columns(&mut p, w, w, (n, lw), odd, true, &mut col);
+                    let want: Vec<i32> = want.iter().flat_map(|&v| vec![v; w]).collect();
+                    assert_eq!(p, want, "column {n} {odd} {w}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn colour_transforms_match_scalar() {
+        #[inline(always)]
+        fn check<I: Isa>(isa: &str) {
+            let mut rng = Rng(4);
+            for n in 0..40usize {
+                for reals in [false, true] {
+                    let data = rng.samples(3 * n, reals);
+                    let run = |p: &mut [i32], simd: bool| {
+                        let p = p.as_mut_ptr();
+                        // SAFETY: three planes of `n`.
+                        unsafe {
+                            let planes = [p, p.add(n), p.add(2 * n)];
+                            match (simd, reals) {
+                                (false, false) => each::<Scalar, _>(&Rct(planes), 0, n),
+                                (false, true) => each::<Scalar, _>(&Ict(planes), 0, n),
+                                (true, false) => each::<I, _>(&Rct(planes), 0, n),
+                                (true, true) => each::<I, _>(&Ict(planes), 0, n),
+                            }
+                        }
+                    };
+                    twins::<I>(&format!("{isa} mct {n} {reals}"), &data, reals, run, 8);
+                }
+            }
+        }
+        on_each_isa!(check);
+    }
+
+    #[test]
+    fn dequantize_matches_scalar() {
+        #[inline(always)]
+        fn check<I: Isa>(isa: &str) {
+            let mut rng = Rng(5);
+            for w in 1..36usize {
+                for h in 1..10usize {
+                    let src = rng.ints(w * h.next_multiple_of(4));
+                    // By hand: scan order in, rows out.
+                    let at = |x: usize, y: usize| src[(y / 4 * w + x) * 4 + y % 4];
+                    let stride = w + 3;
+                    let step = 0.734_375f32;
+                    let mut want = [vec![7; stride * h], vec![7; stride * h]];
+                    for y in 0..h {
+                        for x in 0..w {
+                            let v = at(x, y);
+                            let m = i64::from(v & i32::MAX) * if v < 0 { -1 } else { 1 };
+                            want[0][y * stride + x] = (m / 2) as i32;
+                            want[1][y * stride + x] = real(m as i32 as f32 * step);
+                        }
+                    }
+                    let mut out = [vec![7; stride * h], vec![7; stride * h]];
+                    let [a, b] = &mut out;
+                    let s = src.as_ptr();
+                    // SAFETY: lengths as above.
+                    unsafe {
+                        dequant_loop::<I, Halve>(s, a.as_mut_ptr(), stride, (w, h), 0.0);
+                        dequant_loop::<I, ToReal>(s, b.as_mut_ptr(), stride, (w, h), step);
+                    }
+                    assert_eq!(out, want, "{isa} {w}x{h}");
+                    let [a, b] = &mut out;
+                    // SAFETY: lengths as above.
+                    unsafe {
+                        dequant_loop::<Scalar, Halve>(s, a.as_mut_ptr(), stride, (w, h), 0.0);
+                        dequant_loop::<Scalar, ToReal>(s, b.as_mut_ptr(), stride, (w, h), step);
+                    }
+                    assert_eq!(out, want, "scalar {w}x{h}");
+                }
+            }
+        }
+        on_each_isa!(check);
+    }
+
+    #[test]
+    fn level_matches_scalar() {
+        #[inline(always)]
+        fn check<I: Isa>(isa: &str) {
+            let mut rng = Rng(6);
+            for bits in 1..=31u8 {
+                for signed in [false, true] {
+                    let l = Level::new(bits, signed);
+                    let data = rng.ints(37);
+                    let run = |p: &mut [i32], simd: bool| {
+                        let dst = p.as_mut_ptr();
+                        let e = LevelInt {
+                            src: dst,
+                            dst,
+                            level: l,
+                        };
+                        // SAFETY: one slice, its own length.
+                        unsafe {
+                            if simd {
+                                each::<I, _>(&e, 0, p.len());
+                            } else {
+                                for v in p.iter_mut() {
+                                    let wide = i64::from(*v) + i64::from(l.shift);
+                                    *v = wide.clamp(l.min.into(), l.max.into()) as i32;
+                                }
+                            }
+                        }
+                    };
+                    twins::<I>(
+                        &format!("{isa} level {bits} {signed}"),
+                        &data,
+                        false,
+                        run,
+                        8,
+                    );
+                    if bits > 20 {
+                        continue;
+                    }
+                    // Halves on purpose: ties go to even.
+                    let mut data = rng.reals(37, true);
+                    for (i, v) in data.iter_mut().enumerate().take(9) {
+                        *v = real(i as f32 - 4.5);
+                    }
+                    let run = |p: &mut [i32], simd: bool| {
+                        let dst = p.as_mut_ptr();
+                        let e = LevelReal {
+                            src: dst,
+                            dst,
+                            level: l,
+                        };
+                        // SAFETY: one slice, its own length.
+                        unsafe {
+                            if simd {
+                                each::<I, _>(&e, 0, p.len());
+                            } else {
+                                each::<Scalar, _>(&e, 0, p.len());
+                                return;
+                            }
+                        }
+                    };
+                    twins::<I>(
+                        &format!("{isa} real level {bits} {signed}"),
+                        &data,
+                        false,
+                        run,
+                        8,
+                    );
+                }
+            }
+        }
+        on_each_isa!(check);
+    }
+
+    #[test]
+    fn real_level_rounds_to_even() {
+        let mut p: Vec<i32> = [-2.5f32, -1.5, -0.5, 0.5, 1.5, 2.5, 200.0, -200.0, f32::NAN]
+            .map(real)
+            .to_vec();
+        level_in_place(&mut p, Level::new(8, false), true);
+        assert_eq!(p, [126, 126, 128, 128, 130, 130, 255, 0, 0]);
+    }
 }
