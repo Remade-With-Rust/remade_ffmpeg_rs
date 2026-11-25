@@ -4,7 +4,8 @@
 use crate::codestream::{ceil_shift, Params, Progression, Siz};
 use crate::dwt::Plane;
 use crate::error::{JpxError, JpxResult};
-use crate::t1::{signed2, Segment, MAX_PLANES, STYLE_BYPASS, STYLE_TERMALL, T1};
+use crate::kernels::dequantize;
+use crate::t1::{Segment, MAX_PLANES, STYLE_BYPASS, STYLE_TERMALL, T1};
 use crate::tagtree::{Bits, TagTree};
 
 /// Image-wide budget for structures whose size the header alone decides.
@@ -715,21 +716,8 @@ impl TileComp {
             }
         }
         let first = block.y as usize * stride + block.x as usize;
-        let p = &mut plane.data[first..];
-        if plane.reals {
-            let step = band.step * 0.5;
-            for (row, out) in s.t1.data.chunks_exact(w).zip(p.chunks_mut(stride)) {
-                for (o, &v) in out.iter_mut().zip(row) {
-                    *o = (signed2(v) as f32 * step).to_bits() as i32;
-                }
-            }
-        } else {
-            for (row, out) in s.t1.data.chunks_exact(w).zip(p.chunks_mut(stride)) {
-                for (o, &v) in out.iter_mut().zip(row) {
-                    *o = signed2(v) / 2;
-                }
-            }
-        }
+        let step = plane.reals.then_some(band.step);
+        dequantize(&s.t1.data, w, &mut plane.data[first..], stride, step);
         Ok(())
     }
 }

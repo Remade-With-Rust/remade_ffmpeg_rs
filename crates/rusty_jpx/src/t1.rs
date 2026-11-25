@@ -519,11 +519,3 @@ impl T1 {
         *src = s;
     }
 }
-
-/// A sign-magnitude coefficient (times two) as a two's complement integer.
-#[inline(always)]
-pub(crate) fn signed2(v: u32) -> i32 {
-    let m = (v & 0x7FFF_FFFF) as i32;
-    let s = (v as i32) >> 31;
-    (m ^ s) - s
-}
