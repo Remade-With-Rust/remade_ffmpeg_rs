@@ -12,8 +12,8 @@
 //! Arms: `a1` short-block psy, `grp` window grouping (arm 1a), `a2` tonality SMR, `a3` TNS, `a6` PNS,
 //! `a7` intensity stereo, `a9` level-invariant transients, `a13` demand-based
 //! stereo bit split, `kbd`/`autoshape` window shape. With no arms it is byte-identical to the shipped defaults.
-//! Low-rate tools (default on): `nosect`/`nothp` switch the section trellis or the
-//! high-passed transient detector off; `bw=<hz|auto|full>`, `fd=<strength>`,
+//! Low-rate tools (default on): `nosect`/`nothp`/`nosurp` switch the section trellis, the
+//! high-passed transient detector or the surplus shaping off; `bw=<hz|auto|full>`, `fd=<strength>`,
 //! `smr=<dB>` set the bandwidth, frame-demand strength and mask SMR; `legacy` is
 //! the 2.1.2 encoder.
 
@@ -66,6 +66,9 @@ fn main() {
     }
     if on("nothp") {
         tuning.transient_highpass = false;
+    }
+    if on("nosurp") {
+        tuning.surplus_shaping = false;
     }
     if on("sect") {
         tuning.section_trellis = true;
