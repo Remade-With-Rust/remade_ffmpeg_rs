@@ -500,7 +500,9 @@ fn run_filter(body: &str) {
 #[test]
 fn filter_chain_of_2000_primitives() {
     let mut f = String::from(r#"<filter id="f">"#);
-    for _ in 0..2000 {
+    // Unoptimised kernels are some 30 times as slow.
+    let n = if cfg!(debug_assertions) { 100 } else { 2000 };
+    for _ in 0..n {
         f.push_str(r#"<feGaussianBlur stdDeviation="3"/><feOffset dx="1"/>"#);
     }
     run_filter(&format!(
