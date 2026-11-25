@@ -1,0 +1,25 @@
+# cargo-fuzz harness, detached from the main workspace (its own empty
+# [workspace] table) so libfuzzer-sys never enters the normal build:
+#
+#   cargo +nightly fuzz run decode
+[package]
+name = "rusty_jpx-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rusty_jpx = { path = ".." }
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
