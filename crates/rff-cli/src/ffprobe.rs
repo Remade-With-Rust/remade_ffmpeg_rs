@@ -5,9 +5,11 @@
 //! *is*, but every format this build can convert it *into*, and what each
 //! conversion would cost. It is computed from the engine's own registries by
 //! `rff::targets`, so it never promises an output the transcoder would refuse.
+//! `-show_chapters` lists the chapters (JSON: ffprobe's `chapters` array).
 
 use std::process::ExitCode;
 
+use rff::format::Chapter;
 use rff::probe::MediaInfo;
 use rff::Engine;
 use rff_core::Dictionary;
@@ -18,6 +20,7 @@ pub fn run(args: Vec<String>) -> ExitCode {
     let mut want_version = false;
     let mut as_json = false;
     let mut show_targets = false;
+    let mut show_chapters = false;
     let mut input: Option<String> = None;
 
     let mut i = 0;
@@ -29,6 +32,7 @@ pub fn run(args: Vec<String>) -> ExitCode {
             // Presence-only flags we accept for compatibility.
             "-show_format" | "-show_streams" | "-show_entries" => {}
             "-show_targets" => show_targets = true,
+            "-show_chapters" => show_chapters = true,
             "-of" | "-print_format" => {
                 i += 1;
                 as_json = args.get(i).map(|v| v == "json").unwrap_or(false);
@@ -76,12 +80,13 @@ pub fn run(args: Vec<String>) -> ExitCode {
             }
         };
     }
-    match rff::probe::probe_with_metadata(&engine, &input) {
-        Ok((info, tags)) => {
+    match rff::probe::probe_with_chapters(&engine, &input) {
+        Ok((info, tags, chapters)) => {
+            let chapters = show_chapters.then_some(&chapters[..]);
             if as_json {
-                print_json(&input, &info, &tags);
+                print_json(&input, &info, &tags, chapters);
             } else {
-                print_human(&input, &info, &tags);
+                print_human(&input, &info, &tags, chapters);
             }
             ExitCode::SUCCESS
         }
@@ -140,8 +145,21 @@ Convert to ({} targets):",
 }
 
 /// FFprobe-style human output.
-fn print_human(input: &str, info: &MediaInfo, tags: &[Dictionary]) {
+fn print_human(input: &str, info: &MediaInfo, tags: &[Dictionary], chapters: Option<&[Chapter]>) {
     println!("Input #0, {}, from '{}':", info.format_name, input);
+    if let Some(list) = chapters.filter(|c| !c.is_empty()) {
+        println!("  Chapters:");
+        for (i, c) in list.iter().enumerate() {
+            let (start, end) = (seconds(c.start, c), seconds(c.end, c));
+            println!("    Chapter #0:{i}: start {start}, end {end}");
+            if !c.metadata.is_empty() {
+                println!("      Metadata:");
+                for (k, v) in c.metadata.iter() {
+                    println!("        {k:<16}: {v}");
+                }
+            }
+        }
+    }
     for stream in &info.streams {
         let detail = match stream.media_type {
             rff_core::MediaType::Video => {
@@ -167,7 +185,7 @@ fn print_human(input: &str, info: &MediaInfo, tags: &[Dictionary]) {
 }
 
 /// Minimal JSON output (hand-rolled to keep the CLI dependency-light).
-fn print_json(input: &str, info: &MediaInfo, tags: &[Dictionary]) {
+fn print_json(input: &str, info: &MediaInfo, tags: &[Dictionary], chapters: Option<&[Chapter]>) {
     println!("{{");
     println!("  \"format\": {{");
     println!("    \"filename\": {},", json_str(input));
@@ -209,12 +227,65 @@ fn print_json(input: &str, info: &MediaInfo, tags: &[Dictionary]) {
         }
         println!("    }}{comma}");
     }
-    println!("  ]");
+    match chapters {
+        Some(list) => {
+            println!("  ],");
+            print_json_chapters(list);
+        }
+        None => println!("  ]"),
+    }
     println!("}}");
 }
 
-/// Escape a string as a JSON string literal (quotes + backslashes).
+/// The `chapters` array, with ffprobe's fields.
+fn print_json_chapters(list: &[Chapter]) {
+    println!("  \"chapters\": [");
+    for (i, c) in list.iter().enumerate() {
+        println!("    {{");
+        // ffprobe prints the id as a signed number.
+        println!("      \"id\": {},", c.id as i64);
+        println!(
+            "      \"time_base\": \"{}/{}\",",
+            c.time_base.num, c.time_base.den
+        );
+        println!("      \"start\": {},", c.start);
+        println!("      \"start_time\": \"{}\",", seconds(c.start, c));
+        println!("      \"end\": {},", c.end);
+        print!("      \"end_time\": \"{}\"", seconds(c.end, c));
+        if c.metadata.is_empty() {
+            println!();
+        } else {
+            println!(",\n      \"tags\": {{");
+            let n = c.metadata.len();
+            for (k, (key, value)) in c.metadata.iter().enumerate() {
+                let sep = if k + 1 < n { "," } else { "" };
+                println!("        {}: {}{sep}", json_str(key), json_str(value));
+            }
+            println!("      }}");
+        }
+        println!("    }}{}", if i + 1 < list.len() { "," } else { "" });
+    }
+    println!("  ]");
+}
+
+/// A chapter time in seconds, as ffprobe prints it.
+fn seconds(v: i64, c: &Chapter) -> String {
+    format!("{:.6}", v as f64 * c.time_base.as_f64())
+}
+
+/// Escape a string as a JSON string literal: quotes, backslashes and control
+/// characters.
 fn json_str(s: &str) -> String {
-    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="240" height="160">
+  <linearGradient id="g"><stop stop-color="red"/><stop offset="1" stop-color="blue"/></linearGradient>
+  <radialGradient id="r" gradientUnits="userSpaceOnUse" cx="60" cy="110" r="60"><stop stop-color="yellow"/><stop offset="1" stop-color="green"/></radialGradient>
+  <pattern id="p" width=".2" height=".2"><rect width="6" height="6" fill="purple"/><circle cx="4" cy="4" r="3" fill="orange"/></pattern>
+  <marker id="m" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto"><path d="M0 0L6 3 0 6z" fill="context-stroke" stroke="context-fill"/></marker>
+  <symbol id="s" viewBox="0 0 20 20"><rect x="2" y="2" width="8" height="16" fill="context-fill"/><circle cx="14" cy="10" r="5" fill="context-stroke" stroke="context-fill"/></symbol>
+  <g id="e"><rect width="20" height="30" fill="context-fill"/><rect x="25" width="20" height="30" fill="none" stroke="context-stroke" stroke-width="4" transform="rotate(5)"/></g>
+  <use href="#e" x="10" y="10" fill="url(#g)" stroke="url(#r)"/><use href="#e" x="70" y="10" fill="url(#p)" stroke="url(#g)" transform="skewX(10)"/>
+  <use href="#s" x="150" y="10" width="70" height="50" fill="url(#g)" stroke="url(#p)"/>
+  <path d="M20 100L80 80 120 140" fill="url(#p)" stroke="url(#g)" stroke-width="5" marker-start="url(#m)" marker-mid="url(#m)" marker-end="url(#m)"/>
+  <path d="M150 100L200 80 220 140" fill="none" stroke="url(#r)" stroke-width="4" marker-end="url(#m)"/>
+</svg>

@@ -362,6 +362,333 @@ pub(crate) fn length_list(text: &str) -> Option<Vec<Length>> {
     Some(out)
 }
 
+/// A length list up to its first malformed item.
+pub(crate) fn length_list_prefix(text: &str) -> Vec<Length> {
+    let mut s = Stream::new(text);
+    let mut out = Vec::new();
+    s.skip_spaces();
+    while !s.at_end() {
+        let Some(l) = s.parse_length() else {
+            break;
+        };
+        out.push(l);
+        s.skip_list_separator();
+    }
+    out
+}
+
+/// A comma/space separated number list, up to its first malformed item, and
+/// whether it had none.
+pub(crate) fn number_list(text: &str) -> (Vec<f64>, bool) {
+    let mut s = Stream::new(text);
+    let mut out = Vec::new();
+    s.skip_spaces();
+    while !s.at_end() {
+        match s.parse_list_number() {
+            Some(n) => out.push(n),
+            None => return (out, false),
+        }
+    }
+    (out, true)
+}
+
+/// A `font-family` list; `None` when it is malformed.
+pub(crate) fn font_families(text: &str) -> Option<Vec<crate::text::FontFamily>> {
+    use crate::text::FontFamily;
+    let mut out = Vec::new();
+    let mut rest = text.trim_start();
+    while !rest.is_empty() {
+        let name;
+        if let Some(q) = rest.chars().next().filter(|c| matches!(c, '\'' | '"')) {
+            let end = rest[1..].find(q)?;
+            name = Some(FontFamily::Named(rest[1..=end].to_string()));
+            rest = rest[end + 2..].trim_start();
+        } else {
+            let end = rest.find(',').unwrap_or(rest.len());
+            let mut words = String::new();
+            for w in rest[..end].split_ascii_whitespace() {
+                if !is_css_ident(w) {
+                    return None;
+                }
+                if !words.is_empty() {
+                    words.push(' ');
+                }
+                words.push_str(w);
+            }
+            rest = &rest[end..];
+            name = match words.as_str() {
+                "" => None,
+                "serif" => Some(FontFamily::Serif),
+                "sans-serif" => Some(FontFamily::SansSerif),
+                "cursive" => Some(FontFamily::Cursive),
+                "fantasy" => Some(FontFamily::Fantasy),
+                "monospace" => Some(FontFamily::Monospace),
+                _ => Some(FontFamily::Named(words)),
+            };
+        }
+        out.extend(name.filter(|n| *n != FontFamily::Named(String::new())));
+        match rest.strip_prefix(',') {
+            Some(r) => rest = r.trim_start(),
+            None if rest.is_empty() => {}
+            None => return None,
+        }
+    }
+    Some(out)
+}
+
+/// A CSS identifier, without escapes.
+fn is_css_ident(w: &str) -> bool {
+    let body = w.strip_prefix('-').unwrap_or(w);
+    let mut chars = body.chars();
+    let start = |c: char| c.is_ascii_alphabetic() || c == '_' || !c.is_ascii();
+    chars.next().is_some_and(start) && chars.all(|c| start(c) || c.is_ascii_digit() || c == '-')
+}
+
+/// The parts of a `font` shorthand.
+pub(crate) struct FontShorthand<'a> {
+    pub style: Option<&'a str>,
+    pub variant: Option<&'a str>,
+    pub weight: Option<&'a str>,
+    pub stretch: Option<&'a str>,
+    pub size: &'a str,
+    pub family: &'a str,
+}
+
+/// Parses a `font` shorthand.
+pub(crate) fn font_shorthand(text: &str) -> Option<FontShorthand<'_>> {
+    let mut f = FontShorthand {
+        style: None,
+        variant: None,
+        weight: None,
+        stretch: None,
+        size: "",
+        family: "",
+    };
+    let mut rest = text.trim_start();
+    for _ in 0..4 {
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .unwrap_or(rest.len());
+        let word = &rest[..end];
+        match word {
+            "normal" => {}
+            "small-caps" => f.variant = Some(word),
+            "italic" | "oblique" => f.style = Some(word),
+            "bold" | "bolder" | "lighter" | "100" | "200" | "300" | "400" | "500" | "600"
+            | "700" | "800" | "900" => f.weight = Some(word),
+            "ultra-condensed" | "extra-condensed" | "condensed" | "semi-condensed"
+            | "semi-expanded" | "expanded" | "extra-expanded" | "ultra-expanded" => {
+                f.stretch = Some(word);
+            }
+            _ => break,
+        }
+        rest = rest[end..].trim_start();
+    }
+    let mut s = Stream::new(rest);
+    if s.peek()?.is_ascii_digit() {
+        s.parse_length()?;
+    } else if !matches!(
+        s.consume_ident(),
+        "xx-small"
+            | "x-small"
+            | "small"
+            | "medium"
+            | "large"
+            | "x-large"
+            | "xx-large"
+            | "larger"
+            | "smaller"
+    ) {
+        return None;
+    }
+    f.size = &rest[..s.pos];
+    s.skip_spaces();
+    // The line height has no effect.
+    if s.eat(b'/') {
+        s.skip_spaces();
+        s.parse_length()?;
+        s.skip_spaces();
+    }
+    f.family = s.rest();
+    (!f.family.is_empty()).then_some(f)
+}
+
+/// `font-variation-settings`: pairs of a quoted axis tag and a number;
+/// malformed ones are dropped.
+pub(crate) fn font_variations(text: &str) -> Vec<crate::text::FontVariation> {
+    let pair = |part: &str| {
+        let part = part.trim();
+        let quote = part.chars().next().filter(|c| matches!(c, '\'' | '"'))?;
+        let (tag, value) = part[1..].split_once(quote)?;
+        Some(crate::text::FontVariation {
+            tag: tag.as_bytes().try_into().ok()?,
+            value: value.trim().parse().ok().filter(|v: &f32| v.is_finite())?,
+        })
+    };
+    text.split(',').filter_map(pair).collect()
+}
+
+/// One item of a `filter` value.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum FilterFunc<'a> {
+    Blur(Length),
+    DropShadow {
+        color: Option<Color>,
+        dx: Length,
+        dy: Length,
+        std_dev: Length,
+    },
+    Brightness(f64),
+    Contrast(f64),
+    Grayscale(f64),
+    /// Degrees.
+    HueRotate(f64),
+    Invert(f64),
+    Opacity(f64),
+    Saturate(f64),
+    Sepia(f64),
+    Url(&'a str),
+}
+
+/// A `filter` value: its functions up to the first malformed one, and
+/// whether there was none. `none` and an empty value have no functions.
+pub(crate) fn filter_functions(text: &str) -> (Vec<FilterFunc<'_>>, bool) {
+    let mut s = Stream::new(text);
+    let mut out = Vec::new();
+    loop {
+        s.skip_spaces();
+        if s.at_end() {
+            return (out, true);
+        }
+        if s.starts_with(b"none") {
+            s.advance(4);
+            s.skip_spaces();
+            return (out, s.at_end());
+        }
+        match s.parse_filter_function() {
+            Some(f) => out.push(f),
+            None => return (out, false),
+        }
+    }
+}
+
+impl<'a> Stream<'a> {
+    fn parse_filter_function(&mut self) -> Option<FilterFunc<'a>> {
+        if self.starts_with(b"url(") {
+            return self
+                .parse_func_iri()
+                .filter(|id| !id.is_empty())
+                .map(FilterFunc::Url);
+        }
+        let name = self.consume_ident();
+        self.skip_spaces();
+        if !self.eat(b'(') {
+            return None;
+        }
+        self.skip_spaces();
+        let empty = self.peek() == Some(b')');
+        let f = match name {
+            "blur" => FilterFunc::Blur(if empty {
+                Length::zero()
+            } else {
+                self.parse_filter_length(false)?
+            }),
+            "drop-shadow" => self.parse_drop_shadow()?,
+            "hue-rotate" => FilterFunc::HueRotate(if empty {
+                0.0
+            } else {
+                self.parse_filter_angle()?
+            }),
+            "brightness" => FilterFunc::Brightness(self.parse_amount()?),
+            "contrast" => FilterFunc::Contrast(self.parse_amount()?),
+            "grayscale" => FilterFunc::Grayscale(self.parse_amount()?),
+            "invert" => FilterFunc::Invert(self.parse_amount()?),
+            "opacity" => FilterFunc::Opacity(self.parse_amount()?),
+            "saturate" => FilterFunc::Saturate(self.parse_amount()?),
+            "sepia" => FilterFunc::Sepia(self.parse_amount()?),
+            _ => return None,
+        };
+        self.skip_spaces();
+        self.eat(b')').then_some(f)
+    }
+
+    /// A length that is not a percentage.
+    fn parse_filter_length(&mut self, negative: bool) -> Option<Length> {
+        let mut s = *self;
+        let l = s.parse_length()?;
+        if l.unit == Unit::Percent || (!negative && l.number.is_sign_negative()) {
+            return None;
+        }
+        *self = s;
+        Some(l)
+    }
+
+    /// An angle in degrees; the unit may be missing only on zero.
+    fn parse_filter_angle(&mut self) -> Option<f64> {
+        let n = self.parse_number()?;
+        for (unit, scale) in [
+            (&b"deg"[..], 1.0),
+            (b"grad", 180.0 / 200.0),
+            (b"turn", 360.0),
+        ] {
+            if self.starts_with(unit) {
+                self.advance(unit.len());
+                return Some(n * scale);
+            }
+        }
+        if self.starts_with(b"rad") {
+            self.advance(3);
+            return Some(n.to_degrees());
+        }
+        (n == 0.0).then_some(n)
+    }
+
+    /// A non-negative number or percentage; 1 when missing.
+    fn parse_amount(&mut self) -> Option<f64> {
+        if self.peek() == Some(b')') {
+            return Some(1.0);
+        }
+        self.parse_number_or_percent()
+            .filter(|n| !n.is_sign_negative())
+    }
+
+    /// `drop-shadow`'s arguments: the colour may come first or last.
+    fn parse_drop_shadow(&mut self) -> Option<FilterFunc<'a>> {
+        let (mut color, current) = self.parse_shadow_color();
+        let dx = self.parse_filter_length(true)?;
+        self.skip_spaces();
+        let dy = self.parse_filter_length(true)?;
+        self.skip_spaces();
+        let std_dev = self.parse_filter_length(false).unwrap_or(Length::zero());
+        self.skip_spaces();
+        if color.is_none() && !current {
+            color = self.parse_shadow_color().0;
+        }
+        Some(FilterFunc::DropShadow {
+            color,
+            dx,
+            dy,
+            std_dev,
+        })
+    }
+
+    /// A colour and whether it was `currentColor`.
+    fn parse_shadow_color(&mut self) -> (Option<Color>, bool) {
+        let mut s = *self;
+        if let Some(c) = s.parse_color() {
+            *self = s;
+            self.skip_spaces();
+            return (Some(c), false);
+        }
+        if self.starts_with(b"currentColor") {
+            self.advance(12);
+            self.skip_spaces();
+            return (None, true);
+        }
+        (None, false)
+    }
+}
+
 /// An opacity: a number or a percentage, clamped to `0..=1`.
 pub(crate) fn opacity(text: &str) -> Option<f32> {
     let l = length(text)?;

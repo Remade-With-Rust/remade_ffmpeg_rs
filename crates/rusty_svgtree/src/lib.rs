@@ -26,25 +26,43 @@
 #![forbid(unsafe_code)]
 
 mod colors;
+#[cfg(feature = "fonts")]
+mod colr;
 mod convert;
 mod css;
+pub mod filter;
+mod filter_convert;
+mod filter_kernels;
+mod filter_render;
+#[cfg(feature = "fonts")]
+mod fonts;
 mod image;
 mod marker;
 mod render;
 mod svgtree;
+pub mod text;
+mod text_convert;
+#[cfg(feature = "text")]
+mod text_layout;
 mod tree;
 mod values;
+mod writer;
 
+#[cfg(feature = "fonts")]
+pub use fonts::Fonts;
 pub use rusty_raster;
 pub use tree::{
     BaseGradient, ClipPath, Color, Fill, Group, Image, ImageKind, LinearGradient, Mask, Node,
     Paint, PaintOrder, Path, Pattern, RadialGradient, Stop, Stroke,
 };
 
+pub use writer::WriteOptions;
+
 use rusty_raster::{PixmapMut, Size, Transform};
 
 /// Parse errors.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// The XML is malformed (the message comes from `rusty_xml`).
     ParsingFailed(String),
@@ -52,6 +70,9 @@ pub enum Error {
     NotAnSvg,
     /// `width`/`height`/`viewBox` do not give a finite, positive size.
     InvalidSize,
+    /// The data is compressed, and broken, larger than
+    /// [`Options::max_svgz_bytes`], or the `svgz` feature is off.
+    MalformedGzip,
     /// The document exceeds [`Options::max_nodes`] or
     /// [`Options::max_depth`] (after `use` expansion).
     ElementsLimitReached,
@@ -63,6 +84,7 @@ impl std::fmt::Display for Error {
             Error::ParsingFailed(m) => write!(f, "XML parsing failed: {m}"),
             Error::NotAnSvg => f.write_str("the root element is not <svg>"),
             Error::InvalidSize => f.write_str("the SVG has an invalid size"),
+            Error::MalformedGzip => f.write_str("the compressed data is not valid gzip"),
             Error::ElementsLimitReached => f.write_str("the SVG exceeds the element limits"),
         }
     }
@@ -77,6 +99,12 @@ pub struct Options {
     pub dpi: f32,
     /// The default `font-size`, for `em`/`ex` units.
     pub font_size: f32,
+    /// The default `font-family`.
+    pub font_family: String,
+    /// Where the fonts of text come from; with `None`, text is in the tree
+    /// but draws nothing. Documents cannot load fonts.
+    #[cfg(feature = "text")]
+    pub fonts: Option<std::sync::Arc<dyn text::FontProvider>>,
     /// The size used when `width`/`height` are percentages without a
     /// `viewBox`.
     pub default_size: Size,
@@ -85,17 +113,29 @@ pub struct Options {
     /// Maximum elements after `use` expansion. Bounds `use` amplification
     /// ("billion laughs" through references).
     pub max_nodes: usize,
-    /// Maximum element nesting depth, counting `use` indirections.
+    /// Maximum element nesting depth, counting `use` indirections (deeper is
+    /// an error). Nesting through references (a mask in a mask) is held to
+    /// the same depth: what is deeper is dropped. The default fits a 1 MiB
+    /// stack in a release build; raise it only on a larger one.
     pub max_depth: u32,
     /// Largest embedded image decoded, in pixels.
     pub max_image_pixels: u64,
-    /// Largest canvas `width x height` accepted, in pixels (`Tree::size` is
-    /// checked against it; giant `width`/`height` attributes are an error,
-    /// not an allocation).
+    /// Largest document `width x height` accepted, in pixels; by default any
+    /// (a parsed document allocates nothing for its size, and `render` draws
+    /// at the size of the caller's pixmap). Set it to reject documents too
+    /// large for a caller that renders them at their own size.
     pub max_canvas_pixels: u64,
-    /// Cap on bytes held at once by group layers, clip and mask scratch
-    /// buffers while rendering. A group that would exceed it is skipped.
+    /// Largest decompressed size of an svgz document, in bytes.
+    pub max_svgz_bytes: u64,
+    /// Cap on bytes held at once by group layers, clip, mask and filter
+    /// scratch buffers while rendering. A group that would exceed it is
+    /// skipped.
     pub max_layer_bytes: u64,
+    /// Cap on filter work per `render` call, in pixel operations (a blur
+    /// costs about 10 per pixel, a convolution its kernel's size, a
+    /// turbulence 16 per octave; every primitive costs at least a few
+    /// thousand). A filter past it leaves its element undrawn.
+    pub max_filter_work: u64,
 }
 
 impl Default for Options {
@@ -103,14 +143,40 @@ impl Default for Options {
         Options {
             dpi: 96.0,
             font_size: 12.0,
+            font_family: "Times New Roman".to_string(),
+            #[cfg(feature = "text")]
+            fonts: None,
             default_size: Size::from_wh(100.0, 100.0).unwrap_or_else(|| unreachable!()),
             languages: vec!["en".to_string()],
             max_nodes: 500_000,
-            max_depth: 256,
+            max_depth: 1024,
             max_image_pixels: 64 * 1024 * 1024,
-            max_canvas_pixels: 1 << 28,
+            max_canvas_pixels: u64::MAX,
+            max_svgz_bytes: 1 << 28,
             max_layer_bytes: 1 << 30,
+            max_filter_work: 1 << 33,
         }
+    }
+}
+
+/// What was left out of a tree, so that a caller can say so or fall back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[non_exhaustive]
+pub struct Skipped {
+    /// `<text>` elements that draw nothing: there are no fonts, or a limit
+    /// was reached. (They are in the tree.)
+    pub text: usize,
+    /// `<image>` and `feImage` references that were not loaded: not a
+    /// `data:` URI, not a supported format, broken, or past a limit.
+    pub images: usize,
+    /// Elements dropped because a conversion limit was reached.
+    pub over_limit: usize,
+}
+
+impl Skipped {
+    /// Whether nothing was left out.
+    pub fn is_empty(&self) -> bool {
+        *self == Skipped::default()
     }
 }
 
@@ -119,24 +185,58 @@ impl Default for Options {
 pub struct Tree {
     size: Size,
     root: Group,
+    skipped: Skipped,
+    /// The elements of the document, `use` expanded.
+    node_count: usize,
     max_layer_bytes: u64,
     max_image_pixels: u64,
+    max_filter_work: u64,
 }
 
 impl Tree {
-    /// Parses SVG bytes (UTF-8 or any encoding `rusty_xml` detects).
+    /// Parses SVG bytes (UTF-8 or any encoding `rusty_xml` detects), or
+    /// gzip-compressed ones (svgz).
     pub fn from_data(data: &[u8], opt: &Options) -> Result<Tree, Error> {
+        let mut limits = image::Nested {
+            depth: 0,
+            nodes_left: opt.max_nodes,
+        };
+        Tree::parse(data, opt, &mut limits)
+    }
+
+    /// `limits` is what is left of the limits shared with the documents
+    /// around this one; what it uses is taken from them.
+    pub(crate) fn parse(
+        data: &[u8],
+        opt: &Options,
+        limits: &mut image::Nested,
+    ) -> Result<Tree, Error> {
+        if data.starts_with(&[0x1f, 0x8b]) {
+            #[cfg(feature = "svgz")]
+            {
+                let data = image::gunzip(data, opt.max_svgz_bytes).ok_or(Error::MalformedGzip)?;
+                return Tree::parse_xml(&data, opt, limits);
+            }
+            #[cfg(not(feature = "svgz"))]
+            return Err(Error::MalformedGzip);
+        }
+        Tree::parse_xml(data, opt, limits)
+    }
+
+    fn parse_xml(data: &[u8], opt: &Options, limits: &mut image::Nested) -> Result<Tree, Error> {
         let xml = svgtree::parse_xml(data)?;
         // The document borrows its attribute values from the XML DOM, which
         // therefore lives until the conversion is done.
         let doc = svgtree::build(
             &xml,
             svgtree::Limits {
-                max_nodes: opt.max_nodes,
+                max_nodes: limits.nodes_left,
                 max_depth: opt.max_depth,
             },
         )?;
-        let converted = convert::convert_doc(&doc, opt)?;
+        let node_count = doc.len();
+        limits.nodes_left = limits.nodes_left.saturating_sub(node_count);
+        let converted = convert::convert_doc(&doc, opt, limits)?;
         drop(doc);
         drop(xml);
         let s = converted.size;
@@ -146,8 +246,11 @@ impl Tree {
         Ok(Tree {
             size: s,
             root: converted.root,
+            skipped: converted.skipped,
+            node_count,
             max_layer_bytes: opt.max_layer_bytes,
             max_image_pixels: opt.max_image_pixels,
+            max_filter_work: opt.max_filter_work,
         })
     }
 
@@ -160,6 +263,36 @@ impl Tree {
     /// The canvas size in user units (after `viewBox` resolution).
     pub fn size(&self) -> Size {
         self.size
+    }
+
+    /// What the document has that the tree does not.
+    pub fn skipped(&self) -> Skipped {
+        self.skipped
+    }
+
+    /// The tree as SVG, with every style resolved. It parses to a tree that
+    /// draws the same (a filter function becomes a `<filter>`, which has a
+    /// region).
+    pub fn to_svg_string(&self, opt: &WriteOptions) -> String {
+        writer::write(self, opt)
+    }
+
+    /// The first node with an id, in paint order (also inside groups, not in
+    /// clip paths, masks or patterns).
+    pub fn node_by_id(&self, id: &str) -> Option<&Node> {
+        if id.is_empty() {
+            return None;
+        }
+        let mut stack: Vec<&Node> = self.root.children.iter().rev().collect();
+        while let Some(n) = stack.pop() {
+            if n.id() == id {
+                return Some(n);
+            }
+            if let Node::Group(g) = n {
+                stack.extend(g.children.iter().rev());
+            }
+        }
+        None
     }
 
     /// The root group.
@@ -175,6 +308,7 @@ pub fn render(tree: &Tree, transform: Transform, pixmap: &mut PixmapMut) {
         pixmap.height(),
         tree.max_layer_bytes,
         tree.max_image_pixels,
+        tree.max_filter_work,
     ) else {
         return;
     };

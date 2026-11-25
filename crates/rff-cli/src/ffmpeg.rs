@@ -101,7 +101,8 @@ fn print_help() {
     println!("  -g N               keyframe interval in frames");
     println!("  -vf FILTERS        video filter graph (e.g. scale=640:480, crop=W:H:X:Y)");
     println!("  -pix_fmt FMT       encoder pixel format (e.g. yuv420p, yuv444p, yuv420p10le)");
-    println!("  -map SPEC          select streams: INPUT[:v|:a|:N] (repeatable)");
+    println!("  -map SPEC          select streams: INPUT[:v|:a|:d|:N] (repeatable)");
+    println!("  -map_chapters N    take chapters from input N (-1: none)");
     println!("  -vn / -an / -sn    drop video / audio / subtitle streams from the output");
     println!("  -y / -n            overwrite / never overwrite the output");
     println!("  -codecs            list supported codecs");

@@ -1,0 +1,38 @@
+[package]
+name = "rusty_jbig2"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+authors = ["Mata Network <https://www.mata.network>"]
+description = "Pure-Rust JBIG2 (ITU-T T.88) decoder: generic, refinement, text and halftone regions, arithmetic, Huffman and MMR coding, PDF embedded streams with globals and standalone files. Bounded memory and work; malformed input errors, never panics. No dependencies, no unsafe."
+readme = "README.md"
+keywords = ["jbig2", "pdf", "bilevel", "image", "decoder"]
+categories = ["multimedia::images", "compression"]
+# Test streams are third-party (see tests/data/README.md) and stay in the
+# repository; the published package is the library.
+include = ["/LICENSE", "/README.md", "/src/"]
+
+[dependencies]
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Narrowing casts are made after explicit range checks on untrusted values; the
+# remaining ones are bounded by construction (bit fields, checked sizes).
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
+module_name_repetitions = "allow"
+too_many_lines = "allow"
+similar_names = "allow"
+many_single_char_names = "allow"
+missing_errors_doc = "allow"
+unreadable_literal = "allow"
+struct_excessive_bools = "allow"
+match_same_arms = "allow"
+precedence = "allow"
+too_many_arguments = "allow"
+verbose_bit_mask = "allow"

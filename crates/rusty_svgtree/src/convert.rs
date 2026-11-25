@@ -9,27 +9,29 @@ use rusty_raster::{
     PathStroker, Rect, Size, SpreadMode, Transform,
 };
 
+use crate::filter::Filter;
+use crate::image::Nested;
 use crate::svgtree::{AId, Document, EId, NodeId, SvgNode};
 use crate::tree::{
-    BaseGradient, ClipPath, Color, Fill, Group, Image, ImageKind, LinearGradient, Mask, Node,
-    Paint, PaintOrder, Path, Pattern, RadialGradient, Stop, Stroke,
+    BaseGradient, ClipPath, Color, ContextElement, Fill, Group, Image, ImageKind, LinearGradient,
+    Mask, Node, Paint, PaintOrder, Path, Pattern, RadialGradient, Stop, Stroke,
 };
 use crate::values::{self, Align, AspectRatio, Length, Seg, Unit};
-use crate::{Error, Options};
+use crate::{Error, Options, Skipped};
 
 /// Coordinate system of a paint server, clip path or mask.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Units {
+pub(crate) enum Units {
     UserSpaceOnUse,
     ObjectBoundingBox,
 }
 
 #[derive(Clone)]
-struct State<'a> {
+pub(crate) struct State<'a> {
     in_clip_path: bool,
     view_box: NonZeroRect,
     use_size: (Option<f32>, Option<f32>),
-    opt: &'a Options,
+    pub(crate) opt: &'a Options,
     /// Markers being instantiated (a marker cannot contain itself).
     parent_markers: Vec<NodeId>,
     /// The paints `context-fill` / `context-stroke` resolve to.
@@ -37,17 +39,36 @@ struct State<'a> {
 }
 
 #[derive(Default)]
-struct Cache {
+pub(crate) struct Cache {
     clip_paths: HashMap<NodeId, Arc<ClipPath>>,
     masks: HashMap<NodeId, Arc<Mask>>,
-    /// Clip paths / masks / patterns being converted: a reference back into
-    /// one of them is a cycle and is treated as `none`.
-    active: Vec<NodeId>,
+    pub(crate) filters: HashMap<NodeId, Arc<Filter>>,
+    /// Clip paths / masks / patterns / filters being converted: a reference
+    /// back into one of them is a cycle and is treated as `none`.
+    pub(crate) active: Vec<NodeId>,
     /// Elements converted so far, across every re-conversion of shared
     /// content (`objectBoundingBox` clip paths, patterns, markers): bounds
     /// the output tree, which bounds render work.
     work: usize,
     max_work: usize,
+    /// Images already loaded, by where the `href` text lies (a `use` copy
+    /// shares its original's).
+    images: HashMap<(usize, usize), Option<(ImageKind, Size)>>,
+    nested: Option<Nested>,
+    pub(crate) skipped: Skipped,
+    /// How deep conversion is, through `use`, clip paths, masks, patterns,
+    /// markers and `feImage` together, and its maximum: bounds the stack here
+    /// and in the renderer, which recurses over what is converted.
+    depth: u32,
+    max_depth: u32,
+    /// Byte-spans shaped so far.
+    #[cfg(feature = "text")]
+    text_work: u64,
+    /// Glyph drawings, by what they depend on.
+    #[cfg(feature = "text")]
+    pub(crate) glyphs: HashMap<crate::text_layout::DrawingKey, Option<crate::text_layout::Drawing>>,
+    /// Whether a paint still has to be resolved against its `use` element.
+    has_context: bool,
     /// The builder every shape is built in, kept with its capacity: a shape
     /// grows it only past the largest one before it, and leaves as an
     /// exactly sized copy (see `Cache::finish_path`).
@@ -72,9 +93,134 @@ const PRESIZE_MIN_BYTES: usize = 1 << 16;
 
 impl Cache {
     /// Spends one unit of conversion work; `false` once the budget is gone.
-    fn spend(&mut self) -> bool {
-        self.work += 1;
-        self.work <= self.max_work
+    pub(crate) fn spend(&mut self) -> bool {
+        self.spend_many(1)
+    }
+
+    /// Spends `n` units of conversion work.
+    pub(crate) fn spend_many(&mut self, n: usize) -> bool {
+        self.work = self.work.saturating_add(n);
+        if self.work > self.max_work {
+            self.skipped.over_limit += 1;
+            return false;
+        }
+        true
+    }
+
+    /// Loads an image reference, once per `href` text.
+    pub(crate) fn load_image(&mut self, href: &str, opt: &Options) -> Option<(ImageKind, Size)> {
+        let key = (href.as_ptr() as usize, href.len());
+        let loaded = match self.images.get(&key) {
+            Some(i) => i.clone(),
+            None => {
+                let nested = self.nested.as_mut()?;
+                let image = crate::image::load_href(href, opt, nested);
+                self.images.insert(key, image.clone());
+                image
+            }
+        };
+        // Every use of an embedded document is as much to draw as its
+        // elements.
+        let loaded = loaded.filter(|(kind, _)| match kind {
+            ImageKind::Svg(t) => self.spend_many(t.node_count),
+            _ => true,
+        });
+        if loaded.is_none() {
+            self.skipped.images += 1;
+        }
+        loaded
+    }
+
+    /// Resolves a path's paints against its box, or against the context
+    /// element they come from; a paint that cannot apply is dropped.
+    pub(crate) fn resolve_path_paints(
+        &mut self,
+        fill: &mut Option<Fill>,
+        stroke: &mut Option<Stroke>,
+        bbox: Rect,
+        path_ts: Transform,
+    ) {
+        if let Some(f) = fill {
+            if !self.resolve_paint(&mut f.paint, &mut f.context, bbox, path_ts) {
+                *fill = None;
+            }
+        }
+        if let Some(s) = stroke {
+            if !self.resolve_paint(&mut s.paint, &mut s.context, bbox, path_ts) {
+                *stroke = None;
+            }
+        }
+    }
+
+    fn resolve_paint(
+        &mut self,
+        paint: &mut Paint,
+        context: &mut Option<Box<ContextElement>>,
+        bbox: Rect,
+        path_ts: Transform,
+    ) -> bool {
+        match context.as_deref().copied() {
+            None => paint_to_user_space(paint, bbox),
+            Some(ContextElement::Path(ts, bbox)) => {
+                *context = None;
+                process_context_paint(paint, ts, bbox.map(|b| b.to_rect()), path_ts)
+            }
+            Some(ContextElement::Use) => {
+                // Once the box of the `use` element is known.
+                self.has_context = true;
+                true
+            }
+        }
+    }
+
+    /// The box of a path's stroke.
+    pub(crate) fn stroke_box(
+        &mut self,
+        data: &rusty_raster::Path,
+        stroke: Option<&Stroke>,
+    ) -> Option<Rect> {
+        let mut rs = stroke?.to_raster();
+        rs.dash = None;
+        self.stroker.stroke(data, &rs, 1.0)?.compute_tight_bounds()
+    }
+
+    /// Spends text layout work; `false` once the budget is gone.
+    #[cfg(feature = "text")]
+    pub(crate) fn spend_text_work(&mut self, n: u64) -> bool {
+        self.text_work = self.text_work.saturating_add(n);
+        self.text_work <= crate::text_layout::MAX_SHAPE_WORK
+    }
+
+    /// The content of an SVG glyph, and how many elements it has.
+    #[cfg(feature = "text")]
+    pub(crate) fn glyph_document(
+        &mut self,
+        data: &[u8],
+        id: Option<&str>,
+        opt: &Options,
+    ) -> Option<(Group, usize)> {
+        let limits = self.nested.as_mut()?;
+        let mut inner = Nested {
+            depth: limits.depth + 1,
+            ..*limits
+        };
+        // A glyph's own text would need fonts again.
+        let opt = Options {
+            fonts: None,
+            ..opt.clone()
+        };
+        let tree = crate::Tree::parse(data, &opt, &mut inner);
+        limits.nodes_left = inner.nodes_left;
+        let tree = tree.ok()?;
+        let nodes = tree.node_count;
+        let Some(id) = id else {
+            return Some((tree.root, nodes));
+        };
+        let node = tree.node_by_id(id)?.clone();
+        let mut g = Group::default();
+        g.children.push(node);
+        g.calculate_bounding_boxes();
+        Some((g, nodes))
     }
 
     /// The (empty) builder to build a shape in.
@@ -126,7 +272,7 @@ impl Cache {
 
 /// Maximum nesting of clip-path / mask / pattern references being resolved
 /// at once (each level is a real reference, cycles are broken separately).
-const MAX_REF_DEPTH: usize = 32;
+pub(crate) const MAX_REF_DEPTH: usize = 32;
 
 fn ts_from_matrix(m: values::Matrix) -> Transform {
     Transform::from_row(
@@ -137,6 +283,29 @@ fn ts_from_matrix(m: values::Matrix) -> Transform {
         m[4] as f32,
         m[5] as f32,
     )
+}
+
+impl State<'_> {
+    /// A node's id; content made by a marker has none, or it would repeat.
+    pub(crate) fn element_id(&self, node: SvgNode) -> String {
+        if self.parent_markers.is_empty() {
+            node.element_id().to_string()
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// An attribute's list of lengths, in user units, up to its first malformed
+/// one.
+pub(crate) fn length_list_attr(node: SvgNode, name: AId, state: &State) -> Vec<f32> {
+    let Some(v) = node.attribute(name) else {
+        return Vec::new();
+    };
+    values::length_list_prefix(v)
+        .into_iter()
+        .map(|l| convert_length(l, node, name, Units::UserSpaceOnUse, state))
+        .collect()
 }
 
 impl<'a> SvgNode<'a> {
@@ -167,7 +336,7 @@ impl<'a> SvgNode<'a> {
         NonZeroRect::from_xywh(vb[0] as f32, vb[1] as f32, vb[2] as f32, vb[3] as f32)
     }
 
-    fn aspect(&self) -> AspectRatio {
+    pub(crate) fn aspect(&self) -> AspectRatio {
         self.attribute(AId::PreserveAspectRatio)
             .and_then(values::aspect_ratio)
             .unwrap_or_default()
@@ -175,7 +344,7 @@ impl<'a> SvgNode<'a> {
 
     /// A transform attribute; invalid (non-finite or degenerate) becomes
     /// identity, as usvg does. `transform-origin` is applied.
-    fn resolve_transform(&self, name: AId, state: &State) -> Transform {
+    pub(crate) fn resolve_transform(&self, name: AId, state: &State) -> Transform {
         let mut ts = match self.attribute(name).and_then(values::transform) {
             Some(m) => {
                 let t = ts_from_matrix(m);
@@ -208,37 +377,68 @@ impl<'a> SvgNode<'a> {
         }
     }
 
-    fn is_visible_element(&self, opt: &Options) -> bool {
+    pub(crate) fn is_visible_element(&self, opt: &Options) -> bool {
         self.attribute(AId::Display).map(values::trim) != Some("none")
             && self.has_valid_transform(AId::Transform)
             && switch_condition_passed(*self, opt)
     }
 }
 
+/// The x and y offsets of a `transform-origin` (the z offset is parsed and
+/// dropped), as svgtypes reads it: one keyword names its own axis, and two
+/// values may come in either order when a keyword says which is which.
 fn parse_transform_origin(text: &str) -> Option<(Length, Length)> {
-    let words: Vec<&str> = text.split_ascii_whitespace().collect();
-    let kw = |w: &str| -> Option<Length> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Axis {
+        X,
+        Y,
+        Either,
+    }
+    let part = |w: &str| -> Option<(Length, Axis)> {
+        let percent = |n: f64, axis: Axis| (Length::new(n, Unit::Percent), axis);
         Some(match w {
-            "left" | "top" => Length::new(0.0, Unit::Percent),
-            "center" => Length::new(50.0, Unit::Percent),
-            "right" | "bottom" => Length::new(100.0, Unit::Percent),
-            _ => values::length(w)?,
+            "left" => percent(0.0, Axis::X),
+            "right" => percent(100.0, Axis::X),
+            "top" => percent(0.0, Axis::Y),
+            "bottom" => percent(100.0, Axis::Y),
+            "center" => percent(50.0, Axis::Either),
+            _ => (values::length(w)?, Axis::Either),
         })
     };
-    match words.as_slice() {
-        [x] => Some((kw(x)?, Length::new(50.0, Unit::Percent))),
-        [x, y] | [x, y, _] => {
-            if matches!(*x, "top" | "bottom") || matches!(*y, "left" | "right") {
-                Some((kw(y)?, kw(x)?))
-            } else {
-                Some((kw(x)?, kw(y)?))
-            }
+    let mut words = text
+        .split(|c: char| c.is_ascii_whitespace() || c == ',')
+        .filter(|w| !w.is_empty());
+    let center = Length::new(50.0, Unit::Percent);
+    let a = part(words.next()?)?;
+    let Some(b) = words.next() else {
+        return Some(if a.1 == Axis::Y {
+            (center, a.0)
+        } else {
+            (a.0, center)
+        });
+    };
+    let b = part(b)?;
+    if let Some(z) = words.next() {
+        if values::length(z)?.unit == Unit::Percent || words.next().is_some() {
+            return None;
         }
-        _ => None,
+    }
+    if a.1 != Axis::Y && b.1 != Axis::X {
+        Some((a.0, b.0))
+    } else if a.1 != Axis::X && b.1 != Axis::Y {
+        Some((b.0, a.0))
+    } else {
+        None
     }
 }
 
-fn convert_length(length: Length, node: SvgNode, name: AId, units: Units, state: &State) -> f32 {
+pub(crate) fn convert_length(
+    length: Length,
+    node: SvgNode,
+    name: AId,
+    units: Units,
+    state: &State,
+) -> f32 {
     let dpi = state.opt.dpi;
     let n = length.number as f32;
     match length.unit {
@@ -257,6 +457,7 @@ fn convert_length(length: Length, node: SvgNode, name: AId, units: Units, state:
                 let vb = state.view_box;
                 match name {
                     AId::Cx
+                    | AId::Dx
                     | AId::Fx
                     | AId::MarkerWidth
                     | AId::RefX
@@ -266,6 +467,7 @@ fn convert_length(length: Length, node: SvgNode, name: AId, units: Units, state:
                     | AId::X1
                     | AId::X2 => vb.width() * n / 100.0,
                     AId::Cy
+                    | AId::Dy
                     | AId::Fy
                     | AId::Height
                     | AId::MarkerHeight
@@ -284,10 +486,10 @@ fn convert_length(length: Length, node: SvgNode, name: AId, units: Units, state:
     }
 }
 
-fn resolve_font_size(node: SvgNode, state: &State) -> f32 {
+pub(crate) fn resolve_font_size(node: SvgNode, state: &State) -> f32 {
     let nodes: Vec<SvgNode> = node.ancestors().collect();
     let mut font_size = state.opt.font_size;
-    for n in nodes.iter().rev().skip(1) {
+    for n in nodes.iter().rev() {
         let Some(v) = n.attribute(AId::FontSize) else {
             continue;
         };
@@ -433,9 +635,14 @@ fn aligned_pos(align: Align, x: f32, y: f32, w: f32, h: f32) -> (f32, f32) {
 pub(crate) struct Converted {
     pub size: Size,
     pub root: Group,
+    pub skipped: Skipped,
 }
 
-pub(crate) fn convert_doc(doc: &Document, opt: &Options) -> Result<Converted, Error> {
+pub(crate) fn convert_doc(
+    doc: &Document,
+    opt: &Options,
+    limits: &mut Nested,
+) -> Result<Converted, Error> {
     let svg = doc.root_element().ok_or(Error::NotAnSvg)?;
     let (size, restore_viewbox) = resolve_svg_size(svg, opt);
     let size = size?;
@@ -446,7 +653,11 @@ pub(crate) fn convert_doc(doc: &Document, opt: &Options) -> Result<Converted, Er
 
     let mut root = Group::default();
     if !svg.is_visible_element(opt) {
-        return Ok(Converted { size, root });
+        return Ok(Converted {
+            size,
+            root,
+            skipped: Skipped::default(),
+        });
     }
     let state = State {
         in_clip_path: false,
@@ -458,6 +669,9 @@ pub(crate) fn convert_doc(doc: &Document, opt: &Options) -> Result<Converted, Er
     };
     let mut cache = Cache {
         max_work: opt.max_nodes.saturating_mul(8),
+        nested: Some(*limits),
+        // A document just within the limit also has the groups made for it.
+        max_depth: opt.max_depth.saturating_add(48),
         ..Cache::default()
     };
     let root_ts = view_box_to_transform(view_box, aspect, size);
@@ -474,6 +688,7 @@ pub(crate) fn convert_doc(doc: &Document, opt: &Options) -> Result<Converted, Er
     } else {
         let mut g = Group {
             transform: root_ts,
+            abs_transform: root_ts,
             ..Group::default()
         };
         if let Some(c) = background {
@@ -498,6 +713,16 @@ pub(crate) fn convert_doc(doc: &Document, opt: &Options) -> Result<Converted, Er
         root.children.push(Node::Group(Box::new(g)));
     }
     root.calculate_bounding_boxes();
+    if cache.has_context {
+        // Everything shared is only held by the tree now.
+        cache.clip_paths.clear();
+        cache.masks.clear();
+        cache.filters.clear();
+        resolve_context_paints(&mut root, Transform::identity(), None);
+    }
+    if let Some(n) = cache.nested {
+        *limits = n;
+    }
     let mut size = size;
     if restore_viewbox {
         if let Some(bbox) = root.bounding_box {
@@ -506,7 +731,11 @@ pub(crate) fn convert_doc(doc: &Document, opt: &Options) -> Result<Converted, Er
             }
         }
     }
-    Ok(Converted { size, root })
+    Ok(Converted {
+        size,
+        root,
+        skipped: cache.skipped,
+    })
 }
 
 fn resolve_svg_size(svg: SvgNode, opt: &Options) -> (Result<Size, Error>, bool) {
@@ -573,13 +802,35 @@ fn convert_children(parent_node: SvgNode, state: &State, cache: &mut Cache, pare
     }
 }
 
-fn convert_element(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut Group) {
+pub(crate) fn convert_element(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut Group) {
     let Some(tag) = node.tag_name() else {
         return;
     };
     if !cache.spend() {
         return;
     }
+    if cache.depth >= cache.max_depth {
+        cache.skipped.over_limit += 1;
+        return;
+    }
+    // A nested document or `use` takes several times the stack of a group.
+    let weight = if matches!(tag, EId::Svg | EId::Use) {
+        4
+    } else {
+        1
+    };
+    cache.depth += weight;
+    convert_element_at_depth(tag, node, state, cache, parent);
+    cache.depth -= weight;
+}
+
+fn convert_element_at_depth(
+    tag: EId,
+    node: SvgNode,
+    state: &State,
+    cache: &mut Cache,
+    parent: &mut Group,
+) {
     if !tag.is_graphic() && !matches!(tag, EId::G | EId::Switch | EId::Svg) {
         return;
     }
@@ -600,7 +851,7 @@ fn convert_element(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut
         if let Some(g) = convert_group_into(node, state, false, cache, parent, &mut |cache, g| {
             convert_element(child, state, cache, g);
         }) {
-            parent.children.push(Node::Group(Box::new(g)));
+            parent.children.push(Node::Group(g));
         }
         return;
     }
@@ -611,7 +862,7 @@ fn convert_element(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut
     if let Some(g) = convert_group_into(node, state, false, cache, parent, &mut |cache, g| {
         convert_element_impl(tag, node, state, cache, g);
     }) {
-        parent.children.push(Node::Group(Box::new(g)));
+        parent.children.push(Node::Group(g));
     }
 }
 
@@ -630,14 +881,21 @@ fn convert_element_impl(
         | EId::Polyline
         | EId::Polygon
         | EId::Path => {
-            if let Some(path) = convert_shape(node, state, cache) {
-                convert_path(node, path, state, cache, parent);
-            }
+            convert_shape_element(node, state, cache, parent);
         }
-        EId::Image => convert_image(node, state, parent),
+        EId::Image => convert_image(node, state, cache, parent),
         EId::Svg | EId::G => convert_children(node, state, cache, parent),
-        // Text is deferred (see README); filters are not graphics elements.
+        EId::Text => crate::text_convert::convert(node, state, cache, parent),
         _ => {}
+    }
+}
+
+// The functions a level of nesting does not need on the stack stay out of
+// line: the ones that recurse have small frames.
+#[inline(never)]
+fn convert_shape_element(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut Group) {
+    if let Some(path) = convert_shape(node, state, cache) {
+        convert_path(node, path, state, cache, parent);
     }
 }
 
@@ -652,8 +910,14 @@ fn convert_clip_path_elements(clip: SvgNode, state: &State, cache: &mut Cache, p
         if !tag.is_graphic() || !node.is_visible_element(state.opt) {
             continue;
         }
+        if cache.depth >= cache.max_depth {
+            cache.skipped.over_limit += 1;
+            return;
+        }
         if tag == EId::Use {
+            cache.depth += 4;
             convert_use(node, state, cache, parent);
+            cache.depth -= 4;
             continue;
         }
         if let Some(g) = convert_group_into(node, state, false, cache, parent, &mut |cache, g| {
@@ -661,12 +925,12 @@ fn convert_clip_path_elements(clip: SvgNode, state: &State, cache: &mut Cache, p
                 tag,
                 EId::Rect | EId::Circle | EId::Ellipse | EId::Polyline | EId::Polygon | EId::Path
             ) {
-                if let Some(path) = convert_shape(node, state, cache) {
-                    convert_path(node, path, state, cache, g);
-                }
+                convert_shape_element(node, state, cache, g);
+            } else if tag == EId::Text {
+                crate::text_convert::convert(node, state, cache, g);
             }
         }) {
-            parent.children.push(Node::Group(Box::new(g)));
+            parent.children.push(Node::Group(g));
         }
     }
 }
@@ -683,7 +947,42 @@ fn convert_group_into(
     cache: &mut Cache,
     parent: &mut Group,
     collect: &mut dyn FnMut(&mut Cache, &mut Group),
-) -> Option<Group> {
+) -> Option<Box<Group>> {
+    let Some(mut opened) = open_group(node, state, force, parent) else {
+        // Nothing of its own to hold: the content is the parent's as it
+        // stands, in the same order.
+        collect(cache, parent);
+        return None;
+    };
+    collect(cache, &mut opened.group);
+    close_group(node, state, cache, parent, opened)
+}
+
+/// A group whose content is being converted.
+struct OpenGroup {
+    group: Box<Group>,
+    /// It stays a group whatever its references come to.
+    required: bool,
+    /// It has a clip path, a mask or a filter to convert once its box is
+    /// known.
+    has_refs: bool,
+}
+
+fn has_filter(node: SvgNode, state: &State) -> bool {
+    !state.in_clip_path && node.attribute(AId::Filter).is_some_and(|f| f != "none")
+}
+
+fn mask_link<'a>(node: SvgNode<'a>, state: &State) -> Option<SvgNode<'a>> {
+    if state.in_clip_path {
+        None
+    } else {
+        node.func_iri_attribute(AId::Mask)
+    }
+}
+
+/// The group for `node`, or `None` when it needs none.
+#[inline(never)]
+fn open_group(node: SvgNode, state: &State, force: bool, parent: &Group) -> Option<OpenGroup> {
     let opacity = if state.in_clip_path {
         1.0
     } else {
@@ -702,62 +1001,65 @@ fn convert_group_into(
         || isolate
         || is_g_or_use
         || force;
-
-    let clip_link = node.func_iri_attribute(AId::ClipPath);
-    let mask_link = if state.in_clip_path {
-        None
-    } else {
-        node.func_iri_attribute(AId::Mask)
-    };
-    // Filters are not implemented: a reference to a missing element
-    // disables rendering (as the spec and usvg require); a valid filter
-    // is ignored and the content drawn unfiltered (documented).
-    let filter_missing = !state.in_clip_path
-        && node.attribute(AId::Filter).is_some_and(|f| {
-            f.trim() != "none"
-                && values::func_iri(f).is_some()
-                && node.func_iri_attribute(AId::Filter).is_none()
-        });
-
-    if !required && clip_link.is_none() && mask_link.is_none() && !filter_missing {
-        // Nothing of its own to hold: the content is the parent's as it
-        // stands, in the same order.
-        collect(cache, parent);
+    let has_refs = node.func_iri_attribute(AId::ClipPath).is_some()
+        || mask_link(node, state).is_some()
+        || has_filter(node, state);
+    if !required && !has_refs {
         return None;
     }
+    Some(OpenGroup {
+        group: Box::new(Group {
+            id: if is_g_or_use {
+                state.element_id(node)
+            } else {
+                String::new()
+            },
+            transform,
+            abs_transform: parent.abs_transform.pre_concat(transform),
+            opacity,
+            blend_mode,
+            isolate,
+            ..Group::default()
+        }),
+        required,
+        has_refs,
+    })
+}
 
-    let mut g = Group {
-        transform,
-        opacity,
-        blend_mode,
-        isolate,
-        ..Group::default()
-    };
-    collect(cache, &mut g);
-
-    let mut clip_path = None;
-    let mut mask = None;
-    if clip_link.is_some() || mask_link.is_some() {
+/// Converts the group's references and finishes it; `None` drops it.
+#[inline(never)]
+fn close_group(
+    node: SvgNode,
+    state: &State,
+    cache: &mut Cache,
+    parent: &mut Group,
+    opened: OpenGroup,
+) -> Option<Box<Group>> {
+    let mut g = opened.group;
+    if opened.has_refs {
         let object_bbox = g.calculate_object_bbox();
-        if let Some(link) = clip_link {
-            clip_path = convert_clip_path(link, state, object_bbox, cache);
-            clip_path.as_ref()?;
+        if let Some(link) = node.func_iri_attribute(AId::ClipPath) {
+            g.clip_path = Some(convert_clip_path(link, state, object_bbox, cache)?);
         }
-        if let Some(link) = mask_link {
-            mask = convert_mask(link, state, object_bbox, cache);
-            mask.as_ref()?;
+        if let Some(link) = mask_link(node, state) {
+            g.mask = Some(convert_mask(link, state, object_bbox, cache)?);
+        }
+        if has_filter(node, state) {
+            // Unlike a clip path or mask, an invalid filter drops the
+            // element.
+            g.filters = crate::filter_convert::convert(node, state, object_bbox, cache).ok()?;
+        }
+        if !opened.required && g.clip_path.is_none() && g.mask.is_none() && g.filters.is_empty() {
+            // The filter value came to nothing.
+            parent.children.append(&mut g.children);
+            return None;
         }
     }
-    if filter_missing {
-        return None;
-    }
-    g.clip_path = clip_path;
-    g.mask = mask;
     g.calculate_bounding_boxes();
     Some(g)
 }
 
-fn parse_blend_mode(v: &str) -> Option<BlendMode> {
+pub(crate) fn parse_blend_mode(v: &str) -> Option<BlendMode> {
     Some(match v.trim() {
         "normal" => BlendMode::SourceOver,
         "multiply" => BlendMode::Multiply,
@@ -781,7 +1083,8 @@ fn parse_blend_mode(v: &str) -> Option<BlendMode> {
 
 // ---------------------------------------------------------------- shapes --
 
-fn convert_shape(
+#[inline(never)]
+pub(crate) fn convert_shape(
     node: SvgNode,
     state: &State,
     cache: &mut Cache,
@@ -960,6 +1263,7 @@ fn ellipse_to_path(
 
 // ----------------------------------------------------------------- paths --
 
+#[inline(never)]
 fn convert_path(
     node: SvgNode,
     data: Arc<rusty_raster::Path>,
@@ -996,31 +1300,30 @@ fn convert_path(
     }
     // objectBoundingBox paint servers to user space (usvg does this in a
     // second pass; the result is the same for paths).
-    if let Some(f) = fill.as_mut() {
-        if !paint_to_user_space(&mut f.paint, bounding_box) {
-            fill = None;
-        }
-    }
-    if let Some(s) = stroke.as_mut() {
-        if !paint_to_user_space(&mut s.paint, bounding_box) {
-            stroke = None;
-        }
-    }
-    let stroke_bounding_box = stroke
-        .as_ref()
-        .and_then(|s| {
-            let mut rs = s.to_raster();
-            rs.dash = None;
-            cache
-                .stroker
-                .stroke(&data, &rs, 1.0)?
-                .compute_tight_bounds()
-        })
+    cache.resolve_path_paints(&mut fill, &mut stroke, bounding_box, parent.abs_transform);
+    let stroke_bounding_box = cache
+        .stroke_box(&data, stroke.as_ref())
         .unwrap_or(bounding_box);
     let markers = if visible_attr && !state.in_clip_path && has_markers(node) {
-        let mut g = Group::default();
+        let mut g = Group {
+            abs_transform: parent.abs_transform,
+            ..Group::default()
+        };
         let mut ms = state.clone();
-        ms.context = Some((fill.clone(), stroke.clone()));
+        // What the markers' context paints resolve against (a paint of this
+        // path that itself waits for its `use` element keeps waiting).
+        let own = || {
+            let bbox = bounding_box.to_non_zero_rect();
+            Some(Box::new(ContextElement::Path(parent.abs_transform, bbox)))
+        };
+        let mut context = (fill.clone(), stroke.clone());
+        if let Some(f) = context.0.as_mut() {
+            f.context = f.context.take().or_else(own);
+        }
+        if let Some(s) = context.1.as_mut() {
+            s.context = s.context.take().or_else(own);
+        }
+        ms.context = Some(context);
         convert_markers(node, &data, &ms, cache, &mut g);
         g.calculate_bounding_boxes();
         Some(g)
@@ -1028,6 +1331,8 @@ fn convert_path(
         None
     };
     let path = Path {
+        id: state.element_id(node),
+        abs_transform: parent.abs_transform,
         visible,
         fill,
         stroke,
@@ -1053,6 +1358,7 @@ fn convert_path(
                 a.fill = None;
                 b.stroke = None;
             }
+            b.id = String::new();
             a.visible = a.visible && (a.fill.is_some() || a.stroke.is_some());
             b.visible = b.visible && (b.fill.is_some() || b.stroke.is_some());
             parent.children.push(Node::Path(Box::new(a)));
@@ -1084,6 +1390,7 @@ fn has_markers(node: SvgNode) -> bool {
         .any(|n| marker_link(node, *n).is_some())
 }
 
+#[inline(never)]
 fn convert_markers(
     node: SvgNode,
     data: &rusty_raster::Path,
@@ -1146,12 +1453,13 @@ fn convert_markers(
             };
             let mut g = Group {
                 transform: ts,
+                abs_transform: parent.abs_transform.pre_concat(ts),
                 clip_path: clip.clone(),
                 ..Group::default()
             };
             convert_children(mnode, &ms, cache, &mut g);
             g.calculate_bounding_boxes();
-            if !g.children.is_empty() {
+            if g.has_content() {
                 parent.children.push(Node::Group(Box::new(g)));
             }
         });
@@ -1169,6 +1477,11 @@ fn parse_angle(v: &str) -> Option<f32> {
         _ => return None,
     };
     Some(deg as f32)
+}
+
+/// `paint-order`, without markers.
+pub(crate) fn paint_order(v: &str) -> PaintOrder {
+    parse_paint_order(v).0
 }
 
 fn parse_paint_order(v: &str) -> (PaintOrder, usize) {
@@ -1260,7 +1573,7 @@ fn paint_to_user_space(paint: &mut Paint, bbox: Rect) -> bool {
 
 /// `NonZeroRect::bbox_transform` without its internal `unwrap` (it panics
 /// when the result overflows, which hostile units can arrange).
-fn bbox_transform(r: NonZeroRect, bbox: NonZeroRect) -> Option<NonZeroRect> {
+pub(crate) fn bbox_transform(r: NonZeroRect, bbox: NonZeroRect) -> Option<NonZeroRect> {
     NonZeroRect::from_xywh(
         r.x() * bbox.width() + bbox.x(),
         r.y() * bbox.height() + bbox.y(),
@@ -1294,7 +1607,13 @@ fn push_pattern_transform(root: &mut Group, transform: Transform) {
 
 // ----------------------------------------------------------------- style --
 
-fn resolve_fill(node: SvgNode, has_bbox: bool, state: &State, cache: &mut Cache) -> Option<Fill> {
+#[inline(never)]
+pub(crate) fn resolve_fill(
+    node: SvgNode,
+    has_bbox: bool,
+    state: &State,
+    cache: &mut Cache,
+) -> Option<Fill> {
     let rule = |n: SvgNode, attr: AId| match n.find_attribute(attr).map(values::trim) {
         Some("evenodd") => FillRule::EvenOdd,
         _ => FillRule::Winding,
@@ -1308,11 +1627,14 @@ fn resolve_fill(node: SvgNode, has_bbox: bool, state: &State, cache: &mut Cache)
             }),
             opacity: 1.0,
             rule: rule(node, AId::ClipRule),
+            context: None,
         });
     }
     let mut sub_opacity = 1.0;
+    let mut context = None;
     let paint = if let Some(n) = node.ancestor_with_attribute(AId::Fill) {
         let value = n.attribute(AId::Fill)?;
+        context = context_of(value, state);
         convert_paint(node, value, true, has_bbox, state, &mut sub_opacity, cache)?
     } else {
         Paint::Color(Color {
@@ -1329,10 +1651,12 @@ fn resolve_fill(node: SvgNode, has_bbox: bool, state: &State, cache: &mut Cache)
         paint,
         opacity: sub_opacity * fill_opacity,
         rule: rule(node, AId::FillRule),
+        context,
     })
 }
 
-fn resolve_stroke(
+#[inline(never)]
+pub(crate) fn resolve_stroke(
     node: SvgNode,
     has_bbox: bool,
     state: &State,
@@ -1344,6 +1668,7 @@ fn resolve_stroke(
     let mut sub_opacity = 1.0;
     let n = node.ancestor_with_attribute(AId::Stroke)?;
     let value = n.attribute(AId::Stroke)?;
+    let context = context_of(value, state);
     let paint = convert_paint(node, value, false, has_bbox, state, &mut sub_opacity, cache)?;
     let width = resolve_length(node, AId::StrokeWidth, state, 1.0);
     if !(width.is_finite() && width > 0.0) {
@@ -1379,11 +1704,12 @@ fn resolve_stroke(
         linejoin,
         dasharray: conv_dasharray(node, state),
         dashoffset: resolve_length(node, AId::StrokeDashoffset, state, 0.0),
+        context,
     })
 }
 
 /// An inherited length (`stroke-width`, `stroke-dashoffset`).
-fn resolve_length(node: SvgNode, name: AId, state: &State, def: f32) -> f32 {
+pub(crate) fn resolve_length(node: SvgNode, name: AId, state: &State, def: f32) -> f32 {
     if let Some(n) = node.ancestor_with_attribute(name) {
         if let Some(l) = n.length_attr(name) {
             return convert_length(l, n, name, Units::UserSpaceOnUse, state);
@@ -1414,13 +1740,13 @@ fn conv_dasharray(node: SvgNode, state: &State) -> Option<Vec<f32>> {
     Some(list)
 }
 
-fn current_color(node: SvgNode) -> values::Color {
+pub(crate) fn current_color(node: SvgNode) -> values::Color {
     node.find_attribute(AId::Color)
         .and_then(values::color)
         .unwrap_or(values::Color::BLACK)
 }
 
-fn split(c: values::Color, opacity: &mut f32) -> Color {
+pub(crate) fn split(c: values::Color, opacity: &mut f32) -> Color {
     *opacity = f32::from(c.a) / 255.0;
     Color {
         red: c.r,
@@ -1450,16 +1776,14 @@ fn convert_paint(
     };
     match paint {
         values::Paint::None => None,
-        // Context paints: solid colours are carried over; context gradients
-        // and patterns are not (documented).
-        values::Paint::ContextFill => match state.context.as_ref()?.0.as_ref()?.paint {
-            Paint::Color(c) => Some(Paint::Color(c)),
-            _ => None,
-        },
-        values::Paint::ContextStroke => match state.context.as_ref()?.1.as_ref()?.paint {
-            Paint::Color(c) => Some(Paint::Color(c)),
-            _ => None,
-        },
+        values::Paint::ContextFill => {
+            let fill = state.context.as_ref()?.0.as_ref()?;
+            Some(fill.paint.clone())
+        }
+        values::Paint::ContextStroke => {
+            let stroke = state.context.as_ref()?.1.as_ref()?;
+            Some(stroke.paint.clone())
+        }
         values::Paint::CurrentColor => Some(Paint::Color(split(current_color(node), opacity))),
         values::Paint::Color(c) => Some(Paint::Color(split(c, opacity))),
         values::Paint::Url(id, fallback) => {
@@ -1483,6 +1807,159 @@ fn convert_paint(
                     Some(Paint::Color(c))
                 }
                 None => from_fallback(node, fallback, opacity),
+            }
+        }
+    }
+}
+
+/// What a `context-fill` / `context-stroke` value resolves against; `None`
+/// for any other value, and for a colour (which needs nothing).
+fn context_of(value: &str, state: &State) -> Option<Box<ContextElement>> {
+    if !value.starts_with("context-") {
+        return None;
+    }
+    let (fill, stroke) = state.context.as_ref()?;
+    let (paint, context) = match values::paint(value)? {
+        values::Paint::ContextFill => {
+            let f = fill.as_ref()?;
+            (&f.paint, &f.context)
+        }
+        values::Paint::ContextStroke => {
+            let s = stroke.as_ref()?;
+            (&s.paint, &s.context)
+        }
+        _ => return None,
+    };
+    if matches!(paint, Paint::Color(_)) {
+        return None;
+    }
+    context.clone()
+}
+
+/// Takes a paint of a context element over to a path: object units resolve
+/// against the context element's box, and the paint keeps the context
+/// element's coordinates. `false` when the paint cannot apply.
+fn process_context_paint(
+    paint: &mut Paint,
+    context_ts: Transform,
+    context_bbox: Option<Rect>,
+    path_ts: Transform,
+) -> bool {
+    let obb = match paint {
+        Paint::Color(_) => return true,
+        Paint::LinearGradient(g) => g.base.transform_is_obb(),
+        Paint::RadialGradient(g) => g.base.transform_is_obb(),
+        Paint::Pattern(p) => p.pending.is_some(),
+    };
+    if obb && !context_bbox.is_some_and(|b| paint_to_user_space(paint, b)) {
+        return false;
+    }
+    // From the path's coordinates back to the context element's.
+    let Some(back) = context_ts
+        .invert()
+        .and_then(|i| i.pre_concat(path_ts).invert())
+    else {
+        return true;
+    };
+    match paint {
+        Paint::Color(_) => {}
+        Paint::LinearGradient(g) => {
+            let mut ng = (**g).clone();
+            ng.base.transform = ng.base.transform.post_concat(back);
+            *g = Arc::new(ng);
+        }
+        Paint::RadialGradient(g) => {
+            let mut ng = (**g).clone();
+            ng.base.transform = ng.base.transform.post_concat(back);
+            *g = Arc::new(ng);
+        }
+        Paint::Pattern(p) => {
+            let mut np = (**p).clone();
+            np.transform = np.transform.post_concat(back);
+            *p = Arc::new(np);
+        }
+    }
+    true
+}
+
+/// Resolves the paints left over until the box of their `use` element was
+/// known.
+fn resolve_context_paints(group: &mut Group, ts: Transform, bbox: Option<Rect>) {
+    let (ts, bbox) = if group.is_context {
+        (group.abs_transform, group.bounding_box)
+    } else {
+        (ts, bbox)
+    };
+    let resolve =
+        |paint: &mut Paint, context: &mut Option<Box<ContextElement>>, path_ts| match context
+            .take()
+            .as_deref()
+        {
+            Some(ContextElement::Use) => process_context_paint(paint, ts, bbox, path_ts),
+            _ => true,
+        };
+    for child in &mut group.children {
+        match child {
+            Node::Group(g) => {
+                if let Some(m) = g.mask.as_mut().and_then(Arc::get_mut) {
+                    resolve_context_paints(&mut m.root, ts, bbox);
+                    if let Some(m) = m.mask.as_mut().and_then(Arc::get_mut) {
+                        resolve_context_paints(&mut m.root, ts, bbox);
+                    }
+                }
+                for f in &mut g.filters {
+                    for p in Arc::get_mut(f).into_iter().flat_map(|f| &mut f.primitives) {
+                        if let crate::filter::Kind::Image(i) = &mut p.kind {
+                            resolve_context_paints(&mut i.root, ts, bbox);
+                        }
+                    }
+                }
+                resolve_context_paints(g, ts, bbox);
+            }
+            Node::Path(p) => {
+                let at = p.abs_transform;
+                if p.fill
+                    .as_mut()
+                    .is_some_and(|f| !resolve(&mut f.paint, &mut f.context, at))
+                {
+                    p.fill = None;
+                }
+                if p.stroke
+                    .as_mut()
+                    .is_some_and(|s| !resolve(&mut s.paint, &mut s.context, at))
+                {
+                    p.stroke = None;
+                }
+            }
+            Node::Image(_) => {}
+            Node::Text(t) => {
+                let at = t.abs_transform;
+                for span in t.chunks.iter_mut().flat_map(|c| &mut c.spans) {
+                    let d = &mut span.decoration;
+                    let styles = [&mut d.underline, &mut d.overline, &mut d.line_through]
+                        .into_iter()
+                        .flatten()
+                        .map(|s| (&mut s.fill, &mut s.stroke));
+                    for (fill, stroke) in
+                        std::iter::once((&mut span.fill, &mut span.stroke)).chain(styles)
+                    {
+                        if fill
+                            .as_mut()
+                            .is_some_and(|f| !resolve(&mut f.paint, &mut f.context, at))
+                        {
+                            *fill = None;
+                        }
+                        if stroke
+                            .as_mut()
+                            .is_some_and(|s| !resolve(&mut s.paint, &mut s.context, at))
+                        {
+                            *stroke = None;
+                        }
+                    }
+                }
+                if let Some(g) = &mut t.flattened {
+                    resolve_context_paints(g, ts, bbox);
+                }
             }
         }
     }
@@ -1516,7 +1993,7 @@ impl BaseGradient {
     }
 }
 
-fn units_attr(node: SvgNode, name: AId, def: Units) -> Units {
+pub(crate) fn units_attr(node: SvgNode, name: AId, def: Units) -> Units {
     let n = resolve_attr(node, name);
     match n.attribute(name).map(values::trim) {
         Some("userSpaceOnUse") => Units::UserSpaceOnUse,
@@ -1555,6 +2032,7 @@ fn resolve_attr<'a>(node: SvgNode<'a>, name: AId) -> SvgNode<'a> {
                     || (shared && lt.is_gradient())
             }
             EId::Pattern => lt == EId::Pattern,
+            EId::Filter => lt == EId::Filter,
             _ => false,
         };
         if !ok {
@@ -1567,7 +2045,13 @@ fn resolve_attr<'a>(node: SvgNode<'a>, name: AId) -> SvgNode<'a> {
     node
 }
 
-fn resolve_number(node: SvgNode, name: AId, units: Units, state: &State, def: Length) -> f32 {
+pub(crate) fn resolve_number(
+    node: SvgNode,
+    name: AId,
+    units: Units,
+    state: &State,
+    def: Length,
+) -> f32 {
     resolve_attr(node, name).convert_length(name, units, state, def)
 }
 
@@ -1594,6 +2078,11 @@ fn approx_eq(a: f32, b: f32) -> bool {
     let ia = a.to_bits() as i64;
     let ib = b.to_bits() as i64;
     (ia - ib).abs() <= 4
+}
+
+/// usvg's `approx_zero_ulps(4)`.
+pub(crate) fn approx_zero(v: f32) -> bool {
+    approx_eq(v, 0.0)
 }
 
 fn convert_stops(grad: SvgNode) -> Vec<Stop> {
@@ -1795,7 +2284,7 @@ fn convert_pattern(node: SvgNode, state: &State, cache: &mut Cache) -> Option<Se
             ..Group::default()
         };
         convert_children(with_children, state, cache, &mut g);
-        if !g.children.is_empty() {
+        if g.has_content() {
             g.calculate_bounding_boxes();
             root.children.push(Node::Group(Box::new(g)));
         }
@@ -1803,7 +2292,7 @@ fn convert_pattern(node: SvgNode, state: &State, cache: &mut Cache) -> Option<Se
         convert_children(with_children, state, cache, &mut root);
     }
     cache.active.pop();
-    if root.children.is_empty() {
+    if !root.has_content() {
         return None;
     }
     root.calculate_bounding_boxes();
@@ -1829,6 +2318,7 @@ fn from_bbox(b: NonZeroRect) -> Transform {
     Transform::from_bbox(b)
 }
 
+#[inline(never)]
 fn convert_clip_path(
     node: SvgNode,
     state: &State,
@@ -1880,7 +2370,7 @@ fn convert_clip_path(
         convert_clip_path_elements(node, &cs, cache, &mut root);
     }
     cache.active.pop();
-    if !ok || root.children.is_empty() {
+    if !ok || !root.has_content() {
         return None;
     }
     root.calculate_bounding_boxes();
@@ -1895,6 +2385,7 @@ fn convert_clip_path(
     Some(clip)
 }
 
+#[inline(never)]
 fn convert_mask(
     node: SvgNode,
     state: &State,
@@ -1969,7 +2460,7 @@ fn convert_mask(
                         ..Group::default()
                     };
                     convert_children(node, state, cache, &mut g);
-                    if g.children.is_empty() {
+                    if !g.has_content() {
                         ok = false;
                     } else {
                         g.calculate_bounding_boxes();
@@ -1980,7 +2471,7 @@ fn convert_mask(
             }
         } else {
             convert_children(node, state, cache, &mut root);
-            if root.children.is_empty() {
+            if !root.has_content() {
                 ok = false;
             }
         }
@@ -2004,6 +2495,7 @@ fn convert_mask(
 
 // ------------------------------------------------------------ use / svg --
 
+#[inline(never)]
 fn convert_use(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut Group) {
     let Some(child) = node.first_child() else {
         return;
@@ -2012,10 +2504,17 @@ fn convert_use(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut Gro
         return;
     }
     let mut use_state = state.clone();
-    use_state.context = Some((
+    let mut context = (
         resolve_fill(node, true, state, cache),
         resolve_stroke(node, true, state, cache),
-    ));
+    );
+    if let Some(f) = context.0.as_mut() {
+        f.context = Some(Box::new(ContextElement::Use));
+    }
+    if let Some(s) = context.1.as_mut() {
+        s.context = Some(Box::new(ContextElement::Use));
+    }
+    use_state.context = Some(context);
     let mut orig_ts = node.resolve_transform(AId::Transform, state);
     let mut new_ts = Transform::identity();
     {
@@ -2046,13 +2545,18 @@ fn convert_use(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut Gro
         }
         if let Some(clip_rect) = get_clip_rect(node, child, &use_state) {
             let mut g = clip_element(clip_rect, orig_ts);
+            g.abs_transform = parent.abs_transform.pre_concat(orig_ts);
+            g.is_context = true;
+            let abs = g.abs_transform;
             if let Some(mut g2) =
                 convert_group_into(node, &use_state, true, cache, &mut g, &mut |cache, g2| {
-                    use_convert_children(child, new_ts, &use_state, cache, g2);
+                    // `g2` ends up without the transform `g` has.
+                    g2.abs_transform = abs;
+                    use_convert_children(child, new_ts, &use_state, cache, false, g2);
                 })
             {
                 g2.transform = Transform::identity();
-                g.children.push(Node::Group(Box::new(g2)));
+                g.children.push(Node::Group(g2));
             }
             if g.children.is_empty() {
                 return;
@@ -2064,13 +2568,17 @@ fn convert_use(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut Gro
     }
     orig_ts = orig_ts.pre_concat(new_ts);
     if linked_to_symbol {
+        // The group ends up without its own transform (`orig_ts` has it).
+        let abs = parent.abs_transform;
         if let Some(mut g) =
             convert_group_into(node, &use_state, false, cache, parent, &mut |cache, g| {
-                use_convert_children(child, orig_ts, &use_state, cache, g);
+                g.abs_transform = abs;
+                use_convert_children(child, orig_ts, &use_state, cache, false, g);
             })
         {
             g.transform = Transform::identity();
-            parent.children.push(Node::Group(Box::new(g)));
+            g.is_context = true;
+            parent.children.push(Node::Group(g));
         }
     } else {
         if child.tag_name() == Some(EId::Svg) {
@@ -2083,10 +2591,11 @@ fn convert_use(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut Gro
                 use_state.use_size.1 = Some(node.convert_user_length(AId::Height, &use_state, def));
             }
         }
-        use_convert_children(node, orig_ts, &use_state, cache, parent);
+        use_convert_children(node, orig_ts, &use_state, cache, true, parent);
     }
 }
 
+#[inline(never)]
 fn convert_nested_svg(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut Group) {
     let mut orig_ts = node.resolve_transform(AId::Transform, state);
     let mut new_ts = Transform::identity();
@@ -2107,19 +2616,23 @@ fn convert_nested_svg(node: SvgNode, state: &State, cache: &mut Cache, parent: &
     };
     if let Some(clip_rect) = get_clip_rect(node, node, state) {
         let mut g = clip_element(clip_rect, orig_ts);
-        use_convert_children(node, new_ts, &new_state, cache, &mut g);
+        g.abs_transform = parent.abs_transform.pre_concat(orig_ts);
+        use_convert_children(node, new_ts, &new_state, cache, false, &mut g);
         g.calculate_bounding_boxes();
         parent.children.push(Node::Group(Box::new(g)));
     } else {
         orig_ts = orig_ts.pre_concat(new_ts);
-        use_convert_children(node, orig_ts, &new_state, cache, parent);
+        use_convert_children(node, orig_ts, &new_state, cache, false, parent);
     }
 }
 
+#[inline(never)]
 fn clip_element(clip_rect: NonZeroRect, transform: Transform) -> Group {
     let data = Arc::new(PathBuilder::from_rect(clip_rect.to_rect()));
     let bbox = clip_rect.to_rect();
     let path = Path {
+        id: String::new(),
+        abs_transform: Transform::identity(),
         visible: true,
         fill: Some(Fill {
             paint: Paint::Color(Color {
@@ -2129,6 +2642,7 @@ fn clip_element(clip_rect: NonZeroRect, transform: Transform) -> Group {
             }),
             opacity: 1.0,
             rule: FillRule::Winding,
+            context: None,
         }),
         stroke: None,
         paint_order: PaintOrder::FillAndStroke,
@@ -2157,10 +2671,19 @@ fn use_convert_children(
     transform: Transform,
     state: &State,
     cache: &mut Cache,
+    is_context: bool,
     parent: &mut Group,
 ) {
     let required = !transform.is_identity();
+    let own_group = required || is_context;
+    let abs = parent.abs_transform.pre_concat(transform);
     let r = convert_group_into(node, state, required, cache, parent, &mut |cache, g| {
+        // The group carries `transform` in place of the attribute's. (With an
+        // identity `transform`, `g` may be the parent itself, whose
+        // coordinates are the same.)
+        if own_group {
+            g.abs_transform = abs;
+        }
         if state.in_clip_path {
             convert_clip_path_elements(node, state, cache, g);
         } else {
@@ -2168,14 +2691,14 @@ fn use_convert_children(
         }
     });
     if let Some(mut g) = r {
-        // `convert_group_into` took the transform from the attribute; the
-        // group carries the `use` transform instead.
         g.transform = transform;
+        g.is_context = is_context;
         g.calculate_bounding_boxes();
-        parent.children.push(Node::Group(Box::new(g)));
+        parent.children.push(Node::Group(g));
     }
 }
 
+#[inline(never)]
 fn get_clip_rect(use_node: SvgNode, symbol: SvgNode, state: &State) -> Option<NonZeroRect> {
     if matches!(
         symbol.attribute(AId::Overflow).map(values::trim),
@@ -2224,11 +2747,12 @@ fn viewbox_transform(node: SvgNode, linked: SvgNode, state: &State) -> Option<Tr
 
 // ---------------------------------------------------------------- images --
 
-fn convert_image(node: SvgNode, state: &State, parent: &mut Group) {
+#[inline(never)]
+fn convert_image(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut Group) {
     let Some(href) = node.attribute(AId::Href) else {
         return;
     };
-    let Some((kind, actual)) = crate::image::load_href(href, state.opt) else {
+    let Some((kind, actual)) = cache.load_image(href, state.opt) else {
         return;
     };
     let visible = node
@@ -2236,11 +2760,7 @@ fn convert_image(node: SvgNode, state: &State, parent: &mut Group) {
         .map(values::trim)
         .unwrap_or("visible")
         == "visible";
-    let quality = match node.find_attribute(AId::ImageRendering).map(values::trim) {
-        Some("optimizeSpeed" | "crisp-edges" | "pixelated") => FilterQuality::Nearest,
-        Some("smooth") => FilterQuality::Bilinear,
-        _ => FilterQuality::Bicubic,
-    };
+    let quality = image_quality(node);
     let x = node.convert_user_length(AId::X, state, Length::zero());
     let y = node.convert_user_length(AId::Y, state, Length::zero());
     let mut width = node.convert_user_length(
@@ -2258,20 +2778,46 @@ fn convert_image(node: SvgNode, state: &State, parent: &mut Group) {
         (None, Some(_)) => width = actual.width() * (height / actual.height()),
         _ => {}
     }
-    let aspect = node.aspect();
     let Some(rect) = NonZeroRect::from_xywh(x, y, width, height) else {
         return;
     };
-    let aligned = {
-        let s = rect.size();
-        if aspect.align == Align::None {
-            Some(s)
-        } else {
-            fit_size(actual, s, aspect.slice)
-        }
-    };
-    let Some(aligned) = aligned else {
-        return;
+    let _ = place_image(
+        state.element_id(node),
+        kind,
+        visible,
+        quality,
+        node.aspect(),
+        actual,
+        rect,
+        parent,
+    );
+}
+
+/// `image-rendering` as a sampling quality.
+pub(crate) fn image_quality(node: SvgNode) -> FilterQuality {
+    match node.find_attribute(AId::ImageRendering).map(values::trim) {
+        Some("optimizeSpeed" | "crisp-edges" | "pixelated") => FilterQuality::Nearest,
+        Some("smooth") => FilterQuality::Bilinear,
+        _ => FilterQuality::Bicubic,
+    }
+}
+
+/// Appends an image of intrinsic size `actual`, fitted into `rect`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn place_image(
+    id: String,
+    kind: ImageKind,
+    visible: bool,
+    quality: FilterQuality,
+    aspect: AspectRatio,
+    actual: Size,
+    rect: NonZeroRect,
+    parent: &mut Group,
+) -> Option<()> {
+    let aligned = if aspect.align == Align::None {
+        rect.size()
+    } else {
+        fit_size(actual, rect.size(), aspect.slice)?
     };
     let (ax, ay) = aligned_pos(
         aspect.align,
@@ -2280,9 +2826,7 @@ fn convert_image(node: SvgNode, state: &State, parent: &mut Group) {
         rect.width() - aligned.width(),
         rect.height() - aligned.height(),
     );
-    let Some(vb) = NonZeroRect::from_xywh(ax, ay, aligned.width(), aligned.height()) else {
-        return;
-    };
+    let vb = NonZeroRect::from_xywh(ax, ay, aligned.width(), aligned.height())?;
     let image_ts = Transform::from_row(
         vb.width() / actual.width(),
         0.0,
@@ -2293,9 +2837,11 @@ fn convert_image(node: SvgNode, state: &State, parent: &mut Group) {
     );
     let mut g = Group {
         transform: image_ts,
+        abs_transform: parent.abs_transform.pre_concat(image_ts),
         ..Group::default()
     };
     g.children.push(Node::Image(Box::new(Image {
+        id,
         visible,
         size: actual,
         quality,
@@ -2304,20 +2850,12 @@ fn convert_image(node: SvgNode, state: &State, parent: &mut Group) {
     g.calculate_bounding_boxes();
     if aspect.slice {
         let mut g2 = clip_element(rect, Transform::identity());
+        g2.abs_transform = parent.abs_transform;
         g2.children.push(Node::Group(Box::new(g)));
         g2.calculate_bounding_boxes();
         parent.children.push(Node::Group(Box::new(g2)));
     } else {
         parent.children.push(Node::Group(Box::new(g)));
     }
-}
-
-/// Image kinds the loader can produce.
-pub(crate) fn image_kind_png(data: Vec<u8>) -> ImageKind {
-    ImageKind::Png(Arc::new(data))
-}
-
-/// Image kinds the loader can produce.
-pub(crate) fn image_kind_jpeg(data: Vec<u8>) -> ImageKind {
-    ImageKind::Jpeg(Arc::new(data))
+    Some(())
 }

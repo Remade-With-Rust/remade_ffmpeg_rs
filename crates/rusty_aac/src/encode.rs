@@ -897,6 +897,29 @@ fn perceptual_offsets(
     if thr_ref <= 0.0 {
         return Offsets::flat(off);
     }
+    let surplus = SURPLUS.with(std::cell::Cell::get).then(|| {
+        let density = |i: usize| thr[i] / f64::from(swb[i + 1] - swb[i]);
+        let mut floor: Vec<i32> = (0..num_swb)
+            .map(|i| no_clamp_sf(&spec[usize::from(swb[i])..usize::from(swb[i + 1])]))
+            .collect();
+        // A scalefactor delta codes at most 60 steps: no band may run on past
+        // that under the highest floor.
+        let deepest = floor.iter().copied().max().unwrap_or(0) - 60;
+        for f in &mut floor {
+            *f = (*f).max(deepest);
+        }
+        let top = (0..num_swb)
+            .filter(|&i| energy[i] > 0.0)
+            .map(density)
+            .fold(0f64, f64::max);
+        Surplus {
+            gap: (0..num_swb)
+                .map(|i| ((top / density(i)).log2() / 0.375).max(0.0).round() as i32)
+                .collect(),
+            floor,
+            start: (center + NMR0_SF_OFFSET).round() as i32 - SURPLUS_MARGIN_STEPS,
+        }
+    });
     let ratio: Vec<f32> = thr
         .iter()
         .map(|&t| ((t / thr_ref).sqrt().sqrt()).min(1.0) as f32)
@@ -909,6 +932,7 @@ fn perceptual_offsets(
         // `raw + NMR0_SF_OFFSET` is where a band's noise meets its mask, so the
         // base putting the bands at their masks is `center + NMR0_SF_OFFSET`.
         mask_base: (center + NMR0_SF_OFFSET).round() as i32,
+        surplus,
     }
 }
 
@@ -955,6 +979,65 @@ pub(crate) struct Offsets {
     thr_ref: f64,
     /// The base at which the bands' quantization noise reaches their masks.
     mask_base: i32,
+    /// How bits left over far below the masks are spent; `None` for the
+    /// uniform step all the way down.
+    surplus: Option<Surplus>,
+}
+
+/// How a frame with bits to spare spends them (see [`SURPLUS_MARGIN_STEPS`]).
+#[derive(Debug, Clone)]
+struct Surplus {
+    /// Per band, how many steps its mask per line sits under the highest one.
+    gap: Vec<i32>,
+    /// Per band, the lowest scalefactor that clamps no coefficient and stays
+    /// within a codeable delta of every other band's.
+    floor: Vec<i32>,
+    /// The base below which the noise starts to level out.
+    start: i32,
+}
+
+/// How far below the masks every band's noise goes, in base steps of 1.13 dB
+/// (13 = 14.7 dB), before a frame with bits to spare starts levelling the
+/// noise across its bands.
+///
+/// The uniform step lowers every band's noise-to-mask ratio together, however
+/// far under the masks that takes them. On tonal content at a high rate most of
+/// the surplus then went into bands that were already inaudible (a tone's
+/// window leakage: 51 dB waveform SNR for two pure tones at 320 kbps, where
+/// the reference encoder in `remade_ffmpeg_rs#211` reaches 82), while the bands
+/// carrying the signal kept nearly all of the error energy. Below this margin
+/// a band whose mask is low drops half as fast as the loudest one, until the
+/// two reach the same noise per line.
+///
+/// Measured with PEAQ at 192, 256 and 320 kbps stereo (9 music clips, 4 time
+/// offsets each): ODG -0.000, +0.001 and +0.013 on average, no clip beyond the
+/// noise, 0 to 6 dB more SNR, 13 dB on the pure tones. Letting a low band stop
+/// dead instead of dropping half as fast gains up to 25 dB on piano, but costs
+/// it 0.12 ODG at this margin and up to 0.24 at a 3 dB one.
+const SURPLUS_MARGIN_STEPS: i32 = 13;
+
+/// The surplus policy runs for mono and stereo streams from this rate a
+/// channel; every other stream codes as before, bit for bit. Multichannel lost
+/// up to 0.23 ODG at the margins that would have helped its pure tones.
+const SURPLUS_MIN_BPS_PER_CHANNEL: u32 = 96_000;
+
+thread_local! {
+    /// Whether the frame this thread is coding runs the surplus policy: set
+    /// per frame by `encode_frame`, like [`SECTION_TRELLIS`].
+    static SURPLUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The lowest scalefactor at which no line of `band` quantizes past `MAX_QUANT`.
+fn no_clamp_sf(band: &[f32]) -> i32 {
+    let maxp = band
+        .iter()
+        .fold(0f64, |a, &x| a.max(f64::from(x.abs())))
+        .powf(0.75);
+    if maxp <= 1e-9 {
+        0
+    } else {
+        (100.0 - (f64::from(MAX_QUANT) / maxp).log2() / 0.1875).ceil() as i32
+    }
 }
 
 /// Levels per base step past the masks (see [`Offsets`]).
@@ -976,6 +1059,7 @@ impl Offsets {
             ratio: Vec::new(),
             thr_ref: 0.0,
             mask_base: i32::MAX,
+            surplus: None,
         }
     }
 
@@ -1003,13 +1087,42 @@ impl Offsets {
                 *s = (*s).min((c + release).min(255));
             }
         }
+        if let Some(su) = &self.surplus {
+            for (s, &f) in sf.iter_mut().zip(&su.floor) {
+                *s = (*s).max(f).min(255);
+            }
+        }
         sf
+    }
+
+    /// How many steps over the uniform `fam + off[b]` the surplus policy
+    /// leaves each band, or `None` at or above its start.
+    fn surplus_lag(&self, fam: i32) -> Option<impl Iterator<Item = i32> + '_> {
+        let su = self.surplus.as_ref()?;
+        let below = su.start - fam;
+        (below > 0).then(|| su.gap.iter().map(move |&g| (g.min(below) + 1) / 2))
     }
 
     /// Share one reduction between the two channels of a pair coded at a common
     /// level: ratios against the louder channel's loudest band, and the later of
     /// the two mask bases, so the uniform region (and its output) is unchanged.
+    ///
+    /// A silent channel (the side of two identical ones) has no masks to share.
+    /// Under the surplus policy it follows the other, whose offsets stay as
+    /// they are; its lines are zero at any scalefactor. Otherwise both fall
+    /// back to the uniform step.
     pub(crate) fn join(a: &mut Self, b: &mut Self) {
+        match (&a.surplus, &b.surplus) {
+            (Some(_), None) => {
+                *b = a.clone();
+                return;
+            }
+            (None, Some(_)) => {
+                *a = b.clone();
+                return;
+            }
+            _ => {}
+        }
         if a.ratio.is_empty() || b.ratio.is_empty() {
             *a = Self::flat(std::mem::take(&mut a.off));
             *b = Self::flat(std::mem::take(&mut b.off));
@@ -1037,7 +1150,15 @@ impl Offsets {
     pub(crate) fn sf(&self, level: i32) -> Vec<i32> {
         let fam = level.min(self.top_level());
         if fam <= self.mask_base || self.ratio.is_empty() {
-            let sf = self.off.iter().map(|&o| (fam + o).clamp(0, 255)).collect();
+            let sf = match self.surplus_lag(fam) {
+                Some(lag) => self
+                    .off
+                    .iter()
+                    .zip(lag)
+                    .map(|(&o, l)| (fam + o + l).clamp(0, 255))
+                    .collect(),
+                None => self.off.iter().map(|&o| (fam + o).clamp(0, 255)).collect(),
+            };
             return self.held(level, sf);
         }
         let d = f64::from(fam - self.mask_base) / f64::from(STARVED_SUBSTEPS);
@@ -1140,15 +1261,7 @@ fn peak_hold(
             let noise = (energy[b] * m).max(ath[b]);
             let cap = ((noise / noise_scale[b]).log2() / 0.375 + NMR0_SF_OFFSET).round();
             // Never under the band's no-clamp floor (see `min_base`).
-            let maxp = spec[s..e]
-                .iter()
-                .fold(0f64, |a, &x| a.max(f64::from(x.abs())))
-                .powf(0.75);
-            let min_sf = if maxp <= 1e-9 {
-                0.0
-            } else {
-                (100.0 - (f64::from(MAX_QUANT) / maxp).log2() / 0.1875).ceil()
-            };
+            let min_sf = f64::from(no_clamp_sf(&spec[s..e]));
             cap.max(min_sf).clamp(0.0, 255.0) as i32
         })
         .collect()
@@ -1289,6 +1402,12 @@ fn lfe_band_limit(spec: &mut [f32]) {
 /// The per-channel ICS body budget's ceiling: the 6144-bit decoder input buffer
 /// per channel (ISO 14496-3 §4.5.3) less the element (7) and frame (59) overhead.
 const MAX_CHANNEL_BITS: usize = 6144 - 7 - 59;
+
+/// What TNS can add to a channel's body, which the rate loop does not count:
+/// 64 bits of `tns_data` (order 12) and the zero sections that hold `max_sfb`
+/// up (two 9-bit headers), rounded up. Kept free under [`MAX_CHANNEL_BITS`], or
+/// a block at the buffer's limit came out a byte over it.
+const TNS_RESERVE_BITS: usize = 96;
 
 /// Input samples are clamped to ±8× full scale (NaN becomes silence) at the push
 /// boundary. Real audio is untouched; hostile values (±Inf, 1e30) would otherwise
@@ -2427,7 +2546,22 @@ fn code_frame(xp: &Xpow, swb: &[u16], sf: &[i32]) -> (Vec<u8>, usize, usize, Vec
 
 /// The smallest common `base` such that no band clamps its loudest coefficient
 /// past `MAX_QUANT` (each band's own no-clamp floor, minus that band's offset).
+///
+/// Under the surplus policy every band stops at its own floor instead, so the
+/// search may run on until the last band reaches it (a negative base, since
+/// the bands with low masks lag the base).
 fn min_base(xp: &Xpow, swb: &[u16], offsets: &Offsets) -> i32 {
+    if let Some(su) = &offsets.surplus {
+        return su
+            .floor
+            .iter()
+            .zip(&su.gap)
+            .zip(offsets.iter())
+            .map(|((&f, &g), &o)| f.max(0) - o - (g + 1) / 2)
+            .min()
+            .unwrap_or(0)
+            .min(255);
+    }
     let num_swb = swb.len() - 1;
     let mut floor = 0i32;
     for sfb in 0..num_swb {
@@ -2502,7 +2636,7 @@ fn rate_loop_coded(
     let max_level = offsets.max_level();
     let (mut lo, mut hi) = (min_b, max_level);
     while lo < hi {
-        let mid = (lo + hi) / 2;
+        let mid = (lo + hi).div_euclid(2);
         if estimate_bits(xp, swb, offsets, mid) <= target_bits {
             hi = mid;
         } else {
@@ -2830,8 +2964,9 @@ fn encode_channel_element(
                 let offsets =
                     perceptual_offsets(&filtered, swb, sample_rate, psy.tonality_smr, target_bits);
                 let xp = Xpow::new(&filtered);
+                let tns_target = target_bits.min(MAX_CHANNEL_BITS - TNS_RESERVE_BITS);
                 let (_, sf, (mut cbs, _, msfb, quant)) =
-                    rate_loop_coded(&xp, swb, &offsets, target_bits);
+                    rate_loop_coded(&xp, swb, &offsets, tns_target);
                 // Hold max_sfb at or above tns_max, padding with ZERO bands, so
                 // the decoder's TNS span is exactly the one we filtered.
                 let msfb = msfb.max(tns_max);
@@ -4187,7 +4322,7 @@ fn joint_rate_loop(
     let (mut q0, mut q1) = (vec![0i32; xp0.len()], vec![0i32; xp1.len()]);
     let mut best: Option<(i32, Vec<i32>, Vec<i32>)> = None;
     while lo < hi {
-        let mid = (lo + hi) / 2;
+        let mid = (lo + hi).div_euclid(2);
         let bits = code_core(xp0, swb, &scalefactors(off0, mid), &mut q0).1
             + code_core(xp1, swb, &scalefactors(off1, mid), &mut q1).1;
         if bits <= target_total {
@@ -4226,7 +4361,7 @@ fn joint_rate_loop_seeded(
 ) -> (i32, Option<PairQuant>) {
     let (mut lo, mut hi) = (min_level, max_level);
     while lo < hi {
-        let mid = (lo + hi) / 2;
+        let mid = (lo + hi).div_euclid(2);
         if estimate_bits(xp0, swb, off0, mid) + estimate_bits(xp1, swb, off1, mid) <= target_total {
             hi = mid;
         } else {
@@ -4764,6 +4899,11 @@ pub struct AacTuning {
     /// precision of a frame's loud, tonal bands and coarsens its quiet ones:
     /// at 64 kbps a sung voice's 0-4 kHz went from 16-20 dB SNR to 19-23 dB.
     pub mask_smr_db: f32,
+    /// Spend bits left over far below the masks on the bands that carry the
+    /// signal, not evenly on every band (for mono and stereo streams from 96
+    /// kbps a channel; no effect on others). Default `true`; `false` is the
+    /// 2.1.2 encoder.
+    pub surplus_shaping: bool,
 }
 
 impl Default for AacTuning {
@@ -4779,6 +4919,7 @@ impl Default for AacTuning {
             transient_highpass: true,
             section_trellis: true,
             mask_smr_db: 24.0,
+            surplus_shaping: true,
         }
     }
 }
@@ -4793,6 +4934,7 @@ impl AacTuning {
             transient_highpass: false,
             section_trellis: false,
             mask_smr_db: 18.0,
+            surplus_shaping: false,
         }
     }
 }
@@ -4949,6 +5091,7 @@ pub struct AacEncoder {
     transient_highpass: bool,
     section_trellis: bool,
     mask_smr_db: f32,
+    surplus_shaping: bool,
     win: Vec<f32>,
     /// The KBD long window (α = 4.0), matching the decoder's. Built once.
     win_kbd: Vec<f32>,
@@ -5008,6 +5151,7 @@ impl AacEncoder {
             } else {
                 18.0
             },
+            surplus_shaping: tuning.surplus_shaping,
             win: Vec::new(),
             win_kbd: Vec::new(),
             chans: Vec::new(),
@@ -5031,6 +5175,7 @@ impl AacEncoder {
             transient_highpass: self.transient_highpass,
             section_trellis: self.section_trellis,
             mask_smr_db: self.mask_smr_db,
+            surplus_shaping: self.surplus_shaping,
         }
     }
 
@@ -5263,6 +5408,7 @@ impl AacEncoder {
         };
         SECTION_TRELLIS.with(|c| c.set(self.section_trellis));
         MASK_SMR.with(|c| c.set(smr_ratio(self.effective_smr_db())));
+        SURPLUS.with(|c| c.set(self.surplus_on()));
         let bw_hz = self.bandwidth_hz();
         let cut_long = cutoff_line(bw_hz, self.sample_rate, swb, FRAME_LEN);
         let cut_short = cutoff_line(bw_hz, self.sample_rate, swb_s, SHORT_HALF);
@@ -5486,6 +5632,13 @@ impl AacEncoder {
         } else {
             self.mask_smr_db
         }
+    }
+
+    /// Whether this stream runs [`AacTuning::surplus_shaping`].
+    fn surplus_on(&self) -> bool {
+        self.surplus_shaping
+            && self.channels <= 2
+            && self.bitrate / self.channels.max(1) as u32 >= SURPLUS_MIN_BPS_PER_CHANNEL
     }
 
     /// The coding cutoff in Hz under the configured [`Bandwidth`] policy, or
@@ -8200,6 +8353,118 @@ mod fidelity_129 {
             v[i * ch + c] = amp * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sr as f32).sin();
         }
         v
+    }
+
+    /// A 220/330 Hz stereo pair, interleaved.
+    fn tone_pair(n: usize, sr: u32) -> Vec<f32> {
+        (0..n * 2)
+            .map(|i| {
+                let f = [220.0f32, 330.0][i % 2];
+                let t = (i / 2) as f32 / sr as f32;
+                0.316 * (2.0 * std::f32::consts::PI * f * t).sin()
+            })
+            .collect()
+    }
+
+    fn tuned_aus(pcm: &[f32], ch: u16, kbps: u32, surplus: bool) -> Vec<Vec<u8>> {
+        let tuning = AacTuning {
+            surplus_shaping: surplus,
+            ..Default::default()
+        };
+        let cfg = AacEncoderConfig {
+            bitrate_bps: kbps * 1000,
+            ..Default::default()
+        };
+        let mut e = AacEncoder::with_tuning(cfg, tuning);
+        e.push_pcm(pcm, ch, 48_000).unwrap();
+        e.finish();
+        std::iter::from_fn(|| e.next_packet().ok().map(|p| p.data)).collect()
+    }
+
+    /// `remade_ffmpeg_rs#211`: bits left over far below the masks go to the
+    /// tones, not to their inaudible window leakage (51 and 62 dB before),
+    /// up to the quantizer's own limit of about 84 dB, at any rate.
+    #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret")]
+    fn spare_bits_go_to_the_tones() {
+        let sr = 48_000;
+        let pcm = tone_pair(sr as usize * 2, sr);
+        for (kbps, want) in [(256, 50.0), (320, 60.0), (512, 78.0)] {
+            for c in 0..2 {
+                let (g, snr, _) = gain_snr(&pcm, 2, c, sr, kbps);
+                assert!((0.999..=1.001).contains(&g), "{kbps} kbps: gain {g}");
+                assert!(snr > want, "{kbps} kbps channel {c}: {snr:.1} dB");
+            }
+        }
+        // Two identical channels: the side is silent.
+        let dual: Vec<f32> = pcm.chunks(2).flat_map(|c| [c[0] + c[1]; 2]).collect();
+        let (_, snr, _) = gain_snr(&dual, 2, 0, sr, 320);
+        assert!(snr > 78.0, "identical channels: {snr:.1} dB");
+        let mono = tone(sr as usize * 2, 1, 0, sr);
+        // Past what a 6144-bit frame holds: every band is at its no-clamp floor.
+        let (_, snr, _) = gain_snr(&mono, 1, 0, sr, 512);
+        assert!(snr > 78.0, "mono: {snr:.1} dB");
+    }
+
+    /// TNS data is not in the rate loop's count: at the buffer's limit it took
+    /// a block to 769 bytes (found by the `encode` fuzz target).
+    #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret")]
+    fn a_tns_block_fits_the_decoder_buffer() {
+        let mut s = 8u64.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let mut noise = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        let pcm: Vec<f32> = (0..48_000)
+            .map(|i| {
+                let p = i % 4800;
+                let hit = if p < 2400 {
+                    0.0
+                } else {
+                    0.6 * (-((p - 2400) as f32) / 400.0).exp()
+                };
+                (hit + 0.002) * noise() + 0.1 * (i as f32 * 0.05).sin()
+            })
+            .collect();
+        let mut e = AacEncoder::new(AacEncoderConfig {
+            bitrate_bps: u32::MAX,
+            tns: true,
+            ..Default::default()
+        });
+        e.push_pcm(&pcm, 1, 48_000).unwrap();
+        e.finish();
+        while let Ok(p) = e.next_packet() {
+            assert!(p.data.len() <= 768, "{} bytes", p.data.len());
+        }
+    }
+
+    /// The surplus policy leaves every stream under its rate, and every
+    /// multichannel one, byte for byte as it was.
+    #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret")]
+    fn surplus_shaping_leaves_low_rates_and_multichannel_alone() {
+        let n = 48_000;
+        let stereo = tone_pair(n, 48_000);
+        let dual: Vec<f32> = stereo.chunks(2).flat_map(|c| [c[0] + c[1]; 2]).collect();
+        let six = tone(n, 6, 2, 48_000);
+        for (pcm, ch, kbps, same) in [
+            (&stereo, 2, 190, true),
+            (&stereo, 2, 320, false),
+            (&dual, 2, 190, true),
+            (&dual, 2, 320, false),
+            (&six, 6, 320, true),
+            (&six, 6, 640, true),
+        ] {
+            let (on, off) = (
+                tuned_aus(pcm, ch, kbps, true),
+                tuned_aus(pcm, ch, kbps, false),
+            );
+            assert_eq!(on == off, same, "{ch} channels at {kbps} kbps");
+            assert!(on.iter().all(|p| p.len() * 8 <= 6144 * usize::from(ch)));
+        }
     }
 
     #[test]

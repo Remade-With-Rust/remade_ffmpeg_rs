@@ -22,10 +22,22 @@ pub(crate) struct Context {
     max_bbox: IntRect,
     /// Destination size, for the pattern-tile cap.
     canvas: (u32, u32),
-    /// Bytes currently held by layers, clip and mask scratch pixmaps.
+    /// Bytes currently held by layers, clip, mask and filter scratch.
     live_bytes: u64,
     max_live_bytes: u64,
     max_image_pixels: u64,
+    /// Filter work left, in pixel operations.
+    filter_work: u64,
+}
+
+/// The area layers may cover on a canvas.
+fn max_bbox(width: u32, height: u32) -> Option<IntRect> {
+    IntRect::from_xywh(
+        i32::try_from(width).ok()?.saturating_mul(-2),
+        i32::try_from(height).ok()?.saturating_mul(-2),
+        width.saturating_mul(5),
+        height.saturating_mul(5),
+    )
 }
 
 impl Context {
@@ -34,19 +46,49 @@ impl Context {
         height: u32,
         max_live_bytes: u64,
         max_image_pixels: u64,
+        max_filter_work: u64,
     ) -> Option<Self> {
         Some(Context {
-            max_bbox: IntRect::from_xywh(
-                i32::try_from(width).ok()?.saturating_mul(-2),
-                i32::try_from(height).ok()?.saturating_mul(-2),
-                width.saturating_mul(5),
-                height.saturating_mul(5),
-            )?,
+            max_bbox: max_bbox(width, height)?,
             canvas: (width, height),
             live_bytes: 0,
             max_live_bytes,
             max_image_pixels,
+            filter_work: max_filter_work,
         })
+    }
+
+    /// Spends filter work; `false` once the budget is gone.
+    pub(crate) fn spend_filter_work(&mut self, n: u64) -> bool {
+        match self.filter_work.checked_sub(n) {
+            Some(left) => {
+                self.filter_work = left;
+                true
+            }
+            None => {
+                self.filter_work = 0;
+                false
+            }
+        }
+    }
+
+    /// Reserves scratch bytes against the layer budget.
+    pub(crate) fn reserve(&mut self, bytes: u64) -> bool {
+        let ok = self.live_bytes.saturating_add(bytes) <= self.max_live_bytes;
+        if ok {
+            self.live_bytes += bytes;
+        }
+        ok
+    }
+
+    /// Gives `reserve`d bytes back.
+    pub(crate) fn release(&mut self, bytes: u64) {
+        self.live_bytes = self.live_bytes.saturating_sub(bytes);
+    }
+
+    /// Replaces the area layers may cover, returning the old one.
+    pub(crate) fn swap_max_bbox(&mut self, r: IntRect) -> IntRect {
+        std::mem::replace(&mut self.max_bbox, r)
     }
 
     /// Reserves a `w x h` scratch pixmap against the budget.
@@ -101,10 +143,15 @@ fn render_node(node: &Node, ctx: &mut Context, ts: Transform, pixmap: &mut Pixma
         Node::Image(i) => {
             render_image(i, ctx, ts, pixmap);
         }
+        Node::Text(t) => {
+            if let Some(g) = &t.flattened {
+                render_nodes(g, ctx, ts, pixmap);
+            }
+        }
     }
 }
 
-fn fit_to_rect(r: IntRect, bounds: IntRect) -> Option<IntRect> {
+pub(crate) fn fit_to_rect(r: IntRect, bounds: IntRect) -> Option<IntRect> {
     IntRect::from_ltrb(
         r.left().max(bounds.left()),
         r.top().max(bounds.top()),
@@ -132,13 +179,18 @@ fn render_group(
     if !(fx.is_finite() && fy.is_finite() && cw.is_finite() && ch.is_finite()) {
         return None;
     }
-    // Saturating float-to-int casts, then the resvg 2px padding.
-    let ibbox = IntRect::from_xywh(
-        (fx as i32).checked_sub(2)?,
-        (fy as i32).checked_sub(2)?,
-        (cw as u32).checked_add(4)?,
-        (ch as u32).checked_add(4)?,
-    )?;
+    // Saturating float-to-int casts, then the resvg 2px padding (a filter
+    // region clips, so it gets none).
+    let ibbox = if group.filters.is_empty() {
+        IntRect::from_xywh(
+            (fx as i32).checked_sub(2)?,
+            (fy as i32).checked_sub(2)?,
+            (cw as u32).checked_add(4)?,
+            (ch as u32).checked_add(4)?,
+        )?
+    } else {
+        IntRect::from_xywh(fx as i32, fy as i32, cw.max(1.0) as u32, ch.max(1.0) as u32)?
+    };
     let ibbox = fit_to_rect(ibbox, ctx.max_bbox)?;
 
     let shift = Transform::from_translate(-ibbox.x() as f32, -ibbox.y() as f32);
@@ -146,6 +198,9 @@ fn render_group(
 
     let mut sub = ctx.alloc(ibbox.width(), ibbox.height())?;
     render_nodes(group, ctx, ts, &mut sub.as_mut());
+    for filter in &group.filters {
+        crate::filter_render::apply(filter, ctx, ts, &mut sub);
+    }
     // A layer nothing was drawn into stays empty whatever clips or masks it,
     // and under source-over composites to nothing: it is done.
     if group.blend_mode == BlendMode::SourceOver
@@ -368,7 +423,7 @@ fn make_paint<'a>(
     Some(paint)
 }
 
-fn opacity_to_u8(o: f32) -> u8 {
+pub(crate) fn opacity_to_u8(o: f32) -> u8 {
     // strict-num `NormalizedF32::to_u8`, as resvg uses.
     (o * 255.0 + 0.5) as u8
 }
@@ -582,7 +637,7 @@ fn pixel_rect(
 }
 
 /// Makes every pixel outside `(left, top, right, bottom)` transparent.
-fn clear_outside(pixmap: &mut Pixmap, (l, t, r, b): (usize, usize, usize, usize)) {
+pub(crate) fn clear_outside(pixmap: &mut Pixmap, (l, t, r, b): (usize, usize, usize, usize)) {
     let stride = pixmap.width() as usize * 4;
     let (l, r) = (l.min(r), r);
     let data = pixmap.data_mut();
@@ -645,6 +700,11 @@ fn draw_clip_children(
                 }
             }
             Node::Image(_) => {}
+            Node::Text(t) => {
+                if let Some(g) = &t.flattened {
+                    draw_clip_children(g, mode, ts, ctx, pixmap);
+                }
+            }
         }
     }
 }
@@ -717,6 +777,29 @@ fn apply_mask(mask: &tree::Mask, ctx: &mut Context, ts: Transform, pixmap: &mut 
 
 // ---------------------------------------------------------------- images --
 
+/// An embedded document: drawn into a layer of its own.
+fn render_document(
+    tree: &crate::Tree,
+    ctx: &mut Context,
+    ts: Transform,
+    pixmap: &mut PixmapMut,
+) -> Option<()> {
+    let mut sub = ctx.alloc(pixmap.width(), pixmap.height())?;
+    let old = ctx.swap_max_bbox(max_bbox(sub.width(), sub.height())?);
+    render_nodes(tree.root(), ctx, ts, &mut sub.as_mut());
+    ctx.swap_max_bbox(old);
+    pixmap.draw_pixmap(
+        0,
+        0,
+        sub.as_ref(),
+        &PixmapPaint::default(),
+        Transform::identity(),
+        None,
+    );
+    ctx.free(&sub);
+    Some(())
+}
+
 fn render_image(
     image: &tree::Image,
     ctx: &mut Context,
@@ -725,6 +808,9 @@ fn render_image(
 ) -> Option<()> {
     if !image.visible {
         return None;
+    }
+    if let tree::ImageKind::Svg(tree) = &image.kind {
+        return render_document(tree, ctx, ts, pixmap);
     }
     let raster = crate::image::decode(&image.kind, ctx.max_image_pixels)?;
     let rect = rusty_raster::Size::from_wh(raster.width() as f32, raster.height() as f32)?
@@ -807,6 +893,8 @@ mod tests {
             let data = Arc::new(pb.finish().unwrap());
             let bbox = data.bounds();
             Node::Path(Box::new(tree::Path {
+                id: String::new(),
+                abs_transform: Transform::identity(),
                 visible: true,
                 fill: Some(tree::Fill {
                     paint: tree::Paint::Color(tree::Color {
@@ -816,6 +904,7 @@ mod tests {
                     }),
                     opacity: 1.0,
                     rule: FillRule::Winding,
+                    context: None,
                 }),
                 stroke: None,
                 paint_order: PaintOrder::FillAndStroke,
@@ -923,10 +1012,10 @@ mod tests {
                 fast_rounds += 1;
             }
             let mut want = layer.clone();
-            let mut ctx = Context::new(64, 64, 1 << 30, 1 << 20).unwrap();
+            let mut ctx = Context::new(64, 64, 1 << 30, 1 << 20, 1 << 30).unwrap();
             apply_clip_masked(&clip, &mut ctx, ts, &mut want);
             let mut got = layer.clone();
-            let mut ctx = Context::new(64, 64, 1 << 30, 1 << 20).unwrap();
+            let mut ctx = Context::new(64, 64, 1 << 30, 1 << 20, 1 << 30).unwrap();
             apply_clip(&clip, &mut ctx, ts, &mut got);
             assert_eq!(ctx.live_bytes, 0);
             assert!(want.data() == got.data(), "round {round}");
@@ -1020,6 +1109,8 @@ mod tests {
             };
             let bbox = data.bounds();
             let path = tree::Path {
+                id: String::new(),
+                abs_transform: Transform::identity(),
                 visible: true,
                 fill: Some(tree::Fill {
                     paint: tree::Paint::Color(tree::Color {
@@ -1029,6 +1120,7 @@ mod tests {
                     }),
                     opacity: [1.0, 0.5][(next() % 2) as usize],
                     rule: [FillRule::Winding, FillRule::EvenOdd][(next() % 2) as usize],
+                    context: None,
                 }),
                 stroke: None,
                 paint_order: PaintOrder::FillAndStroke,
@@ -1064,10 +1156,10 @@ mod tests {
                 taken += 1;
             }
             let mut want = layer.clone();
-            let mut ctx = Context::new(64, 64, 1 << 30, 1 << 20).unwrap();
+            let mut ctx = Context::new(64, 64, 1 << 30, 1 << 20, 1 << 30).unwrap();
             apply_clip_masked(&clip, &mut ctx, ts, &mut want);
             let mut got = layer.clone();
-            let mut ctx = Context::new(64, 64, 1 << 30, 1 << 20).unwrap();
+            let mut ctx = Context::new(64, 64, 1 << 30, 1 << 20, 1 << 30).unwrap();
             apply_clip(&clip, &mut ctx, ts, &mut got);
             assert_eq!(ctx.live_bytes, 0);
             assert!(want.data() == got.data(), "round {round}");
@@ -1086,7 +1178,7 @@ mod tests {
             x ^= x << 17;
             x
         };
-        let ctx = Context::new(64, 64, 1 << 30, 1 << 20).unwrap();
+        let ctx = Context::new(64, 64, 1 << 30, 1 << 20, 1 << 30).unwrap();
         for round in 0..400 {
             let (w, h) = (1 + (next() % 40) as u32, 1 + (next() % 40) as u32);
             let mut sub = Pixmap::new(w, h).unwrap();
