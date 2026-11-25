@@ -6,11 +6,14 @@
 //! | bits  | meaning |
 //! |-------|---------|
 //! | 0-17  | significance of the 6 x 3 samples around the column: row `i` (0 is the row above, 1-4 the column's own), column `j` (0 left, 1 own, 2 right) at bit `3 * i + j` |
-//! | 18-23 | sign of the own column's six rows |
-//! | 24-27 | the sample has been refined before |
-//! | 28-31 | the sample was coded in this bit-plane's significance pass |
+//! | 18 + 3 i | sign of row `i` of the own column (row 5 at bit 31) |
+//! | 19 + 3 k | sample `k` was coded in this bit-plane's significance pass |
+//! | 20 + 3 k | sample `k` has been refined before |
 //!
-//! The 3 x 3 neighbourhood of sample `k` is then `(flags >> 3 * k) & 0x1FF`.
+//! The 3 x 3 neighbourhood of sample `k` is then `(flags >> 3 * k) & 0x1FF`,
+//! and a property of all four samples is one mask ([`EACH`]).
+
+use std::cell::Cell;
 
 use crate::mq::{Contexts, Mq, Raw, CTX_MAG, CTX_RUN, CTX_UNI};
 
@@ -27,8 +30,11 @@ pub(crate) const STYLE_HT: u8 = 64;
 pub(crate) const MAX_PLANES: u32 = 30;
 
 const SIG_ALL: u32 = (1 << 18) - 1;
-const SIG_OWN: u32 = 0x10 | (0x10 << 3) | (0x10 << 6) | (0x10 << 9);
-const PI_ALL: u32 = 0xF << 28;
+/// One bit for each sample of a column.
+const EACH: u32 = 0o1111;
+const PI: u32 = 19;
+const PI_ALL: u32 = EACH << PI;
+const MU: u32 = 20;
 const NEIGHBOURS: u32 = 0x1EF;
 
 /// Zero-coding contexts (Table D.1) by neighbourhood, for each of the three
@@ -76,8 +82,8 @@ const fn zc_hh(hv: usize, d: usize) -> u8 {
     }
 }
 
-/// Sign contexts (Tables D.2, D.3): index bits are (significant, negative)
-/// for left, right, up, down; the value is `context | flip << 7`.
+/// Sign contexts (Tables D.2, D.3): index bits are (negative, significant)
+/// for up, left, right, down; the value is `context | flip << 7`.
 static SC: [u8; 256] = {
     let mut t = [0u8; 256];
     let mut v = 0;
@@ -85,13 +91,14 @@ static SC: [u8; 256] = {
         let mut s = [0i32; 4];
         let mut i = 0;
         while i < 4 {
-            if (v >> (2 * i)) & 1 != 0 {
-                s[i] = 1 - 2 * ((v as i32 >> (2 * i + 1)) & 1);
+            if (v >> (2 * i + 1)) & 1 != 0 {
+                s[i] = 1 - 2 * ((v as i32 >> (2 * i)) & 1);
             }
             i += 1;
         }
-        let h = clamp1(s[0] + s[1]);
-        let w = clamp1(s[2] + s[3]);
+        let [up, left, right, down] = s;
+        let h = clamp1(left + right);
+        let w = clamp1(up + down);
         let (flip, h, w) = if h < 0 || (h == 0 && w < 0) {
             (0x80, -h, -w)
         } else {
@@ -156,250 +163,202 @@ pub(crate) struct Segment {
 /// Reusable code-block decoder.
 #[derive(Default)]
 pub(crate) struct T1 {
-    /// Decoded coefficients, row-major: sign in bit 31, below it the magnitude
-    /// times two with the reconstruction half-step in place.
+    /// Decoded coefficients, sign in bit 31, below it the magnitude times two
+    /// with the reconstruction half-step in place. The order is that of the
+    /// scan: stripes of four rows, in them column by column (the last stripe
+    /// is filled up with zeros).
     pub data: Vec<u32>,
     flags: Vec<u32>,
     w: usize,
+    h: usize,
     causal: bool,
 }
 
-/// One stripe: the flag words of the stripe above, its own and the stripe
-/// below (each with a border column on both sides), and its samples (up to
-/// four rows).
-struct Stripe<'a> {
-    up: &'a mut [u32],
-    cur: &'a mut [u32],
-    down: &'a mut [u32],
-    rows: &'a mut [u32],
-    w: usize,
+/// What is around one stripe column: the flag words of it and its left and
+/// right neighbours, in its own stripe and the ones above and below, and its
+/// samples.
+struct Place<'a> {
+    up: &'a [Cell<u32>; 3],
+    cur: &'a [Cell<u32>; 3],
+    down: &'a [Cell<u32>; 3],
+    samples: &'a mut [u32; 4],
     causal: bool,
 }
 
-/// The flag words of column `x` (counted without the border) and of its two
-/// neighbours: left, own, right.
 #[inline(always)]
-fn columns(words: &mut [u32], x: usize) -> &mut [u32; 3] {
-    match words[x..].first_chunk_mut() {
-        Some(c) => c,
-        None => unreachable!("border columns"),
-    }
+fn set(word: &Cell<u32>, bits: u32) {
+    word.set(word.get() | bits);
 }
 
-/// Sign-coding table entry of sample `k` of a column (`f` is the column's
-/// current flag word).
-#[inline(always)]
-fn sign_entry(cur: &[u32; 3], f: u32, k: u32) -> u8 {
-    let l = (cur[0] >> (19 + k)) & 1;
-    let r = (cur[2] >> (19 + k)) & 1;
-    let nb = f >> (3 * k);
-    let idx = ((nb >> 3) & 1)
-        | (l << 1)
-        | (((nb >> 5) & 1) << 2)
-        | (r << 3)
-        | (((nb >> 1) & 1) << 4)
-        | (((f >> (18 + k)) & 1) << 5)
-        | (((nb >> 7) & 1) << 6)
-        | (((f >> (20 + k)) & 1) << 7);
-    SC[(idx & 255) as usize]
-}
-
-impl Stripe<'_> {
-    fn height(&self) -> u32 {
-        (self.rows.len() / self.w) as u32
+impl Place<'_> {
+    /// Sign-coding table entry of sample `k` (`f` is the flag word).
+    #[inline(always)]
+    fn sign_entry(&self, f: u32, k: u32) -> u8 {
+        let down = if k == 3 {
+            (f >> 25) & 0x40
+        } else {
+            (f >> (18 + 3 * k)) & 0x40
+        };
+        let idx = ((f >> (3 * k)) & 0xAA)
+            | ((f >> (18 + 3 * k)) & 1)
+            | ((self.cur[0].get() >> (19 + 3 * k)) & 4)
+            | ((self.cur[2].get() >> (17 + 3 * k)) & 0x10)
+            | down;
+        SC[(idx & 255) as usize]
     }
 
-    /// Decode the sign of sample `k` of column `x` and mark it significant.
+    /// Decode the sign of sample `k` and mark it significant.
     #[inline(always)]
     fn newly<S: Source>(
         &mut self,
         src: &mut S,
         cx: &mut Contexts,
         f: &mut u32,
-        x: usize,
         k: u32,
         value: u32,
     ) {
-        let cur = columns(self.cur, x);
-        let s = src.sign(cx, sign_entry(cur, *f, k));
-        self.rows[k as usize * self.w + x] = value | (s << 31);
-        *f |= (0x10 << (3 * k)) | (s << (19 + k));
-        cur[0] |= 0x20 << (3 * k);
-        cur[2] |= 0x08 << (3 * k);
+        let s = src.sign(cx, self.sign_entry(*f, k));
+        self.samples[k as usize & 3] = value | (s << 31);
+        *f |= (0x10 << (3 * k)) | (s << (21 + 3 * k));
+        set(&self.cur[0], 0x20 << (3 * k));
+        set(&self.cur[2], 0x08 << (3 * k));
         // Vertically causal contexts: the stripe above never sees this one.
         if k == 0 && !self.causal {
-            let up = columns(self.up, x);
-            up[0] |= 1 << 17;
-            up[1] |= (1 << 16) | (s << 23);
-            up[2] |= 1 << 15;
+            set(&self.up[0], 1 << 17);
+            set(&self.up[1], (1 << 16) | (s << 31));
+            set(&self.up[2], 1 << 15);
         }
         if k == 3 {
-            let down = columns(self.down, x);
-            down[0] |= 1 << 2;
-            down[1] |= (1 << 1) | (s << 18);
-            down[2] |= 1;
+            set(&self.down[0], 1 << 2);
+            set(&self.down[1], (1 << 1) | (s << 18));
+            set(&self.down[2], 1);
         }
     }
 
-    /// Significance propagation (D.3.1). `FULL`: the stripe has four rows.
+    /// Significance propagation (D.3.1) of the column's first `h` samples.
     #[inline(always)]
-    fn significance<S: Source, const FULL: bool>(
+    fn significance<S: Source>(
         &mut self,
         src: &mut S,
         cx: &mut Contexts,
         bp: u32,
         zc: &[u8; 512],
+        h: u32,
     ) {
-        let value = 3 << bp;
-        for x in 0..self.w {
-            let mut f = self.cur[x + 1];
-            if f & SIG_ALL == 0 {
-                continue;
-            }
-            if FULL {
-                // Unrolled by hand: the compiler leaves it a loop.
-                self.significance_at(src, cx, &mut f, x, 0, value, zc);
-                self.significance_at(src, cx, &mut f, x, 1, value, zc);
-                self.significance_at(src, cx, &mut f, x, 2, value, zc);
-                self.significance_at(src, cx, &mut f, x, 3, value, zc);
-            } else {
-                for k in 0..self.height() {
-                    self.significance_at(src, cx, &mut f, x, k, value, zc);
-                }
-            }
-            self.cur[x + 1] = f;
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    fn significance_at<S: Source>(
-        &mut self,
-        src: &mut S,
-        cx: &mut Contexts,
-        f: &mut u32,
-        x: usize,
-        k: u32,
-        value: u32,
-        zc: &[u8; 512],
-    ) {
-        let nb = (*f >> (3 * k)) & 0x1FF;
-        if nb & 0x10 != 0 || nb & NEIGHBOURS == 0 {
+        let mut f = self.cur[1].get();
+        if f & SIG_ALL == 0 {
             return;
         }
-        if src.decision(cx, usize::from(zc[nb as usize])) != 0 {
-            self.newly(src, cx, f, x, k, value);
+        // Samples with a significant neighbour, not significant themselves.
+        let side = f | (f >> 2);
+        let row = side | (f >> 1);
+        let fresh = !(f >> 4) & EACH;
+        let mut m = (row | (side >> 3) | (row >> 6)) & fresh;
+        if m == 0 {
+            return;
         }
-        *f |= 1 << (28 + k);
+        let value = 3 << bp;
+        macro_rules! at {
+            ($k:expr) => {
+                if m & (1 << (3 * $k)) != 0 {
+                    let nb = (f >> (3 * $k)) & 0x1FF;
+                    if src.decision(cx, usize::from(zc[nb as usize])) != 0 {
+                        self.newly(src, cx, &mut f, $k, value);
+                        m |= (8 << (3 * $k)) & fresh;
+                    }
+                    f |= 1 << (PI + 3 * $k);
+                }
+            };
+        }
+        // Unrolled by hand: the compiler leaves it a loop.
+        at!(0);
+        if h > 1 {
+            at!(1);
+        }
+        if h > 2 {
+            at!(2);
+        }
+        if h > 3 {
+            at!(3);
+        }
+        self.cur[1].set(f);
     }
 
     /// Magnitude refinement (D.3.3).
     #[inline(always)]
-    fn refinement<S: Source, const FULL: bool>(&mut self, src: &mut S, cx: &mut Contexts, bp: u32) {
-        let half = 1u32 << bp;
-        for x in 0..self.w {
-            let mut f = self.cur[x + 1];
-            if f & SIG_OWN == 0 {
-                continue;
-            }
-            if FULL {
-                self.refinement_at(src, cx, &mut f, x, 0, half);
-                self.refinement_at(src, cx, &mut f, x, 1, half);
-                self.refinement_at(src, cx, &mut f, x, 2, half);
-                self.refinement_at(src, cx, &mut f, x, 3, half);
-            } else {
-                for k in 0..self.height() {
-                    self.refinement_at(src, cx, &mut f, x, k, half);
-                }
-            }
-            self.cur[x + 1] = f;
-        }
-    }
-
-    #[inline(always)]
-    fn refinement_at<S: Source>(
-        &mut self,
-        src: &mut S,
-        cx: &mut Contexts,
-        f: &mut u32,
-        x: usize,
-        k: u32,
-        half: u32,
-    ) {
-        let nb = *f >> (3 * k);
-        if (nb >> 4) & !(*f >> (28 + k)) & 1 == 0 {
+    fn refinement<S: Source>(&mut self, src: &mut S, cx: &mut Contexts, bp: u32) {
+        let mut f = self.cur[1].get();
+        let m = (f >> 4) & !(f >> PI) & EACH;
+        if m == 0 {
             return;
         }
-        let ctx = if (*f >> (24 + k)) & 1 != 0 {
-            CTX_MAG + 2
-        } else {
-            CTX_MAG + usize::from(nb & NEIGHBOURS != 0)
-        };
-        let bit = src.decision(cx, ctx);
-        // The sample holds the midpoint of the plane above: move it by half a
-        // step of this plane, up for a 1 and down for a 0.
-        let v = &mut self.rows[k as usize * self.w + x];
-        *v = v
-            .wrapping_add(half)
-            .wrapping_sub((2 * half) & bit.wrapping_sub(1));
-        *f |= 1 << (24 + k);
+        let half = 1u32 << bp;
+        macro_rules! at {
+            ($k:expr) => {
+                if m & (1 << (3 * $k)) != 0 {
+                    let ctx = if (f >> (MU + 3 * $k)) & 1 != 0 {
+                        CTX_MAG + 2
+                    } else {
+                        CTX_MAG + usize::from((f >> (3 * $k)) & NEIGHBOURS != 0)
+                    };
+                    let bit = src.decision(cx, ctx);
+                    // The sample holds the midpoint of the plane above: move it by
+                    // half a step of this plane, up for a 1 and down for a 0.
+                    let v = &mut self.samples[$k as usize];
+                    *v = v
+                        .wrapping_add(half)
+                        .wrapping_sub((2 * half) & bit.wrapping_sub(1));
+                    f |= 1 << (MU + 3 * $k);
+                }
+            };
+        }
+        at!(0);
+        at!(1);
+        at!(2);
+        at!(3);
+        self.cur[1].set(f);
     }
 
-    /// Cleanup (D.3.4).
+    /// Cleanup (D.3.4) of the column's first `h` samples.
     #[inline(always)]
-    fn cleanup<const FULL: bool>(
-        &mut self,
-        src: &mut Mq,
-        cx: &mut Contexts,
-        bp: u32,
-        zc: &[u8; 512],
-    ) {
+    fn cleanup(&mut self, src: &mut Mq, cx: &mut Contexts, bp: u32, zc: &[u8; 512], h: u32) {
+        let mut f = self.cur[1].get();
         let value = 3 << bp;
-        for x in 0..self.w {
-            let mut f = self.cur[x + 1];
-            if !FULL {
-                for k in 0..self.height() {
-                    self.cleanup_at(src, cx, &mut f, x, k, value, zc);
-                }
-            } else if f & (SIG_ALL | PI_ALL) == 0 {
-                if src.decode(cx, CTX_RUN) == 0 {
-                    continue;
-                }
-                let mut k = src.decode(cx, CTX_UNI) << 1;
-                k |= src.decode(cx, CTX_UNI);
-                self.newly(src, cx, &mut f, x, k, value);
-                while k < 3 {
-                    k += 1;
-                    self.cleanup_at(src, cx, &mut f, x, k, value, zc);
-                }
-            } else {
-                self.cleanup_at(src, cx, &mut f, x, 0, value, zc);
-                self.cleanup_at(src, cx, &mut f, x, 1, value, zc);
-                self.cleanup_at(src, cx, &mut f, x, 2, value, zc);
-                self.cleanup_at(src, cx, &mut f, x, 3, value, zc);
+        let m;
+        if f & (SIG_ALL | PI_ALL) == 0 && h == 4 {
+            if src.decode(cx, CTX_RUN) == 0 {
+                return;
             }
-            self.cur[x + 1] = f & !PI_ALL;
+            let mut k = src.decode(cx, CTX_UNI) << 1;
+            k |= src.decode(cx, CTX_UNI);
+            self.newly(src, cx, &mut f, k, value);
+            m = (0o1110 << (3 * k)) & EACH;
+        } else {
+            m = !((f >> 4) | (f >> PI)) & EACH;
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    fn cleanup_at(
-        &mut self,
-        src: &mut Mq,
-        cx: &mut Contexts,
-        f: &mut u32,
-        x: usize,
-        k: u32,
-        value: u32,
-        zc: &[u8; 512],
-    ) {
-        let nb = (*f >> (3 * k)) & 0x1FF;
-        if ((nb >> 4) | (*f >> (28 + k))) & 1 == 0
-            && src.decode(cx, usize::from(zc[nb as usize])) != 0
-        {
-            self.newly(src, cx, f, x, k, value);
+        if m != 0 {
+            macro_rules! at {
+                ($k:expr) => {
+                    if m & (1 << (3 * $k)) != 0 {
+                        let nb = (f >> (3 * $k)) & 0x1FF;
+                        if src.decode(cx, usize::from(zc[nb as usize])) != 0 {
+                            self.newly(src, cx, &mut f, $k, value);
+                        }
+                    }
+                };
+            }
+            at!(0);
+            if h > 1 {
+                at!(1);
+            }
+            if h > 2 {
+                at!(2);
+            }
+            if h > 3 {
+                at!(3);
+            }
         }
+        self.cur[1].set(f & !PI_ALL);
     }
 }
 
@@ -418,9 +377,10 @@ impl T1 {
         segments: &[Segment],
     ) {
         self.w = w;
+        self.h = h;
         self.causal = style & STYLE_CAUSAL != 0;
         self.data.clear();
-        self.data.resize(w * h, 0);
+        self.data.resize(w * h.next_multiple_of(4), 0);
         self.flags.clear();
         self.flags.resize((w + 2) * (h.div_ceil(4) + 2), 0);
         let zc = &ZC[class];
@@ -460,23 +420,32 @@ impl T1 {
         }
     }
 
-    /// The block's stripes, top to bottom, and whether each has four rows.
+    /// Visit the block's stripe columns, in scan order, with the number of
+    /// their rows.
     #[inline(always)]
-    fn stripes(&mut self, mut body: impl FnMut(Stripe, bool)) {
+    fn columns(&mut self, mut body: impl FnMut(Place, u32)) {
         let fw = self.w + 2;
-        for (i, rows) in self.data.chunks_mut(4 * self.w).enumerate() {
-            let (up, rest) = self.flags[i * fw..(i + 3) * fw].split_at_mut(fw);
-            let (cur, down) = rest.split_at_mut(fw);
-            let full = rows.len() == 4 * self.w;
-            let st = Stripe {
-                up,
-                cur,
-                down,
-                rows,
-                w: self.w,
-                causal: self.causal,
-            };
-            body(st, full);
+        let causal = self.causal;
+        let flags = Cell::from_mut(&mut self.flags[..]).as_slice_of_cells();
+        for (i, stripe) in self.data.chunks_exact_mut(4 * self.w).enumerate() {
+            let [up, cur, down] = [0, 1, 2].map(|j| flags[(i + j) * fw..][..fw].windows(3));
+            let rows = self.h - 4 * i;
+            let places = stripe.chunks_exact_mut(4).zip(cur).zip(up).zip(down);
+            let places = places.map(|(((samples, cur), up), down)| Place {
+                up: three(up),
+                cur: three(cur),
+                down: three(down),
+                samples: match samples.first_chunk_mut() {
+                    Some(s) => s,
+                    None => unreachable!("chunks of four"),
+                },
+                causal,
+            });
+            if rows >= 4 {
+                places.for_each(|p| body(p, 4));
+            } else {
+                places.for_each(|p| body(p, rows as u32));
+            }
         }
     }
 
@@ -485,37 +454,36 @@ impl T1 {
 
     fn significance<S: Source>(&mut self, src: &mut S, cx: &mut Contexts, bp: u32, zc: &[u8; 512]) {
         let mut s = *src;
-        self.stripes(|mut st, full| {
-            if full {
-                st.significance::<S, true>(&mut s, cx, bp, zc);
-            } else {
-                st.significance::<S, false>(&mut s, cx, bp, zc);
-            }
-        });
+        self.columns(
+            #[inline(always)]
+            |mut p, h| p.significance(&mut s, cx, bp, zc, h),
+        );
         *src = s;
     }
 
     fn refinement<S: Source>(&mut self, src: &mut S, cx: &mut Contexts, bp: u32) {
         let mut s = *src;
-        self.stripes(|mut st, full| {
-            if full {
-                st.refinement::<S, true>(&mut s, cx, bp);
-            } else {
-                st.refinement::<S, false>(&mut s, cx, bp);
-            }
-        });
+        self.columns(
+            #[inline(always)]
+            |mut p, _| p.refinement(&mut s, cx, bp),
+        );
         *src = s;
     }
 
     fn cleanup(&mut self, src: &mut Mq, cx: &mut Contexts, bp: u32, zc: &[u8; 512]) {
         let mut s = *src;
-        self.stripes(|mut st, full| {
-            if full {
-                st.cleanup::<true>(&mut s, cx, bp, zc);
-            } else {
-                st.cleanup::<false>(&mut s, cx, bp, zc);
-            }
-        });
+        self.columns(
+            #[inline(always)]
+            |mut p, h| p.cleanup(&mut s, cx, bp, zc, h),
+        );
         *src = s;
+    }
+}
+
+#[inline(always)]
+fn three(window: &[Cell<u32>]) -> &[Cell<u32>; 3] {
+    match window.first_chunk() {
+        Some(w) => w,
+        None => unreachable!("windows of three"),
     }
 }

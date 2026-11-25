@@ -717,7 +717,7 @@ impl TileComp {
         }
         let first = block.y as usize * stride + block.x as usize;
         let step = plane.reals.then_some(band.step);
-        dequantize(&s.t1.data, w, &mut plane.data[first..], stride, step);
+        dequantize(&s.t1.data, (w, h), &mut plane.data[first..], stride, step);
         Ok(())
     }
 }

@@ -55,6 +55,8 @@ trait Isa: Copy {
     unsafe fn clampf(a: Self::R, lo: Self::R, hi: Self::R) -> Self::R;
     /// Integer to real.
     unsafe fn to_real(a: Self::R) -> Self::R;
+    /// `N` consecutive columns of four samples, as four rows.
+    unsafe fn load_columns(p: *const i32) -> [Self::R; 4];
     /// `a[0] b[0] a[1] b[1] ..`, low and high half.
     unsafe fn zip(a: Self::R, b: Self::R) -> (Self::R, Self::R);
     #[inline(always)]
@@ -142,6 +144,10 @@ impl Isa for Scalar {
         real(a as f32)
     }
     #[inline(always)]
+    unsafe fn load_columns(p: *const i32) -> [i32; 4] {
+        [*p, *p.add(1), *p.add(2), *p.add(3)]
+    }
+    #[inline(always)]
     unsafe fn zip(a: i32, b: i32) -> (i32, i32) {
         (a, b)
     }
@@ -227,6 +233,24 @@ mod x86 {
             _mm_castps_si128(_mm_cvtepi32_ps(a))
         }
         #[inline(always)]
+        unsafe fn load_columns(p: *const i32) -> [__m128i; 4] {
+            let c = [0, 4, 8, 12].map(|i| Self::load(p.add(i)));
+            let (a, b) = (
+                _mm_unpacklo_epi32(c[0], c[1]),
+                _mm_unpackhi_epi32(c[0], c[1]),
+            );
+            let (d, e) = (
+                _mm_unpacklo_epi32(c[2], c[3]),
+                _mm_unpackhi_epi32(c[2], c[3]),
+            );
+            [
+                _mm_unpacklo_epi64(a, d),
+                _mm_unpackhi_epi64(a, d),
+                _mm_unpacklo_epi64(b, e),
+                _mm_unpackhi_epi64(b, e),
+            ]
+        }
+        #[inline(always)]
         unsafe fn zip(a: __m128i, b: __m128i) -> (__m128i, __m128i) {
             (_mm_unpacklo_epi32(a, b), _mm_unpackhi_epi32(a, b))
         }
@@ -301,6 +325,28 @@ mod x86 {
         #[inline(always)]
         unsafe fn to_real(a: __m256i) -> __m256i {
             _mm256_castps_si256(_mm256_cvtepi32_ps(a))
+        }
+        #[inline(always)]
+        unsafe fn load_columns(p: *const i32) -> [__m256i; 4] {
+            // Columns i and i + 4 share a register.
+            let c = [0, 4, 8, 12].map(|i| {
+                let (l, h) = (_mm_loadu_si128(p.add(i).cast()), p.add(i + 16).cast());
+                _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(l), _mm_loadu_si128(h))
+            });
+            let (a, b) = (
+                _mm256_unpacklo_epi32(c[0], c[1]),
+                _mm256_unpackhi_epi32(c[0], c[1]),
+            );
+            let (d, e) = (
+                _mm256_unpacklo_epi32(c[2], c[3]),
+                _mm256_unpackhi_epi32(c[2], c[3]),
+            );
+            [
+                _mm256_unpacklo_epi64(a, d),
+                _mm256_unpackhi_epi64(a, d),
+                _mm256_unpacklo_epi64(b, e),
+                _mm256_unpackhi_epi64(b, e),
+            ]
         }
         #[inline(always)]
         unsafe fn zip(a: __m256i, b: __m256i) -> (__m256i, __m256i) {
@@ -398,6 +444,11 @@ mod neon {
         #[inline(always)]
         unsafe fn to_real(a: int32x4_t) -> int32x4_t {
             si(vcvtq_f32_s32(a))
+        }
+        #[inline(always)]
+        unsafe fn load_columns(p: *const i32) -> [int32x4_t; 4] {
+            let int32x4x4_t(a, b, c, d) = vld4q_s32(p);
+            [a, b, c, d]
         }
         #[inline(always)]
         unsafe fn zip(a: int32x4_t, b: int32x4_t) -> (int32x4_t, int32x4_t) {
@@ -1017,49 +1068,83 @@ impl Dequant for ToReal {
 
 /// # Safety
 ///
-/// `src` has `w * h` samples, `dst` has `h` rows of `w`, `stride` apart.
+/// `src` has stripes of `4 * w` samples for `h` rows, `dst` has `h` rows of
+/// `w`, `stride` apart.
 #[inline(always)]
 unsafe fn dequant_loop<I: Isa, D: Dequant>(
     src: *const i32,
     dst: *mut i32,
     stride: usize,
-    w: usize,
-    h: usize,
+    (w, h): (usize, usize),
     step: f32,
 ) {
-    for y in 0..h {
+    let mut y = 0;
+    while y < h {
         let (src, dst) = (src.add(y * w), dst.add(y * stride));
-        let mut i = 0;
-        while i + I::N <= w {
-            I::store(dst.add(i), D::apply::<I>(I::load(src.add(i)), step));
-            i += I::N;
+        if y + 4 <= h {
+            dequant_stripe::<I, D>(src, dst, stride, w, 4, step);
+        } else {
+            dequant_stripe::<I, D>(src, dst, stride, w, h - y, step);
         }
-        while i < w {
-            *dst.add(i) = D::apply::<Scalar>(*src.add(i), step);
-            i += 1;
-        }
+        y += 4;
     }
 }
 
-dispatch!(dequant_int = dequant_loop::<Halve>(src: *const i32, dst: *mut i32, stride: usize, w: usize, h: usize, step: f32));
-dispatch!(dequant_real = dequant_loop::<ToReal>(src: *const i32, dst: *mut i32, stride: usize, w: usize, h: usize, step: f32));
+/// # Safety
+///
+/// `src` has `4 * w` samples, `dst` has `rows` (up to four) rows of `w`,
+/// `stride` apart.
+#[inline(always)]
+unsafe fn dequant_stripe<I: Isa, D: Dequant>(
+    src: *const i32,
+    dst: *mut i32,
+    stride: usize,
+    w: usize,
+    rows: usize,
+    step: f32,
+) {
+    let mut x = 0;
+    while x + I::N <= w {
+        let v = I::load_columns(src.add(4 * x));
+        for (i, &v) in v.iter().enumerate().take(rows) {
+            I::store(dst.add(i * stride + x), D::apply::<I>(v, step));
+        }
+        x += I::N;
+    }
+    while x < w {
+        for i in 0..rows {
+            *dst.add(i * stride + x) = D::apply::<Scalar>(*src.add(4 * x + i), step);
+        }
+        x += 1;
+    }
+}
 
-/// Coefficients of a code-block, `w` a row (bit 31 the sign, below it twice
-/// the magnitude), into a plane of rows `stride` apart: times half of `step`
-/// as reals, or halved towards zero as integers when there is no step.
-pub(crate) fn dequantize(src: &[u32], w: usize, dst: &mut [i32], stride: usize, step: Option<f32>) {
-    if w == 0 || src.is_empty() {
+dispatch!(dequant_int = dequant_loop::<Halve>(src: *const i32, dst: *mut i32, stride: usize, n: (usize, usize), step: f32));
+dispatch!(dequant_real = dequant_loop::<ToReal>(src: *const i32, dst: *mut i32, stride: usize, n: (usize, usize), step: f32));
+
+/// Coefficients of a `w` x `h` code-block (bit 31 the sign, below it twice the
+/// magnitude; stripes of four rows, in them column by column) into a plane of
+/// rows `stride` apart: times half of `step` as reals, or halved towards zero
+/// as integers when there is no step.
+pub(crate) fn dequantize(
+    src: &[u32],
+    (w, h): (usize, usize),
+    dst: &mut [i32],
+    stride: usize,
+    step: Option<f32>,
+) {
+    if w == 0 || h == 0 {
         return;
     }
-    let h = src.len() / w;
+    assert!(src.len() >= w * h.next_multiple_of(4));
     assert!(w <= stride && dst.len() >= (h - 1) * stride + w);
     let (src, dst) = (src.as_ptr().cast::<i32>(), dst.as_mut_ptr());
-    // SAFETY: `src` has `h` whole rows, `dst` was just checked; `u32` and
-    // `i32` have the same layout.
+    // SAFETY: both lengths were just checked; `u32` and `i32` have the same
+    // layout.
     unsafe {
         match step {
-            None => dequant_int(src, dst, stride, w, h, 0.0),
-            Some(step) => dequant_real(src, dst, stride, w, h, step * 0.5),
+            None => dequant_int(src, dst, stride, (w, h), 0.0),
+            Some(step) => dequant_real(src, dst, stride, (w, h), step * 0.5),
         }
     }
 }
