@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use crate::codestream::{self, Codestream, Siz, TileParts};
 use crate::dwt::Plane;
 use crate::error::{try_vec, JpxError, JpxResult};
+use crate::kernels::{self, Level};
 use crate::tile::{Budget, PacketData, Scratch, Tile};
 use crate::DecodeOptions;
 
@@ -109,13 +110,17 @@ fn decode_tile(
     let body: Cow<[u8]> = match parts.bodies.as_slice() {
         [] => Cow::Borrowed(&[]),
         [one] => Cow::Borrowed(&cs[one.clone()]),
-        many => Cow::Owned(many.iter().flat_map(|r| &cs[r.clone()]).copied().collect()),
+        many => {
+            let parts: Vec<&[u8]> = many.iter().map(|r| &cs[r.clone()]).collect();
+            Cow::Owned(parts.concat())
+        }
     };
     let packed = parts.packed_headers(cs);
     let mut data = PacketData {
         body: &body,
         pos: 0,
         packed: packed.as_deref().map(|h| (h, 0)),
+        pending: Vec::new(),
         lenient: options.allow_truncated,
         clean_end: false,
         cut: false,
@@ -144,69 +149,48 @@ fn decode_tile(
         }
         inverse_mct(&mut planes)?;
         for (c, plane) in planes.into_iter().enumerate() {
-            store(siz, c, reduce, rects[c], plane, sizes[c], &mut out[c])?;
+            store(
+                siz,
+                c,
+                reduce,
+                rects[c],
+                plane,
+                sizes[c],
+                scratch,
+                &mut out[c],
+            )?;
         }
         rest.start = 3;
     }
     for c in rest {
         let comp = &tile.comps[c];
         let plane = comp.reconstruct(&body, scratch)?;
-        store(siz, c, reduce, comp.rect(), plane, sizes[c], &mut out[c])?;
+        store(
+            siz,
+            c,
+            reduce,
+            comp.rect(),
+            plane,
+            sizes[c],
+            scratch,
+            &mut out[c],
+        )?;
     }
     Ok(complete)
 }
 
 /// Inverse RCT or ICT (G.2, G.3) on the first three components.
 fn inverse_mct(planes: &mut [Plane]) -> JpxResult<()> {
-    match planes {
-        [Plane::Int(a), Plane::Int(b), Plane::Int(c)] => {
-            for ((a, b), c) in a.iter_mut().zip(b).zip(c) {
-                let (y, u, v) = (*a, *b, *c);
-                let g = y.wrapping_sub(u.wrapping_add(v) >> 2);
-                *a = v.wrapping_add(g);
-                *b = g;
-                *c = u.wrapping_add(g);
-            }
-            Ok(())
-        }
-        [Plane::Real(a), Plane::Real(b), Plane::Real(c)] => {
-            for ((a, b), c) in a.iter_mut().zip(b).zip(c) {
-                let (y, u, v) = (*a, *b, *c);
-                *a = y + v * 1.402;
-                *b = y - u * 0.344_13 - v * 0.714_14;
-                *c = y + u * 1.772;
-            }
-            Ok(())
-        }
-        _ => Err(JpxError::Format("colour transform over different wavelets")),
+    let [a, b, c] = planes else { return Ok(()) };
+    if a.reals != b.reals || a.reals != c.reals {
+        return Err(JpxError::Format("colour transform over different wavelets"));
     }
-}
-
-/// `1.5 * 2^23`: adding it leaves an integer of up to 22 bits in the low
-/// mantissa bits, rounded to nearest, halves to even.
-const ROUND: f32 = 12_582_912.0;
-
-/// Level shift, round and clamp one row of reals. Up to 20 bits the sum with
-/// [`ROUND`] does the rounding, which vectorizes; NaN cannot get through the
-/// clamp (`f32::max` takes the other operand).
-fn level_row(dst: &mut [i32], src: &[f32], bits: u8, shift: i32, min: i32, max: i32) {
-    if bits <= 20 {
-        let (lo, hi) = ((min - shift) as f32, (max - shift) as f32);
-        let bias = shift.wrapping_sub(ROUND.to_bits() as i32);
-        for (d, &s) in dst.iter_mut().zip(src) {
-            let v = s.max(lo).min(hi) + ROUND;
-            *d = (v.to_bits() as i32).wrapping_add(bias);
-        }
-    } else {
-        for (d, &s) in dst.iter_mut().zip(src) {
-            *d = (s.round_ties_even() as i32)
-                .saturating_add(shift)
-                .clamp(min, max);
-        }
-    }
+    kernels::inverse_mct([&mut a.data, &mut b.data, &mut c.data], a.reals);
+    Ok(())
 }
 
 /// DC level shift, clamp and copy of a tile-component into its component.
+#[allow(clippy::too_many_arguments)]
 fn store(
     siz: &Siz,
     c: usize,
@@ -214,15 +198,11 @@ fn store(
     rect: [u32; 4],
     plane: Plane,
     (w, h): (u64, u64),
+    scratch: &mut Scratch,
     out: &mut Vec<i32>,
 ) -> JpxResult<()> {
     let k = siz.comps[c];
-    let half = 1i64 << (k.bits - 1);
-    let (shift, min, max) = if k.signed {
-        (0, -half as i32, (half - 1) as i32)
-    } else {
-        (half as i32, 0, (2 * half - 1) as i32)
-    };
+    let level = Level::new(k.bits, k.signed);
     let origin = siz.comp_rect(c, reduce);
     let (w, h) = (w as usize, h as usize);
     let tw = rect[2].saturating_sub(rect[0]) as usize;
@@ -230,16 +210,10 @@ fn store(
     if tw == 0 || th == 0 {
         return Ok(());
     }
-    let level = |v: i32| v.saturating_add(shift).clamp(min, max);
-    match plane {
-        Plane::Int(mut p) if out.is_empty() && (tw, th) == (w, h) => {
-            for v in &mut p {
-                *v = level(*v);
-            }
-            *out = p;
-            return Ok(());
-        }
-        _ => {}
+    if out.is_empty() && (tw, th) == (w, h) {
+        *out = plane.data;
+        kernels::level_in_place(out, level, plane.reals);
+        return Ok(());
     }
     if out.is_empty() {
         *out = try_vec(w * h)?;
@@ -247,19 +221,9 @@ fn store(
     let x = (rect[0] - origin[0]) as usize;
     let y = (rect[1] - origin[1]) as usize;
     let rows = out.chunks_exact_mut(w).skip(y).take(th);
-    match &plane {
-        Plane::Int(p) => {
-            for (dst, src) in rows.zip(p.chunks_exact(tw)) {
-                for (d, &s) in dst[x..x + tw].iter_mut().zip(src) {
-                    *d = level(s);
-                }
-            }
-        }
-        Plane::Real(p) => {
-            for (dst, src) in rows.zip(p.chunks_exact(tw)) {
-                level_row(&mut dst[x..x + tw], src, k.bits, shift, min, max);
-            }
-        }
+    for (dst, src) in rows.zip(plane.data.chunks_exact(tw)) {
+        kernels::level_into(&mut dst[x..x + tw], src, level, plane.reals);
     }
+    scratch.spare.push(plane.data);
     Ok(())
 }

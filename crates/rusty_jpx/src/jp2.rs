@@ -189,17 +189,20 @@ pub(crate) fn apply_palette(
     let mut out = Vec::with_capacity(cmap.len());
     for &(source, kind, column) in cmap {
         let src = &components[usize::from(source)];
-        let mut channel = src.clone();
-        if kind == 1 {
-            let (bits, signed) = palette.columns[usize::from(column)];
-            channel.bits = bits;
-            channel.signed = signed;
+        let channel = if kind == 1 {
+            let column = usize::from(column);
+            let (bits, signed) = palette.columns[column];
             let last = palette.entries as i32 - 1;
-            for v in &mut channel.data {
-                let row = (*v).clamp(0, last) as usize;
-                *v = palette.values[row * n + usize::from(column)];
+            let entry = |&v: &i32| palette.values[v.clamp(0, last) as usize * n + column];
+            Component {
+                bits,
+                signed,
+                data: src.data.iter().map(entry).collect(),
+                ..*src
             }
-        }
+        } else {
+            src.clone()
+        };
         out.push(channel);
     }
     Ok(out)

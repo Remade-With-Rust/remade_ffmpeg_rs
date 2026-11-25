@@ -40,13 +40,17 @@ impl fmt::Display for JpxError {
 
 impl std::error::Error for JpxError {}
 
-/// A vector of `n` default values, or a `Limit` error when the allocator
-/// refuses it.
-pub(crate) fn try_vec<T: Clone + Default>(n: usize) -> JpxResult<Vec<T>> {
-    let mut v = Vec::new();
-    v.try_reserve_exact(n)
-        .map_err(|_| JpxError::Limit("out of memory"))?;
-    v.resize(n, T::default());
+/// A vector of `n` zeros, or a `Limit` error when the allocator refuses it.
+pub(crate) fn try_vec(n: usize) -> JpxResult<Vec<i32>> {
+    crate::kernels::zeros(n).ok_or(JpxError::Limit("out of memory"))
+}
+
+/// `v` with room for `n` values, whatever they are: a buffer for reuse.
+pub(crate) fn try_grow(v: &mut Vec<i32>, n: usize) -> JpxResult<&mut [i32]> {
+    if v.len() < n {
+        *v = Vec::new();
+        *v = try_vec(n)?;
+    }
     Ok(v)
 }
 

@@ -53,131 +53,166 @@ const STATES: [(u16, u8, u8, u8); 47] = [
     (0x5601, 46, 46, 0),
 ];
 
-/// One context, packed so that a decision needs a single load:
-/// `Qe << 16 | MPS-successor << 9 | LPS-successor << 2 | MPS`.
-/// Successors index this table (state * 2 + MPS).
-static TABLE: [u32; 128] = {
-    let mut t = [0u32; 128];
+/// A context, from `i = state * 2 + MPS`: `Qe << 48 | i << 4 | MPS`.
+const fn context(i: usize) -> u64 {
+    ((STATES[i / 2].0 as u64) << 48) | (i << 4 | i & 1) as u64
+}
+
+/// Contexts after an MPS (even index) and an LPS (odd), by `2 * i`.
+static NEXT: [u64; 256] = {
+    let mut t = [0; 256];
     let mut i = 0;
     while i < 94 {
-        let (qe, nm, nl, sw) = STATES[i / 2];
-        let mps = (i & 1) as u32;
-        let nm = nm as u32 * 2 + mps;
-        let nl = nl as u32 * 2 + (mps ^ sw as u32);
-        t[i] = ((qe as u32) << 16) | (nm << 9) | (nl << 2) | mps;
+        let (_, nm, nl, sw) = STATES[i / 2];
+        t[2 * i] = context(nm as usize * 2 + (i & 1));
+        t[2 * i + 1] = context(nl as usize * 2 + ((i & 1) ^ sw as usize));
         i += 1;
     }
     t
 };
 
-pub(crate) const CTX_MAG: usize = 14;
-pub(crate) const CTX_RUN: usize = 17;
-pub(crate) const CTX_UNI: usize = 18;
+/// The contexts of a code-block (Table D.1 to D.4): 0 to 8 zero coding, 9 to
+/// 13 signs, 14 to 16 magnitude refinement, 17 runs and 18 the uniform one.
+/// An enumeration, so that indexing by one needs no check.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+#[rustfmt::skip]
+pub(crate) enum Ctx {
+    C0, C1, C2, C3, C4, C5, C6, C7, C8, C9, C10, C11, C12, C13, C14, C15, C16, Run, Uni,
+}
 
-/// The 19 context states of a code-block (rounded up so that a masked index
-/// is always in range).
+impl Ctx {
+    /// Context `n`, below 17.
+    pub const fn new(n: usize) -> Self {
+        use Ctx::*;
+        [
+            C0, C1, C2, C3, C4, C5, C6, C7, C8, C9, C10, C11, C12, C13, C14, C15, C16,
+        ][n]
+    }
+}
+
+/// The context states of a code-block.
 #[derive(Clone, Copy)]
-pub(crate) struct Contexts([u32; 32]);
+pub(crate) struct Contexts([u64; 19]);
 
 impl Contexts {
     /// Initial states (Table D.7).
     pub fn new() -> Self {
-        let mut c = [TABLE[0]; 32];
-        c[0] = TABLE[4 * 2];
-        c[CTX_RUN] = TABLE[3 * 2];
-        c[CTX_UNI] = TABLE[46 * 2];
+        let mut c = [context(0); 19];
+        c[Ctx::C0 as usize] = context(4 * 2);
+        c[Ctx::Run as usize] = context(3 * 2);
+        c[Ctx::Uni as usize] = context(46 * 2);
         Self(c)
     }
 }
 
-/// MQ decoder registers (software conventions, C.3).
+/// MQ decoder registers (software conventions, C.3), at the top of 64 bits,
+/// so that there is room for several bytes below `Chigh`.
 ///
-/// `data` must end with the two bytes `FF FF`: the decoder stops at them and
-/// feeds ones from there on, as the standard asks for at a marker.
+/// Past its end the data reads as `FF FF`, which makes the decoder feed ones
+/// from there on, as the standard asks for at a marker.
 #[derive(Clone, Copy)]
 pub(crate) struct Mq<'a> {
     data: &'a [u8],
+    /// Of the last byte read.
     pos: usize,
-    a: u32,
-    c: u32,
+    a: u64,
+    c: u64,
+    /// Valid bits below `Chigh`.
     ct: u32,
+}
+
+/// Shift `C` by `n` (at most 15) bits, more than the `ct` that are valid.
+#[inline(never)]
+fn shift_in(data: &[u8], pos: usize, c: u64, ct: u32, n: u32) -> (usize, u64, u32) {
+    let (mut pos, mut c, mut n) = (pos, c << ct, n - ct);
+    if let Some(&[last, b0, b1, b2, b3, b4]) = data.get(pos..).and_then(|d| d.first_chunk()) {
+        // Five plain bytes.
+        let v = u32::from_be_bytes([b0, b1, b2, b3]);
+        if last != 0xFF && !has_ff(v) {
+            c += (u64::from(v) << 16) | (u64::from(b4) << 8);
+            return (pos + 5, c << n, 40 - n);
+        }
+    }
+    let at = |i: usize| data.get(i).copied().unwrap_or(0xFF);
+    loop {
+        // A byte after FF has seven bits, and one that carries into the bits
+        // before it.
+        let next = u64::from(at(pos + 1));
+        let ct;
+        if at(pos) != 0xFF {
+            pos += 1;
+            c = c.wrapping_add(next << 40);
+            ct = 8;
+        } else if next > 0x8F {
+            c = c.wrapping_add(0xFF << 40);
+            ct = 8;
+        } else {
+            pos += 1;
+            c = c.wrapping_add(next << 41);
+            ct = 7;
+        }
+        let s = n.min(ct);
+        c <<= s;
+        n -= s;
+        if n == 0 {
+            return (pos, c, ct - s);
+        }
+    }
+}
+
+/// Whether one of four bytes is FF.
+#[inline(always)]
+fn has_ff(v: u32) -> bool {
+    let z = !v;
+    z.wrapping_sub(0x0101_0101) & v & 0x8080_8080 != 0
 }
 
 impl<'a> Mq<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        let mut m = Mq {
+        let first = data.first().copied().unwrap_or(0xFF);
+        let (pos, c, ct) = shift_in(data, 0, u64::from(first) << 48, 0, 7);
+        Mq {
             data,
-            pos: 0,
-            a: 0x8000,
-            c: u32::from(data[0]) << 16,
-            ct: 0,
-        };
-        m.byte_in();
-        m.c <<= 7;
-        m.ct -= 7;
-        m
-    }
-
-    #[inline]
-    fn byte_in(&mut self) {
-        let next = self.data.get(self.pos + 1).copied().unwrap_or(0xFF);
-        if self.data.get(self.pos).copied().unwrap_or(0xFF) == 0xFF {
-            if next > 0x8F {
-                self.c += 0xFF00;
-                self.ct = 8;
-            } else {
-                self.pos += 1;
-                self.c += u32::from(next) << 9;
-                self.ct = 7;
-            }
-        } else {
-            self.pos += 1;
-            self.c += u32::from(next) << 8;
-            self.ct = 8;
-        }
-    }
-
-    #[inline(always)]
-    fn renorm(&mut self) {
-        let mut n = self.a.leading_zeros() - 16;
-        loop {
-            if self.ct == 0 {
-                self.byte_in();
-            }
-            let s = n.min(self.ct);
-            self.a <<= s;
-            self.c <<= s;
-            self.ct -= s;
-            n -= s;
-            if n == 0 {
-                break;
-            }
+            pos,
+            a: 0x8000 << 48,
+            c,
+            ct,
         }
     }
 
     /// Decode one decision in context `ctx`.
     #[inline(always)]
-    pub fn decode(&mut self, cx: &mut Contexts, ctx: usize) -> u32 {
-        let e = cx.0[ctx & 31];
-        let qe = e >> 16;
-        self.a -= qe;
-        // `swapped`: the sub-interval sizes are inverted (conditional
-        // exchange), so the smaller one belongs to the MPS.
-        let swapped = self.a < qe;
-        let lps = if (self.c >> 16) < qe {
-            self.a = qe;
-            !swapped
+    pub fn decode(&mut self, cx: &mut Contexts, ctx: Ctx) -> u32 {
+        let ctx = ctx as usize;
+        let e = cx.0[ctx];
+        let qe = e & !0xFFFF;
+        let a;
+        let (c, low) = self.c.overflowing_sub(qe);
+        // The sub-interval sizes may be inverted (conditional exchange): then
+        // the smaller one belongs to the MPS.
+        let lps = if low {
+            a = qe;
+            self.a.wrapping_sub(qe) >= qe
         } else {
-            self.c -= qe << 16;
-            if self.a & 0x8000 != 0 {
-                return e & 1;
+            self.c = c;
+            a = self.a.wrapping_sub(qe);
+            if a >> 63 != 0 {
+                self.a = a;
+                return e as u32 & 1;
             }
-            swapped
+            a < qe
         };
-        let next = if lps { e >> 2 } else { e >> 9 };
-        cx.0[ctx & 31] = TABLE[(next & 127) as usize];
-        self.renorm();
-        (e & 1) ^ u32::from(lps)
+        cx.0[ctx] = NEXT[((e as usize & 0x7F0) >> 3) | usize::from(lps)];
+        let n = 63 - (a | 1).ilog2();
+        self.a = a << n;
+        if n <= self.ct {
+            self.c <<= n;
+            self.ct -= n;
+        } else {
+            (self.pos, self.c, self.ct) = shift_in(self.data, self.pos, self.c, self.ct, n);
+        }
+        (e as u32 ^ u32::from(lps)) & 1
     }
 }
 
@@ -244,7 +279,7 @@ mod tests {
         let mut mq = Mq::new(&coded);
         let mut cx = Contexts::new();
         for want in plain {
-            let got = (0..8).fold(0, |a, _| (a << 1) | mq.decode(&mut cx, 1));
+            let got = (0..8).fold(0, |a, _| (a << 1) | mq.decode(&mut cx, Ctx::C1));
             assert_eq!(got, want);
         }
     }
@@ -254,7 +289,127 @@ mod tests {
         let mut mq = Mq::new(&[0xFF, 0xFF]);
         let mut cx = Contexts::new();
         for i in 0..100_000 {
-            mq.decode(&mut cx, i % 19);
+            mq.decode(&mut cx, Ctx::new(i % 17));
+        }
+    }
+
+    /// The decoder of the standard's flow charts (C.3), bit by bit.
+    struct Book<'a> {
+        data: &'a [u8],
+        pos: usize,
+        a: u32,
+        c: u32,
+        ct: u32,
+        states: [(usize, u32); 19],
+    }
+
+    impl<'a> Book<'a> {
+        fn new(data: &'a [u8]) -> Self {
+            let mut states = [(0, 0); 19];
+            states[0].0 = 4;
+            states[17].0 = 3;
+            states[18].0 = 46;
+            let mut b = Book {
+                data,
+                pos: 0,
+                a: 0x8000,
+                c: 0,
+                ct: 0,
+                states,
+            };
+            b.c = b.at(0) << 16;
+            b.byte_in();
+            b.c <<= 7;
+            b.ct -= 7;
+            b
+        }
+
+        fn at(&self, i: usize) -> u32 {
+            self.data.get(i).map_or(0xFF, |&b| b.into())
+        }
+
+        fn byte_in(&mut self) {
+            let next = self.at(self.pos + 1);
+            if self.at(self.pos) != 0xFF {
+                self.pos += 1;
+                self.c = self.c.wrapping_add(next << 8);
+                self.ct = 8;
+            } else if next > 0x8F {
+                self.c = self.c.wrapping_add(0xFF00);
+                self.ct = 8;
+            } else {
+                self.pos += 1;
+                self.c = self.c.wrapping_add(next << 9);
+                self.ct = 7;
+            }
+        }
+
+        fn decode(&mut self, ctx: usize) -> u32 {
+            let (state, mps) = self.states[ctx];
+            let (qe, nm, nl, switch) = STATES[state];
+            let qe = u32::from(qe);
+            self.a -= qe;
+            let lps;
+            if self.c >> 16 < qe {
+                lps = self.a >= qe;
+                self.a = qe;
+            } else {
+                self.c -= qe << 16;
+                if self.a & 0x8000 != 0 {
+                    return mps;
+                }
+                lps = self.a < qe;
+            }
+            self.states[ctx] = if lps {
+                (nl.into(), mps ^ u32::from(switch))
+            } else {
+                (nm.into(), mps)
+            };
+            while self.a & 0x8000 == 0 {
+                if self.ct == 0 {
+                    self.byte_in();
+                }
+                self.a <<= 1;
+                self.c <<= 1;
+                self.ct -= 1;
+            }
+            mps ^ u32::from(lps)
+        }
+    }
+
+    /// Any bytes at all, those that no encoder writes included, and past the
+    /// end of them.
+    #[test]
+    fn matches_the_book() {
+        let mut seed = 7u64;
+        let mut random = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) as usize
+        };
+        for round in 0..3000 {
+            let n = random() % 200;
+            let data: Vec<u8> = (0..n)
+                .map(|_| match (round % 4, random()) {
+                    // Many FF, and what may follow them.
+                    (0, r) if r % 3 == 0 => 0xFF,
+                    (0, r) if r % 3 == 1 => 0x80 + (r / 3 % 0x12) as u8,
+                    (1, r) if r % 16 == 0 => 0xFF,
+                    (2, _) => 0xFF,
+                    (_, r) => r as u8,
+                })
+                .collect();
+            let mut mq = Mq::new(&data);
+            let mut cx = Contexts::new();
+            let mut book = Book::new(&data);
+            for i in 0..4000 {
+                let n = random() % 19;
+                let ctx = match n {
+                    17 => Ctx::Run,
+                    18 => Ctx::Uni,
+                    n => Ctx::new(n),
+                };
+                assert_eq!(mq.decode(&mut cx, ctx), book.decode(n), "{round} {i}");
+            }
         }
     }
 }

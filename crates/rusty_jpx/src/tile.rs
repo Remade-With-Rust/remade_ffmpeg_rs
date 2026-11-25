@@ -2,9 +2,10 @@
 //! (ISO/IEC 15444-1 Annex B).
 
 use crate::codestream::{ceil_shift, Params, Progression, Siz};
-use crate::dwt::Plane;
+use crate::dwt::{Lifting, Plane};
 use crate::error::{try_vec, JpxError, JpxResult};
-use crate::t1::{signed2, Segment, MAX_PLANES, STYLE_BYPASS, STYLE_TERMALL, T1};
+use crate::kernels::dequantize;
+use crate::t1::{Segment, MAX_PLANES, STYLE_BYPASS, STYLE_TERMALL, T1};
 use crate::tagtree::{Bits, TagTree};
 
 /// Image-wide budget for structures whose size the header alone decides.
@@ -103,6 +104,9 @@ pub(crate) struct PacketData<'a> {
     pub body: &'a [u8],
     pub pos: usize,
     pub packed: Option<(&'a [u8], usize)>,
+    /// Code-block contributions of the packet being read: band, block, bytes,
+    /// passes.
+    pub pending: Vec<(u8, u32, u32, u8)>,
     /// Keep what a short body still has instead of failing.
     pub lenient: bool,
     /// Set when the data ended at a packet boundary.
@@ -418,7 +422,8 @@ impl Tile {
             None => (data.body, data.pos),
         };
         let mut bits = Bits::new(header, start);
-        let mut pending: Vec<(u8, u32, u32, u8)> = Vec::new();
+        let mut pending = std::mem::take(&mut data.pending);
+        pending.clear();
         if bits.bit()? != 0 {
             for (bi, band) in precinct.bands.iter_mut().enumerate() {
                 read_band_header(band, bi as u8, layer, style, &mut bits, &mut pending)?;
@@ -432,7 +437,7 @@ impl Tile {
             Some((_, p)) => *p = pos,
             None => data.pos = pos,
         }
-        for (bi, block, len, passes) in pending {
+        for &(bi, block, len, passes) in &pending {
             let left = data.body.len() - data.pos;
             let mut len = len as usize;
             if len > left {
@@ -452,6 +457,7 @@ impl Tile {
             }
             data.pos += len;
         }
+        data.pending = pending;
         Ok(())
     }
 }
@@ -625,6 +631,9 @@ impl Resolution {
 #[derive(Default)]
 pub(crate) struct Scratch {
     t1: T1,
+    lifting: Lifting,
+    /// Planes to use again, their contents of no use.
+    pub spare: Vec<Vec<i32>>,
     bytes: Vec<u8>,
     segments: Vec<Segment>,
 }
@@ -640,28 +649,51 @@ impl TileComp {
         let top = self.rect();
         let w = top[2].saturating_sub(top[0]) as usize;
         let h = top[3].saturating_sub(top[1]) as usize;
-        let mut plane = if self.reversible {
-            Plane::Int(try_vec(w * h)?)
+        // A used buffer has to be overwritten all over: block by block when
+        // every precinct was seen.
+        let mut used = false;
+        let mut data = Vec::new();
+        if let Some(spare) = scratch.spare.pop() {
+            data = spare;
+            used = data.len() >= w * h;
+        }
+        if used {
+            data.truncate(w * h);
+            let seen = |r: &Resolution| r.precincts.iter().all(Option::is_some);
+            if !self.res[..self.keep].iter().all(seen) {
+                data.fill(0);
+                used = false;
+            }
         } else {
-            Plane::Real(try_vec(w * h)?)
+            data = try_vec(w * h)?;
+        }
+        let mut plane = Plane {
+            data,
+            reals: !self.reversible,
         };
         for res in &self.res[..self.keep] {
             for precinct in res.precincts.iter().flatten() {
                 for (band, info) in precinct.bands.iter().zip(&res.bands) {
                     for block in &band.blocks {
-                        if !block.chunks.is_empty() {
-                            self.block(block, info, body, scratch, &mut plane, w)?;
+                        if !self.block(block, info, body, scratch, &mut plane, w)? && used {
+                            let first = block.y as usize * w + block.x as usize;
+                            let rows = plane.data[first..].chunks_mut(w);
+                            for row in rows.take(usize::from(block.h)) {
+                                row[..usize::from(block.w)].fill(0);
+                            }
                         }
                     }
                 }
             }
         }
         for pair in self.res[..self.keep].windows(2) {
-            plane.synthesize(w, pair[0].rect, pair[1].rect)?;
+            plane.synthesize(w, pair[0].rect, pair[1].rect, &mut scratch.lifting)?;
         }
         Ok(plane)
     }
 
+    /// Decode a code-block into the plane; `false` when there is nothing to
+    /// decode.
     fn block(
         &self,
         block: &Block,
@@ -670,44 +702,49 @@ impl TileComp {
         s: &mut Scratch,
         plane: &mut Plane,
         stride: usize,
-    ) -> JpxResult<()> {
+    ) -> JpxResult<bool> {
         let planes =
             (band.planes + u32::from(self.roi)).saturating_sub(u32::from(block.zero_planes));
-        if planes == 0 {
-            return Ok(());
+        if planes == 0 || block.chunks.is_empty() {
+            return Ok(false);
         }
         if planes > MAX_PLANES {
             return Err(JpxError::Unsupported("more than 30 magnitude bit-planes"));
         }
-        s.bytes.clear();
-        s.segments.clear();
+        // Segments in one piece are read where they are; a segment spread over
+        // several packets has to be put together, and the others with it.
+        let mut whole = true;
         let mut pass = 0;
         for chunk in &block.chunks {
-            if starts_segment(self.style, pass) {
-                s.bytes.extend_from_slice(&[0xFF, 0xFF]);
+            whole &= starts_segment(self.style, pass);
+            pass += u32::from(chunk.passes);
+        }
+        s.bytes.clear();
+        s.segments.clear();
+        pass = 0;
+        for chunk in &block.chunks {
+            let mut range = chunk.start..chunk.start + chunk.len;
+            if !whole {
                 let start = s.bytes.len();
-                if let Some(last) = s.segments.last_mut() {
-                    last.end = start;
-                }
-                s.segments.push(Segment {
-                    passes: 0,
-                    start,
-                    end: start,
-                });
+                s.bytes.extend_from_slice(&body[range]);
+                range = start..s.bytes.len();
             }
-            s.bytes
-                .extend_from_slice(&body[chunk.start..chunk.start + chunk.len]);
-            if let Some(last) = s.segments.last_mut() {
-                last.passes += u32::from(chunk.passes);
+            match s.segments.last_mut() {
+                Some(last) if !starts_segment(self.style, pass) => {
+                    last.passes += u32::from(chunk.passes);
+                    last.end = range.end;
+                }
+                _ => s.segments.push(Segment {
+                    passes: u32::from(chunk.passes),
+                    start: range.start,
+                    end: range.end,
+                }),
             }
             pass += u32::from(chunk.passes);
         }
-        s.bytes.extend_from_slice(&[0xFF, 0xFF]);
-        if let Some(last) = s.segments.last_mut() {
-            last.end = s.bytes.len();
-        }
+        let bytes = if whole { body } else { &s.bytes };
         let (w, h) = (usize::from(block.w), usize::from(block.h));
-        s.t1.decode(w, h, planes, band.class, self.style, &s.bytes, &s.segments);
+        s.t1.decode(w, h, planes, band.class, self.style, bytes, &s.segments);
         if (1..MAX_PLANES).contains(&u32::from(self.roi)) {
             // Maxshift (H.1): anything at or above 2^s belongs to the region.
             let shift = u32::from(self.roi);
@@ -719,23 +756,8 @@ impl TileComp {
             }
         }
         let first = block.y as usize * stride + block.x as usize;
-        match plane {
-            Plane::Int(p) => {
-                for (row, out) in s.t1.data.chunks_exact(w).zip(p[first..].chunks_mut(stride)) {
-                    for (o, &v) in out.iter_mut().zip(row) {
-                        *o = signed2(v) / 2;
-                    }
-                }
-            }
-            Plane::Real(p) => {
-                let step = band.step * 0.5;
-                for (row, out) in s.t1.data.chunks_exact(w).zip(p[first..].chunks_mut(stride)) {
-                    for (o, &v) in out.iter_mut().zip(row) {
-                        *o = signed2(v) as f32 * step;
-                    }
-                }
-            }
-        }
-        Ok(())
+        let step = plane.reals.then_some(band.step);
+        dequantize(&s.t1.data, (w, h), &mut plane.data[first..], stride, step);
+        Ok(true)
     }
 }
