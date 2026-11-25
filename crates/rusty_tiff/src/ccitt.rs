@@ -5,6 +5,8 @@
 //! parameters: `K` selects [`Coding`] (`K < 0` is [`Coding::Group4`], `K = 0`
 //! [`Coding::Group3_1D`], `K > 0` [`Coding::Group3_2D`]), `Columns`,
 //! `Rows`, `EncodedByteAlign` and `BlackIs1` are fields of the same name.
+//! [`FilterOptions`] and [`decode_filter`] add that filter's `EndOfLine`,
+//! `EndOfBlock` and `DamagedRowsBeforeError`.
 //!
 //! Output is packed 1-bit rows, most significant bit first, each row padded to
 //! a whole byte. With `black_is_1` (the TIFF convention, and what libtiff
@@ -846,6 +848,331 @@ pub fn decode_g3(
         ..opts.clone()
     };
     decode(data, &o)
+}
+
+// ---------------------------------------------------------------------------
+// PDF CCITTFaxDecode semantics.
+
+/// Decoder parameters with the PDF `CCITTFaxDecode` end conditions
+/// (ISO 32000-1, 7.4.6): [`Options`] plus `EndOfLine`, `EndOfBlock` and
+/// `DamagedRowsBeforeError`. Used by [`decode_filter`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FilterOptions {
+    /// Coding, columns, rows, alignment, polarity and the output cap.
+    pub options: Options,
+    /// `EndOfLine`: an EOL code is required before every Group 3 row. EOL
+    /// codes are accepted either way. Default false.
+    pub end_of_line: bool,
+    /// `EndOfBlock`: the data ends with an end-of-block code (EOFB or RTC),
+    /// which overrides `rows`: rows are decoded until it, or until the data
+    /// ends. If false, decoding stops after `rows` rows or at the end of the
+    /// data, whichever comes first. Default true.
+    ///
+    /// Writers often leave the code out, so data that ends at a row boundary
+    /// is accepted either way, unless `rows` asks for more; and bytes after
+    /// `rows` rows that do not decode are ignored.
+    pub end_of_block: bool,
+    /// `DamagedRowsBeforeError`: how many damaged rows to tolerate. It applies
+    /// only if `end_of_line` is set and the coding is Group 3. A damaged row
+    /// is replaced by the row before it, or by a white row if that one was
+    /// damaged too, and decoding resumes at the next EOL. Default 0.
+    pub damaged_rows_before_error: u32,
+}
+
+impl FilterOptions {
+    /// The PDF defaults for the end conditions around `options`.
+    #[must_use]
+    pub fn new(options: Options) -> Self {
+        Self {
+            options,
+            end_of_line: false,
+            end_of_block: true,
+            damaged_rows_before_error: 0,
+        }
+    }
+
+    /// The PDF filter's parameters as they appear in `DecodeParms`: `K`,
+    /// `Columns` and `Rows` (0 or absent: unknown). Everything else gets its
+    /// PDF default, including `BlackIs1 = false`.
+    #[must_use]
+    pub fn from_pdf(k: i32, columns: u32, rows: u32) -> Self {
+        let coding = match k {
+            0 => Coding::Group3_1D,
+            1.. => Coding::Group3_2D,
+            _ => Coding::Group4,
+        };
+        let mut o = Options::new(coding, columns);
+        o.rows = (rows != 0).then_some(rows);
+        o.black_is_1 = false;
+        if k > 0 {
+            o.k = k as u32;
+        }
+        Self::new(o)
+    }
+
+    /// Set [`FilterOptions::end_of_line`].
+    #[must_use]
+    pub fn with_end_of_line(mut self, v: bool) -> Self {
+        self.end_of_line = v;
+        self
+    }
+
+    /// Set [`FilterOptions::end_of_block`].
+    #[must_use]
+    pub fn with_end_of_block(mut self, v: bool) -> Self {
+        self.end_of_block = v;
+        self
+    }
+
+    /// Set [`FilterOptions::damaged_rows_before_error`].
+    #[must_use]
+    pub fn with_damaged_rows_before_error(mut self, v: u32) -> Self {
+        self.damaged_rows_before_error = v;
+        self
+    }
+
+    /// Set `EncodedByteAlign`.
+    #[must_use]
+    pub fn with_encoded_byte_align(mut self, v: bool) -> Self {
+        self.options.encoded_byte_align = v;
+        self
+    }
+
+    /// Set `BlackIs1`.
+    #[must_use]
+    pub fn with_black_is_1(mut self, v: bool) -> Self {
+        self.options.black_is_1 = v;
+        self
+    }
+}
+
+/// What [`decode_filter`] produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Decoded {
+    /// Packed rows, as [`decode`] returns them.
+    pub data: Vec<u8>,
+    /// Rows in `data`. The end-of-block code decides, so this can differ from
+    /// `rows` in the options.
+    pub rows: u32,
+    /// How many of them replace damaged ones.
+    pub damaged_rows: u32,
+}
+
+/// How one row attempt ended.
+enum Next {
+    Row,
+    EndOfBlock,
+    /// The data is used up, at a row boundary.
+    EndOfData,
+}
+
+/// Decode with the PDF filter's end-of-line, end-of-block and damaged-row
+/// rules. [`decode`] is the simpler call for data of known height.
+///
+/// ```
+/// use rusty_tiff::ccitt::{self, FilterOptions};
+/// // /K -1 /Columns 16, rows unknown, BlackIs1 false.
+/// let f = FilterOptions::from_pdf(-1, 16, 0);
+/// let mut enc = f.options.clone();
+/// enc.rows = Some(2);
+/// let pixels = [0xFF, 0xFF, 0x00, 0xFF];
+/// let coded = ccitt::encode(&pixels, &enc).unwrap();
+/// let out = ccitt::decode_filter(&coded, &f).unwrap();
+/// assert_eq!((out.rows, &out.data[..]), (2, &pixels[..]));
+/// ```
+pub fn decode_filter(data: &[u8], opts: &FilterOptions) -> Result<Decoded, CcittError> {
+    let o = &opts.options;
+    let width = o.columns;
+    if width == 0 || width > 1 << 20 {
+        return err(0, format!("unsupported column count {width}"));
+    }
+    let stride = width.div_ceil(8) as usize;
+    let g3 = matches!(o.coding, Coding::Group3_1D | Coding::Group3_2D);
+    let tolerant = opts.end_of_line && g3;
+    let mut out = Decoded {
+        data: Vec::new(),
+        rows: 0,
+        damaged_rows: 0,
+    };
+    let mut r = RowReader {
+        b: Bits::new(data),
+        reference: vec![width; 3],
+        cur: Vec::new(),
+        eol_pending: false,
+        eols: opts.end_of_line,
+    };
+    // Changing elements of the last row, which a damaged one repeats, and
+    // whether that row was itself damaged.
+    let mut previous: Vec<u32> = Vec::new();
+    let mut previous_damaged = true;
+    loop {
+        let row = out.rows;
+        let enough = o.rows.is_some_and(|n| row >= n);
+        if enough && !opts.end_of_block {
+            break;
+        }
+        let damaged = match r.next(opts, row) {
+            Ok(Next::Row) => false,
+            Ok(Next::EndOfBlock) => break,
+            Ok(Next::EndOfData) => {
+                if opts.end_of_block && o.rows.is_some_and(|n| row < n) {
+                    return err(row, "data ended before the end-of-block code");
+                }
+                break;
+            }
+            // Past the declared rows there was no end-of-block code to find.
+            Err(_) if enough => break,
+            Err(e) => {
+                if !tolerant || out.damaged_rows >= opts.damaged_rows_before_error {
+                    return Err(e);
+                }
+                true
+            }
+        };
+        if damaged {
+            if !r.eol_pending {
+                while !r.b.rest_is_zero() && !r.eol_pending {
+                    r.eol_pending = r.b.take_eol();
+                    if !r.eol_pending {
+                        r.b.consume(1);
+                    }
+                }
+            }
+            out.damaged_rows += 1;
+            r.cur.clear();
+            if !previous_damaged {
+                r.cur.extend_from_slice(&previous);
+            }
+        }
+        if out.data.len() + stride > o.max_output_bytes {
+            return err(row, "output would exceed max_output_bytes");
+        }
+        let at = out.data.len();
+        out.data.resize(at + stride, 0);
+        render_row(&r.cur, width, &mut out.data[at..], o.black_is_1);
+        r.reference.clear();
+        r.reference.extend_from_slice(&r.cur);
+        r.reference.extend_from_slice(&[width; 3]);
+        previous.clone_from(&r.cur);
+        previous_damaged = damaged;
+        out.rows += 1;
+    }
+    Ok(out)
+}
+
+struct RowReader<'a> {
+    b: Bits<'a>,
+    reference: Vec<u32>,
+    cur: Vec<u32>,
+    /// An EOL has been consumed that belongs to the next row.
+    eol_pending: bool,
+    /// Rows have EOLs (always expected when required).
+    eols: bool,
+}
+
+/// Whether an EOL follows, after the tag bit of the one before in 2-D mode.
+fn at_eol(b: &mut Bits<'_>, coding: Coding) -> bool {
+    let save = b.pos;
+    if coding == Coding::Group3_2D {
+        b.consume(1);
+    }
+    let found = b.take_eol();
+    b.pos = save;
+    found
+}
+
+/// Whether two EOLs in a row follow.
+fn at_rtc(b: &mut Bits<'_>, coding: Coding) -> bool {
+    let save = b.pos;
+    let found = b.take_eol() && at_eol(b, coding);
+    b.pos = save;
+    found
+}
+
+impl RowReader<'_> {
+    /// Decode the next row into `cur`. After an error nothing but the bit
+    /// position (and `eol_pending`) is meaningful.
+    fn next(&mut self, opts: &FilterOptions, row: u32) -> Result<Next, CcittError> {
+        let o = &opts.options;
+        let width = o.columns;
+        let b = &mut self.b;
+        let mut two_d = o.coding == Coding::Group4;
+        match o.coding {
+            Coding::ModifiedHuffman => b.align(),
+            Coding::Group4 => {
+                if o.encoded_byte_align {
+                    b.align();
+                }
+                if b.peek(24) == 0x00_1001 {
+                    return Ok(Next::EndOfBlock);
+                }
+            }
+            Coding::Group3_1D | Coding::Group3_2D => {
+                let had_eol = if self.eol_pending {
+                    self.eol_pending = false;
+                    true
+                } else if o.encoded_byte_align && !self.eols {
+                    // Alignment zeros and a code that starts with zeros can
+                    // look like an EOL: without EOLs so far, only one at the
+                    // boundary counts. RTC need not be aligned.
+                    if at_rtc(b, o.coding) {
+                        return Ok(Next::EndOfBlock);
+                    }
+                    b.align();
+                    b.take_eol()
+                } else {
+                    b.take_eol() || {
+                        if o.encoded_byte_align {
+                            b.align();
+                        }
+                        b.take_eol()
+                    }
+                };
+                self.eols |= had_eol;
+                // Another EOL straight away is RTC.
+                if had_eol && at_eol(b, o.coding) {
+                    return Ok(Next::EndOfBlock);
+                }
+                if b.rest_is_zero() {
+                    return Ok(Next::EndOfData);
+                }
+                if opts.end_of_line && !had_eol {
+                    return err(row, "end-of-line code missing");
+                }
+                if o.coding == Coding::Group3_2D {
+                    two_d = b.peek(1) == 0;
+                    b.consume(1);
+                }
+            }
+        }
+        // Only fill bits (or nothing) left: the data is used up.
+        if b.rest_is_zero() {
+            return Ok(Next::EndOfData);
+        }
+        let end = if two_d {
+            decode_2d_row(b, width, &self.reference, &mut self.cur, row)?
+        } else {
+            decode_1d_row(b, width, &mut self.cur, row)?
+        };
+        if matches!(end, RowEnd::Eol) {
+            match o.coding {
+                Coding::Group3_1D | Coding::Group3_2D => {
+                    // A premature EOL frames the next row. The short row is
+                    // white from there, or damaged when rows are framed.
+                    self.eol_pending = true;
+                    if opts.end_of_line {
+                        return err(row, "row ended early");
+                    }
+                }
+                Coding::Group4 if self.cur.is_empty() => return Ok(Next::EndOfBlock),
+                Coding::Group4 => return err(row, "EOL inside a Group 4 row"),
+                Coding::ModifiedHuffman => return err(row, "EOL in Modified Huffman data"),
+            }
+        }
+        Ok(Next::Row)
+    }
 }
 
 // ---------------------------------------------------------------------------
