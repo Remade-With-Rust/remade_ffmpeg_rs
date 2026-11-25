@@ -128,6 +128,8 @@ trait Shape {
         | ((1 << Self::R2.0) - 1) << Self::R2.1;
     /// The bits where a window's newest pixel enters.
     const NEWEST: u32 = 1 | 1 << Self::H.1 | (Self::R2.0 != 0) as u32 * (1 << Self::R2.1);
+    /// [`entering`] eight black pixels on each row.
+    const ENTER_BLACK: u32 = 0xFF | (Self::R2.0 != 0) as u32 * (0xFF << Self::R2.1);
     /// The bits that are another pixel's, shifted.
     const SHIFTED: u32 = Self::BLACK as u32 & !Self::NEWEST;
 }
@@ -170,36 +172,30 @@ impl Shape for T3 {
     const SLTP: (usize, usize, usize) = (0b01_1001, 0b0101, 0);
 }
 
-/// Eight pixels' view of the rows above, from three bytes of each: those at
-/// `x0 - 8`, `x0` and `x0 + 8` of rows -2 and -1.
-struct Above {
-    /// The context of the first pixel but for its history.
-    first: u32,
-    /// The pixels that enter for the second to the ninth, those of both rows
-    /// in step: bit `7 - j` (row -1) and that plus `R2.1` (row -2).
-    next: u32,
-}
-
+/// The context of a row's first pixel, from the first bytes of rows -2 and -1.
 #[inline]
-fn above<S: Shape>(r2: u32, r1: u32) -> Above {
-    // Pixel `x0 + k` is bit 15 - k.
-    let window = |w: u32, (n, right): (u32, u32)| (w >> (15 - right)) & ((1 << n) - 1);
-    let enter = |w: u32, right: u32| (w >> (7 - right)) & 0xFF;
-    let mut v = Above {
-        first: window(r1, S::R1),
-        next: enter(r1, S::R1.1),
-    };
-    if S::R2.0 != 0 {
-        v.first |= window(r2, (S::R2.0, S::R2.2)) << S::R2.1;
-        v.next |= enter(r2, S::R2.2) << S::R2.1;
+fn first<S: Shape>(r2: &[u8], r1: &[u8]) -> u32 {
+    let byte = |r: &[u8]| u32::from(r.first().copied().unwrap_or(0));
+    let c = byte(r1) >> (7 - S::R1.1);
+    if S::R2.0 == 0 {
+        c
+    } else {
+        c | byte(r2) >> (7 - S::R2.2) << S::R2.1
     }
-    v
 }
 
-/// The context bits of the `hist`ory of this row, newest in bit 0.
+/// The pixels that enter the windows over rows -2 and -1 for the second to
+/// the ninth pixel from `x0`, both rows' in step: bit `7 - j` (row -1) and
+/// that plus `R2.1` (row -2). `r2` and `r1` end with the bytes at `x0` and
+/// `x0 + 8`.
 #[inline]
-fn history<S: Shape>(hist: u32) -> u32 {
-    (hist & ((1 << S::H.0) - 1)) << S::H.1
+fn entering<S: Shape>(r2: u32, r1: u32) -> u32 {
+    let next = (r1 >> (7 - S::R1.1)) & 0xFF;
+    if S::R2.0 == 0 {
+        next
+    } else {
+        next | ((r2 >> (7 - S::R2.2)) & 0xFF) << S::R2.1
+    }
 }
 
 /// The next pixel's context: shift in the pixel `d` decoded and the pixels
@@ -337,14 +333,12 @@ impl Region<'_> {
         let (near, far) = (&near[..nears], &far[..fars]);
         let (r2, r1) = (up(2), up(1));
         let last = cur.len() - 1;
+        let mut c = first::<S>(r2, r1);
         for i in 0..cur.len() {
             let sk = skip.get(i).copied().unwrap_or(0);
-            if sk == 0xFF {
-                hist <<= 8;
-                continue;
-            }
             let x0 = i as i64 * 8;
-            let (w2, w1) = (fetch32(r2, x0 - 8) >> 8, fetch32(r1, x0 - 8) >> 8);
+            let (w2, w1) = (fetch32(r2, x0) >> 16, fetch32(r1, x0) >> 16);
+            let mut next = entering::<S>(w2, w1);
             let mut moved = [0u32; 8];
             // Whether any of the moved pixels is black, or white.
             let (mut any, mut all) = (0, 0xFF);
@@ -355,11 +349,12 @@ impl Region<'_> {
                 spread(&mut moved, v, 1 << bit);
             }
             if i != last && sk == 0 {
-                if w2 | w1 | (hist & 0xFF) | any == 0 && a.run(cx[0], 0, 8) {
+                if c | next | any | (hist & 0xFF) == 0 && a.run(cx[0], 0, 8) {
                     hist <<= 8;
                     continue;
                 }
-                if w2 & w1 == BYTES
+                if c == S::BLACK as u32
+                    && next == S::ENTER_BLACK
                     && hist & all & 0xFF == 0xFF
                     && a.run(cx[S::BLACK & (N - 1)], 1, 8)
                 {
@@ -368,8 +363,6 @@ impl Region<'_> {
                 }
             }
             let n = if i == last { (self.w - 1) % 8 + 1 } else { 8 };
-            let Above { first, mut next } = above::<S>(w2, w1);
-            let mut c = first | history::<S>(hist);
             for (j, moved) in (0..n).zip(moved) {
                 let d = if (sk >> (7 - j)) & 1 == 1 {
                     0
@@ -401,8 +394,6 @@ fn spread(out: &mut [u32; 8], v: u32, bit: u32) {
 
 /// A row of white pixels, for all but the widest bitmaps.
 static WHITE_ROW: [u8; 1024] = [0; 1024];
-/// Three bytes of a row, all black.
-const BYTES: u32 = 0x00FF_FFFF;
 
 /// The rows above, `r2` and `r1`, are as long as `cur`.
 fn row_nominal<'d, S: Shape, const N: usize>(
@@ -415,61 +406,62 @@ fn row_nominal<'d, S: Shape, const N: usize>(
 ) -> Arith<'d> {
     let len = cur.len();
     let (r2, r1) = (&r2[..len], &r1[..len]);
-    let mut hist = 0u32;
-    // The bytes at x0 - 8, x0 and x0 + 8 of the rows above.
+    let mut c = first::<S>(r2, r1);
     let (mut w2, mut w1) = (u32::from(r2[0]), u32::from(r1[0]));
     let mut i = 0;
     while i < len {
         let last = i + 1 == len;
         let mut n = (w - 1) % 8 + 1;
-        w2 = (w2 << 8) & BYTES;
-        w1 = (w1 << 8) & BYTES;
+        w2 = (w2 << 8) & 0xFFFF;
+        w1 = (w1 << 8) & 0xFFFF;
         if !last {
             n = 8;
             w2 |= u32::from(r2[i + 1]);
             w1 |= u32::from(r1[i + 1]);
-            // Pixels deep inside white or black share one context, usually a
-            // very skewed one: take 64 or 8 at once.
-            if w2 | w1 | (hist & 0xFF) == 0 {
-                let from = i;
-                while words(r2, r1, i + 1).is_some_and(|(p, q)| p | q == 0) && a.run(cx[0], 0, 64) {
-                    i += 8;
-                }
-                if i != from {
-                    continue;
-                }
-                if a.run(cx[0], 0, 8) {
-                    i += 1;
-                    continue;
-                }
+        }
+        let mut next = entering::<S>(w2, w1);
+        // Pixels deep inside white or black share one context, usually a very
+        // skewed one: take 64 or 8 at once.
+        if !last && c | next == 0 {
+            let from = i;
+            while words(r2, r1, i + 1).is_some_and(|(p, q)| p | q == 0) && a.run(cx[0], 0, 64) {
+                i += 8;
             }
-            if w2 & w1 == BYTES && hist & 0xFF == 0xFF {
-                let from = i;
-                while words(r2, r1, i + 1).is_some_and(|(p, q)| p & q == u64::MAX)
-                    && a.run(cx[S::BLACK & (N - 1)], 1, 64)
-                {
-                    cur[i..i + 8].fill(0xFF);
-                    i += 8;
-                }
-                if i != from {
-                    continue;
-                }
-                if a.run(cx[S::BLACK & (N - 1)], 1, 8) {
-                    cur[i] = 0xFF;
-                    i += 1;
-                    continue;
-                }
+            if i != from {
+                (w2, w1) = (0, 0);
+                continue;
+            }
+            if a.run(cx[0], 0, 8) {
+                i += 1;
+                continue;
             }
         }
-        let Above { first, mut next } = above::<S>(w2, w1);
-        let mut c = first | history::<S>(hist);
+        if !last && c == S::BLACK as u32 && next == S::ENTER_BLACK {
+            let from = i;
+            while words(r2, r1, i + 1).is_some_and(|(p, q)| p & q == u64::MAX)
+                && a.run(cx[S::BLACK & (N - 1)], 1, 64)
+            {
+                cur[i..i + 8].fill(0xFF);
+                i += 8;
+            }
+            if i != from {
+                (w2, w1) = (0xFF, 0xFF);
+                continue;
+            }
+            if a.run(cx[S::BLACK & (N - 1)], 1, 8) {
+                cur[i] = 0xFF;
+                i += 1;
+                continue;
+            }
+        }
+        let mut byte = 0;
         for _ in 0..n {
             let d = a.bit(&mut cx[c as usize & (N - 1)]);
-            hist = (hist << 1) | d;
+            byte = (byte << 1) | d;
             c = advance::<S>(c, d, next);
             next <<= 1;
         }
-        cur[i] = (hist << (8 - n)) as u8;
+        cur[i] = (byte << (8 - n)) as u8;
         i += 1;
     }
     a
