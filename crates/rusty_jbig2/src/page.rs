@@ -25,12 +25,50 @@ enum Resource {
 }
 
 struct Page {
+    /// Without its pixels as long as `blank` is set.
     bitmap: Bitmap,
+    /// Nothing has been drawn: every pixel is the default one.
+    blank: bool,
     default_pixel: bool,
     /// The height was not given: it follows from the stripes.
     unknown_height: bool,
     max_stripe: u32,
     last_stripe_end: Option<u32>,
+}
+
+impl Page {
+    /// The bitmap, pixels and all.
+    fn pixels(&mut self) -> &mut Bitmap {
+        if self.blank {
+            self.blank = false;
+            self.bitmap = Bitmap::new(self.bitmap.w, self.bitmap.h, self.default_pixel);
+        }
+        &mut self.bitmap
+    }
+
+    fn set_height(&mut self, h: u32) {
+        if self.blank {
+            self.bitmap.h = h;
+        } else {
+            self.bitmap.set_height(h, self.default_pixel);
+        }
+    }
+
+    fn draw(&mut self, bm: Bitmap, x: u32, y: u32, op: Op) {
+        // A page that is one region, which most are, is that region.
+        let all = (x, y) == (0, 0) && (bm.w, bm.h) == (self.bitmap.w, self.bitmap.h);
+        let same = match (op, self.default_pixel) {
+            (Op::Replace, _) => true,
+            (Op::Or | Op::Xor, false) | (Op::And | Op::Xnor, true) => self.blank,
+            _ => false,
+        };
+        if all && same {
+            self.bitmap = bm;
+            self.blank = false;
+        } else {
+            self.pixels().draw(&bm, i64::from(x), i64::from(y), op);
+        }
+    }
 }
 
 struct Decoder<'o> {
@@ -85,18 +123,19 @@ pub(crate) fn decode<'a, 's: 'a>(
             _ => {}
         }
     }
-    let p = d.page.ok_or(no_page)?;
+    let mut p = d.page.ok_or(no_page)?;
     if needs_end_of_page && !ended && !lenient {
         return Err(Error::Truncated);
     }
-    let mut bm = p.bitmap;
     if p.unknown_height {
         match p.last_stripe_end {
-            Some(y) => bm.set_height(y + 1, p.default_pixel),
+            Some(y) => p.set_height(y + 1),
             None if lenient => {}
             None => return Err(Error::Invalid("page height never given")),
         }
     }
+    p.pixels();
+    let bm = p.bitmap;
     Ok(Bitmap1 {
         width: bm.w,
         height: bm.h,
@@ -176,7 +215,13 @@ impl Decoder<'_> {
         let h = if unknown_height { max_stripe } else { h };
         self.budget.bitmap(u64::from(w), u64::from(h))?;
         self.page = Some(Page {
-            bitmap: Bitmap::new(w, h, default_pixel),
+            bitmap: Bitmap {
+                w,
+                h,
+                stride: 0,
+                data: Vec::new(),
+            },
+            blank: true,
             default_pixel,
             unknown_height,
             max_stripe,
@@ -195,7 +240,7 @@ impl Decoder<'_> {
             let w = u64::from(p.bitmap.w);
             self.budget.size(w, h)?;
             self.budget.bitmap(w, h - old)?;
-            p.bitmap.set_height(h as u32, p.default_pixel);
+            p.set_height(h as u32);
         }
         Ok(())
     }
@@ -284,8 +329,7 @@ impl Decoder<'_> {
         self.grow(u64::from(info.y) + u64::from(info.h))?;
         if let Some(p) = self.page.as_mut() {
             self.budget.charge(bm.data.len() as u64)?;
-            p.bitmap
-                .draw(&bm, i64::from(info.x), i64::from(info.y), info.op);
+            p.draw(bm, info.x, info.y, info.op);
         }
         Ok(())
     }
@@ -330,9 +374,9 @@ impl Decoder<'_> {
             self.budget.bitmap(u64::from(info.w), u64::from(info.h))?;
             let p = self
                 .page
-                .as_ref()
+                .as_mut()
                 .ok_or(Error::Invalid("segment before page information"))?;
-            p.bitmap
+            p.pixels()
                 .extract(i64::from(info.x), i64::from(info.y), info.w, info.h)
         };
         if (reference.w, reference.h) != (info.w, info.h) {
