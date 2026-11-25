@@ -525,6 +525,25 @@ impl Lift for ScaleDelta {
     }
 }
 
+/// [`ScaleDelta`], scaling the high-pass neighbours as well, and the step
+/// after it, scaling its high-pass sample: a row needs no pass for that alone.
+struct ScaleAllDelta;
+impl Lift for ScaleAllDelta {
+    #[inline(always)]
+    unsafe fn apply<I: Isa>(v: I::R, a: I::R, b: I::R) -> I::R {
+        let k = I::splatf(1.0 / K);
+        ScaleDelta::apply::<I>(v, I::mulf(a, k), I::mulf(b, k))
+    }
+}
+
+struct ScaleGamma;
+impl Lift for ScaleGamma {
+    #[inline(always)]
+    unsafe fn apply<I: Isa>(v: I::R, a: I::R, b: I::R) -> I::R {
+        Gamma::apply::<I>(I::mulf(v, I::splatf(1.0 / K)), a, b)
+    }
+}
+
 struct Gamma;
 impl Lift for Gamma {
     #[inline(always)]
@@ -686,15 +705,8 @@ impl Row for Row97 {
     #[inline(always)]
     unsafe fn run<I: Isa>(row: *mut i32, lw: usize, hw: usize, odd: bool, tmp: *mut i32) {
         let high = row.add(lw);
-        each::<I, _>(
-            &Scale {
-                p: high,
-                by: 1.0 / K,
-            },
-            hw,
-        );
-        step::<I, ScaleDelta>(tmp, row, lw, high, hw, !odd);
-        step::<I, Gamma>(high, high, hw, tmp, lw, odd);
+        step::<I, ScaleAllDelta>(tmp, row, lw, high, hw, !odd);
+        step::<I, ScaleGamma>(high, high, hw, tmp, lw, odd);
         step::<I, Beta>(tmp, tmp, lw, high, hw, !odd);
         predict_row::<I, Alpha>(row, lw, hw, tmp, odd);
     }
@@ -988,18 +1000,6 @@ unsafe fn each<I: Isa, E: Each>(e: &E, n: usize) {
 
 dispatch!(each_rct = each::<Rct>(e: &Rct, n: usize));
 dispatch!(each_ict = each::<Ict>(e: &Ict, n: usize));
-
-struct Scale {
-    p: *mut i32,
-    by: f32,
-}
-impl Each for Scale {
-    #[inline(always)]
-    unsafe fn at<I: Isa>(&self, i: usize) {
-        let p = self.p.add(i);
-        I::store(p, I::mulf(I::load(p), I::splatf(self.by)));
-    }
-}
 
 /// Inverse RCT (G.2).
 struct Rct([*mut i32; 3]);
