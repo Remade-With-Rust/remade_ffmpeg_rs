@@ -3,7 +3,7 @@
 
 use crate::codestream::{ceil_shift, Params, Progression, Siz};
 use crate::dwt::Plane;
-use crate::error::{try_vec, JpxError, JpxResult};
+use crate::error::{JpxError, JpxResult};
 use crate::t1::{signed2, Segment, MAX_PLANES, STYLE_BYPASS, STYLE_TERMALL, T1};
 use crate::tagtree::{Bits, TagTree};
 
@@ -640,11 +640,7 @@ impl TileComp {
         let top = self.rect();
         let w = top[2].saturating_sub(top[0]) as usize;
         let h = top[3].saturating_sub(top[1]) as usize;
-        let mut plane = if self.reversible {
-            Plane::Int(try_vec(w * h)?)
-        } else {
-            Plane::Real(try_vec(w * h)?)
-        };
+        let mut plane = Plane::zeroed(w * h, !self.reversible)?;
         for res in &self.res[..self.keep] {
             for precinct in res.precincts.iter().flatten() {
                 for (band, info) in precinct.bands.iter().zip(&res.bands) {
@@ -719,20 +715,18 @@ impl TileComp {
             }
         }
         let first = block.y as usize * stride + block.x as usize;
-        match plane {
-            Plane::Int(p) => {
-                for (row, out) in s.t1.data.chunks_exact(w).zip(p[first..].chunks_mut(stride)) {
-                    for (o, &v) in out.iter_mut().zip(row) {
-                        *o = signed2(v) / 2;
-                    }
+        let p = &mut plane.data[first..];
+        if plane.reals {
+            let step = band.step * 0.5;
+            for (row, out) in s.t1.data.chunks_exact(w).zip(p.chunks_mut(stride)) {
+                for (o, &v) in out.iter_mut().zip(row) {
+                    *o = (signed2(v) as f32 * step).to_bits() as i32;
                 }
             }
-            Plane::Real(p) => {
-                let step = band.step * 0.5;
-                for (row, out) in s.t1.data.chunks_exact(w).zip(p[first..].chunks_mut(stride)) {
-                    for (o, &v) in out.iter_mut().zip(row) {
-                        *o = signed2(v) as f32 * step;
-                    }
+        } else {
+            for (row, out) in s.t1.data.chunks_exact(w).zip(p.chunks_mut(stride)) {
+                for (o, &v) in out.iter_mut().zip(row) {
+                    *o = signed2(v) / 2;
                 }
             }
         }

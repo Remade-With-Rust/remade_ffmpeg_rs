@@ -21,4 +21,4 @@ include = ["/LICENSE", "/README.md", "/src/"]
 rusty_alloc-api.workspace = true
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"

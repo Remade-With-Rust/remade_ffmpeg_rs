@@ -158,28 +158,28 @@ fn decode_tile(
 
 /// Inverse RCT or ICT (G.2, G.3) on the first three components.
 fn inverse_mct(planes: &mut [Plane]) -> JpxResult<()> {
-    match planes {
-        [Plane::Int(a), Plane::Int(b), Plane::Int(c)] => {
-            for ((a, b), c) in a.iter_mut().zip(b).zip(c) {
-                let (y, u, v) = (*a, *b, *c);
-                let g = y.wrapping_sub(u.wrapping_add(v) >> 2);
-                *a = v.wrapping_add(g);
-                *b = g;
-                *c = u.wrapping_add(g);
-            }
-            Ok(())
-        }
-        [Plane::Real(a), Plane::Real(b), Plane::Real(c)] => {
-            for ((a, b), c) in a.iter_mut().zip(b).zip(c) {
-                let (y, u, v) = (*a, *b, *c);
-                *a = y + v * 1.402;
-                *b = y - u * 0.344_13 - v * 0.714_14;
-                *c = y + u * 1.772;
-            }
-            Ok(())
-        }
-        _ => Err(JpxError::Format("colour transform over different wavelets")),
+    let [a, b, c] = planes else { return Ok(()) };
+    if a.reals != b.reals || a.reals != c.reals {
+        return Err(JpxError::Format("colour transform over different wavelets"));
     }
+    if a.reals {
+        let f = |v: &i32| f32::from_bits(*v as u32);
+        for ((a, b), c) in a.data.iter_mut().zip(&mut b.data).zip(&mut c.data) {
+            let (y, u, v) = (f(a), f(b), f(c));
+            *a = (y + v * 1.402).to_bits() as i32;
+            *b = (y - u * 0.344_13 - v * 0.714_14).to_bits() as i32;
+            *c = (y + u * 1.772).to_bits() as i32;
+        }
+    } else {
+        for ((a, b), c) in a.data.iter_mut().zip(&mut b.data).zip(&mut c.data) {
+            let (y, u, v) = (*a, *b, *c);
+            let g = y.wrapping_sub(u.wrapping_add(v) >> 2);
+            *a = v.wrapping_add(g);
+            *b = g;
+            *c = u.wrapping_add(g);
+        }
+    }
+    Ok(())
 }
 
 /// `1.5 * 2^23`: adding it leaves an integer of up to 22 bits in the low
@@ -189,16 +189,18 @@ const ROUND: f32 = 12_582_912.0;
 /// Level shift, round and clamp one row of reals. Up to 20 bits the sum with
 /// [`ROUND`] does the rounding, which vectorizes; NaN cannot get through the
 /// clamp (`f32::max` takes the other operand).
-fn level_row(dst: &mut [i32], src: &[f32], bits: u8, shift: i32, min: i32, max: i32) {
+fn level_row(dst: &mut [i32], src: &[i32], bits: u8, shift: i32, min: i32, max: i32) {
     if bits <= 20 {
         let (lo, hi) = ((min - shift) as f32, (max - shift) as f32);
         let bias = shift.wrapping_sub(ROUND.to_bits() as i32);
         for (d, &s) in dst.iter_mut().zip(src) {
+            let s = f32::from_bits(s as u32);
             let v = s.max(lo).min(hi) + ROUND;
             *d = (v.to_bits() as i32).wrapping_add(bias);
         }
     } else {
         for (d, &s) in dst.iter_mut().zip(src) {
+            let s = f32::from_bits(s as u32);
             *d = (s.round_ties_even() as i32)
                 .saturating_add(shift)
                 .clamp(min, max);
@@ -231,15 +233,12 @@ fn store(
         return Ok(());
     }
     let level = |v: i32| v.saturating_add(shift).clamp(min, max);
-    match plane {
-        Plane::Int(mut p) if out.is_empty() && (tw, th) == (w, h) => {
-            for v in &mut p {
-                *v = level(*v);
-            }
-            *out = p;
-            return Ok(());
+    if !plane.reals && out.is_empty() && (tw, th) == (w, h) {
+        *out = plane.data;
+        for v in out.iter_mut() {
+            *v = level(*v);
         }
-        _ => {}
+        return Ok(());
     }
     if out.is_empty() {
         *out = try_vec(w * h)?;
@@ -247,17 +246,13 @@ fn store(
     let x = (rect[0] - origin[0]) as usize;
     let y = (rect[1] - origin[1]) as usize;
     let rows = out.chunks_exact_mut(w).skip(y).take(th);
-    match &plane {
-        Plane::Int(p) => {
-            for (dst, src) in rows.zip(p.chunks_exact(tw)) {
-                for (d, &s) in dst[x..x + tw].iter_mut().zip(src) {
-                    *d = level(s);
-                }
-            }
-        }
-        Plane::Real(p) => {
-            for (dst, src) in rows.zip(p.chunks_exact(tw)) {
-                level_row(&mut dst[x..x + tw], src, k.bits, shift, min, max);
+    for (dst, src) in rows.zip(plane.data.chunks_exact(tw)) {
+        let dst = &mut dst[x..x + tw];
+        if plane.reals {
+            level_row(dst, src, k.bits, shift, min, max);
+        } else {
+            for (d, &s) in dst.iter_mut().zip(src) {
+                *d = level(s);
             }
         }
     }
