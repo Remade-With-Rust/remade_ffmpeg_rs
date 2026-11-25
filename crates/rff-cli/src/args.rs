@@ -29,6 +29,7 @@ fn parse_map(spec: &str) -> Option<MapSpec> {
         None => MapSelector::All,
         Some("v") | Some("V") => MapSelector::Kind(MediaType::Video),
         Some("a") => MapSelector::Kind(MediaType::Audio),
+        Some("d") => MapSelector::Kind(MediaType::Data),
         Some(idx) => MapSelector::Index(idx.parse().ok()?),
     };
     Some(MapSpec { input, selector })
@@ -303,6 +304,11 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             "movflags" => {
                 let value = take_value(args, &mut i, arg)?;
                 format_options.set("movflags", value);
+            }
+            // Which input the chapters come from (-1: none).
+            "map_chapters" => {
+                let value = take_value(args, &mut i, arg)?;
+                format_options.set("map_chapters", value);
             }
             "hls_list_size" => {
                 let _ = take_value(args, &mut i, arg)?;
