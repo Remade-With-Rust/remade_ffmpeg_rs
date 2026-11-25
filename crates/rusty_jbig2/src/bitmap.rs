@@ -1,3 +1,4 @@
+use crate::kernels::{And, Combine, Narrow, Or, Replace, Wide, Words, Xnor, Xor};
 use crate::{Error, Result};
 
 /// A 1-bit image: packed rows, most significant bit first, each row padded
@@ -36,13 +37,16 @@ impl Bitmap1 {
     /// bits stay zero.
     #[must_use]
     pub fn into_pdf_samples(mut self) -> Vec<u8> {
+        // All of it at once, then the padding.
+        for b in &mut self.data {
+            *b = !*b;
+        }
         let mask = tail_mask(self.width);
-        for row in self.data.chunks_exact_mut(self.stride.max(1)) {
-            for b in row.iter_mut() {
-                *b = !*b;
-            }
-            if let Some(l) = row.last_mut() {
-                *l &= mask;
+        if mask != 0xFF {
+            for row in self.data.chunks_exact_mut(self.stride.max(1)) {
+                if let Some(l) = row.last_mut() {
+                    *l &= mask;
+                }
             }
         }
         self.data
@@ -156,7 +160,7 @@ impl Bitmap {
         &self.data[s..s + self.stride]
     }
 
-    #[inline]
+    #[cfg(test)]
     pub(crate) fn get(&self, x: u32, y: u32) -> u32 {
         self.row(i64::from(y))
             .get((x >> 3) as usize)
@@ -192,66 +196,93 @@ impl Bitmap {
         if x0 >= x1 || y0 >= y1 {
             return;
         }
+        match op {
+            Op::Or => self.rows::<Or>(src, (x, y), (x0, x1), (y0, y1)),
+            Op::And => self.rows::<And>(src, (x, y), (x0, x1), (y0, y1)),
+            Op::Xor => self.rows::<Xor>(src, (x, y), (x0, x1), (y0, y1)),
+            Op::Xnor => self.rows::<Xnor>(src, (x, y), (x0, x1), (y0, y1)),
+            Op::Replace => self.rows::<Replace>(src, (x, y), (x0, x1), (y0, y1)),
+        }
+    }
+
+    /// [`Bitmap::draw`] clipped to columns `x0..x1` and rows `y0..y1`, not
+    /// empty.
+    fn rows<C: Combine>(
+        &mut self,
+        src: &Bitmap,
+        (x, y): (i64, i64),
+        (x0, x1): (i64, i64),
+        (y0, y1): (i64, i64),
+    ) {
+        // Full rows: one run of bytes.
+        if x == 0 && src.w == self.w {
+            let (y0, y1) = (y0 as usize, y1 as usize);
+            let from = (y0 as i64 - y) as usize * src.stride;
+            let d = &mut self.data[y0 * self.stride..y1 * self.stride];
+            for (d, s) in d.iter_mut().zip(&src.data[from..]) {
+                *d = C::f(*d, *s, 0xFF);
+            }
+            if C::SETS_PADDING {
+                self.clear_padding(y0 * self.stride);
+            }
+            return;
+        }
         let (b0, b1) = ((x0 >> 3) as usize, ((x1 + 7) >> 3) as usize);
-        let head = 0xFFu8 >> (x0 & 7);
+        let d0 = y0 as usize * self.stride + b0;
+        let lead = (x0 & 7) as u32;
+        let (sx, bits) = (x0 - x, (x1 - x0) as u64);
+        let skip = (sx & 7) as u32;
+        // Symbols and patterns: each row within one 64-bit word of both.
+        if bits <= u64::from(64 - lead.max(skip)) && self.data.len() >= 8 {
+            let s0 = (y0 - y) as usize * src.stride + (sx >> 3) as usize;
+            let w = Narrow {
+                rows: (y1 - y0) as usize,
+                rotate: skip.wrapping_sub(lead) & 63,
+                mask: (!0u64 << (64 - bits)) >> lead,
+            };
+            w.run::<C>(
+                (&mut self.data, self.stride, d0),
+                (&src.data, src.stride, s0),
+            );
+            return;
+        }
         let tail = if x1 & 7 == 0 {
             0xFF
         } else {
             0xFFu8 << (8 - (x1 & 7))
         };
-        for yy in y0..y1 {
-            let s = src.row(yy - y);
-            let start = yy as usize * self.stride;
-            let d = &mut self.data[start + b0..start + b1];
-            let p = b0 as i64 * 8 - x;
-            match op {
-                Op::Or => blend(d, s, p, head, tail, |d, s, m| d | (s & m)),
-                Op::And => blend(d, s, p, head, tail, |d, s, m| d & (s | !m)),
-                Op::Xor => blend(d, s, p, head, tail, |d, s, m| d ^ (s & m)),
-                Op::Xnor => blend(d, s, p, head, tail, |d, s, m| (d & !m) | (!(d ^ s) & m)),
-                Op::Replace => blend(d, s, p, head, tail, |d, s, m| (d & !m) | (s & m)),
+        let w = Wide {
+            first: b0 as i64 - (x >> 3) - i64::from(x & 7 != 0),
+            sh: (x.wrapping_neg() & 7) as u32,
+            head: 0xFF >> lead,
+            tail,
+        };
+        // The bytes of longer rows vectorise.
+        if bits > 512 {
+            for yy in y0..y1 {
+                let start = yy as usize * self.stride;
+                w.row::<C>(&mut self.data[start + b0..start + b1], src.row(yy - y));
             }
-        }
-    }
-}
-
-/// One row: byte `i` of `d` is combined with the 8 bits of `s` at `p + 8i`.
-#[inline]
-fn blend(d: &mut [u8], s: &[u8], p: i64, head: u8, tail: u8, f: impl Fn(u8, u8, u8) -> u8) {
-    let n = d.len();
-    if p >= 0 && p & 7 == 0 && n > 2 {
-        // Byte-aligned source: no shifting between the end bytes.
-        let s0 = (p >> 3) as usize;
-        if let Some(sm) = s.get(s0..s0 + n) {
-            d[0] = f(d[0], sm[0], head);
-            for (d, s) in d[1..n - 1].iter_mut().zip(&sm[1..n - 1]) {
-                *d = f(*d, *s, 0xFF);
-            }
-            d[n - 1] = f(d[n - 1], sm[n - 1], tail);
             return;
         }
-    }
-    let sh = (p & 7) as u32;
-    let mut idx = p >> 3;
-    let at = |k: i64| -> u32 {
-        usize::try_from(k)
-            .ok()
-            .and_then(|k| s.get(k))
-            .map_or(0, |&v| u32::from(v))
-    };
-    let mut hi = at(idx);
-    for (i, b) in d.iter_mut().enumerate() {
-        let mut m = 0xFF;
-        if i == 0 {
-            m &= head;
+        let words = Words::new(lead, x1 - b0 as i64 * 8, w.sh);
+        for yy in y0..y1 {
+            let start = yy as usize * self.stride;
+            // What these words hold beyond the row is masked, whether it is
+            // another row's or what precedes the source's first pixel.
+            let from = (yy - y) as usize * src.stride;
+            let done = from
+                .checked_add_signed(w.first as isize)
+                .is_some_and(|from| {
+                    words.row::<C>(
+                        &mut self.data[start + b0..],
+                        src.data.get(from..).unwrap_or(&[]),
+                    )
+                });
+            if !done {
+                w.row::<C>(&mut self.data[start + b0..start + b1], src.row(yy - y));
+            }
         }
-        if i + 1 == n {
-            m &= tail;
-        }
-        idx += 1;
-        let lo = at(idx);
-        *b = f(*b, (((hi << 8) | lo) >> (8 - sh)) as u8, m);
-        hi = lo;
     }
 }
 
@@ -277,38 +308,81 @@ mod tests {
         b
     }
 
+    /// The definition, one pixel at a time.
+    fn draw_oracle(base: &Bitmap, src: &Bitmap, x: i64, y: i64, op: Op) -> Bitmap {
+        let mut out = Bitmap::new(base.w, base.h, false);
+        for py in 0..i64::from(base.h) {
+            for pxx in 0..i64::from(base.w) {
+                let (sx, sy) = (pxx - x, py - y);
+                let b = px(base, pxx, py);
+                let inside =
+                    (0..i64::from(src.w)).contains(&sx) && (0..i64::from(src.h)).contains(&sy);
+                let s = px(src, sx, sy);
+                let v = if inside {
+                    match op {
+                        Op::Or => b | s,
+                        Op::And => b & s,
+                        Op::Xor => b ^ s,
+                        Op::Xnor => 1 ^ b ^ s,
+                        Op::Replace => s,
+                    }
+                } else {
+                    b
+                };
+                if v == 1 {
+                    out.data[py as usize * out.stride + (pxx >> 3) as usize] |= 0x80 >> (pxx & 7);
+                }
+            }
+        }
+        out
+    }
+
+    const OPS: [Op; 5] = [Op::Or, Op::And, Op::Xor, Op::Xnor, Op::Replace];
+
+    /// Both kernels (one word, and bytes) against the definition: every shift
+    /// and clip of sources from a pixel to beyond two words, onto destinations
+    /// down to less than a word in all.
     #[test]
     fn draw_matches_per_pixel_definition() {
-        let base = noise(37, 8, 99);
-        for op in [Op::Or, Op::And, Op::Xor, Op::Xnor, Op::Replace] {
-            for (sw, sh) in [(1, 1), (7, 3), (8, 4), (9, 2), (31, 5), (64, 3)] {
+        let sizes = [
+            (1u32, 1u32),
+            (7, 3),
+            (8, 4),
+            (9, 2),
+            (31, 5),
+            (37, 3),
+            (56, 2),
+            (57, 3),
+            (58, 2),
+            (63, 2),
+            (64, 3),
+            (65, 2),
+            (71, 2),
+            (72, 2),
+            (130, 2),
+        ];
+        let bases = [
+            (37u32, 8u32),
+            (5, 2),
+            (8, 7),
+            (8, 8),
+            (64, 1),
+            (71, 3),
+            (150, 3),
+            (300, 2),
+        ];
+        for (dw, dh) in bases {
+            let base = noise(dw, dh, 99);
+            for (sw, sh) in sizes {
                 let src = noise(sw, sh, 7);
-                for x in -70..50 {
-                    for y in [-4i64, -1, 0, 2, 9] {
-                        let mut d = base.clone();
-                        d.draw(&src, x, y, op);
-                        for py in 0..8i64 {
-                            for pxx in 0..37i64 {
-                                let (sx, sy) = (pxx - x, py - y);
-                                let b = px(&base, pxx, py);
-                                let inside = (0..i64::from(sw)).contains(&sx)
-                                    && (0..i64::from(sh)).contains(&sy);
-                                let s = px(&src, sx, sy);
-                                let want = if inside {
-                                    match op {
-                                        Op::Or => b | s,
-                                        Op::And => b & s,
-                                        Op::Xor => b ^ s,
-                                        Op::Xnor => 1 ^ b ^ s,
-                                        Op::Replace => s,
-                                    }
-                                } else {
-                                    b
-                                };
-                                assert_eq!(px(&d, pxx, py), want, "{op:?} {sw}x{sh} {x},{y}");
-                            }
+                for x in -i64::from(sw) - 2..i64::from(dw) + 3 {
+                    for y in [-4i64, -1, 0, 1, i64::from(dh) - 1, 9] {
+                        for op in OPS {
+                            let mut d = base.clone();
+                            d.draw(&src, x, y, op);
+                            let want = draw_oracle(&base, &src, x, y, op);
+                            assert_eq!(d.data, want.data, "{op:?} {dw}x{dh} {sw}x{sh} {x},{y}");
                         }
-                        assert!(d.data.chunks(d.stride).all(|r| r[4] & 0x07 == 0));
                     }
                 }
             }

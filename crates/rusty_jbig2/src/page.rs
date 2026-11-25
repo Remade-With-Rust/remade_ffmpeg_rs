@@ -1,5 +1,6 @@
 //! Segment dispatch and page composition (7.4, 8.2).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -25,12 +26,50 @@ enum Resource {
 }
 
 struct Page {
+    /// Without its pixels as long as `blank` is set.
     bitmap: Bitmap,
+    /// Nothing has been drawn: every pixel is the default one.
+    blank: bool,
     default_pixel: bool,
     /// The height was not given: it follows from the stripes.
     unknown_height: bool,
     max_stripe: u32,
     last_stripe_end: Option<u32>,
+}
+
+impl Page {
+    /// The bitmap, pixels and all.
+    fn pixels(&mut self) -> &mut Bitmap {
+        if self.blank {
+            self.blank = false;
+            self.bitmap = Bitmap::new(self.bitmap.w, self.bitmap.h, self.default_pixel);
+        }
+        &mut self.bitmap
+    }
+
+    fn set_height(&mut self, h: u32) {
+        if self.blank {
+            self.bitmap.h = h;
+        } else {
+            self.bitmap.set_height(h, self.default_pixel);
+        }
+    }
+
+    fn draw(&mut self, bm: Bitmap, x: u32, y: u32, op: Op) {
+        // A page that is one region, which most are, is that region.
+        let all = (x, y) == (0, 0) && (bm.w, bm.h) == (self.bitmap.w, self.bitmap.h);
+        let same = match (op, self.default_pixel) {
+            (Op::Replace, _) => true,
+            (Op::Or | Op::Xor, false) | (Op::And | Op::Xnor, true) => self.blank,
+            _ => false,
+        };
+        if all && same {
+            self.bitmap = bm;
+            self.blank = false;
+        } else {
+            self.pixels().draw(&bm, i64::from(x), i64::from(y), op);
+        }
+    }
 }
 
 struct Decoder<'o> {
@@ -85,18 +124,19 @@ pub(crate) fn decode<'a, 's: 'a>(
             _ => {}
         }
     }
-    let p = d.page.ok_or(no_page)?;
+    let mut p = d.page.ok_or(no_page)?;
     if needs_end_of_page && !ended && !lenient {
         return Err(Error::Truncated);
     }
-    let mut bm = p.bitmap;
     if p.unknown_height {
         match p.last_stripe_end {
-            Some(y) => bm.set_height(y + 1, p.default_pixel),
+            Some(y) => p.set_height(y + 1),
             None if lenient => {}
             None => return Err(Error::Invalid("page height never given")),
         }
     }
+    p.pixels();
+    let bm = p.bitmap;
     Ok(Bitmap1 {
         width: bm.w,
         height: bm.h,
@@ -111,7 +151,7 @@ impl Decoder<'_> {
         self.budget.charge(256 + s.refs.len() as u64 * 16)?;
         match s.kind {
             kind::SYMBOL_DICT => {
-                let input = self.symbols(&s.refs)?;
+                let input = Self::symbols(&self.resources, &mut self.budget, &s.refs)?;
                 let tables = self.tables(&s.refs);
                 let previous = s
                     .refs
@@ -121,7 +161,7 @@ impl Decoder<'_> {
                         Some(Resource::Symbols(d)) => Some(d),
                         _ => None,
                     });
-                let dict = symbol::decode(s.data, &input, &tables, previous, &mut self.budget)?;
+                let dict = symbol::decode(s.data, input, &tables, previous, &mut self.budget)?;
                 self.resources.insert(s.number, Resource::Symbols(dict));
             }
             kind::PATTERN_DICT => {
@@ -129,6 +169,8 @@ impl Decoder<'_> {
                 self.resources.insert(s.number, Resource::Patterns(dict));
             }
             kind::TABLES => {
+                // For its lookup table.
+                self.budget.charge(4096)?;
                 let t = Arc::new(Table::parse(s.data)?);
                 self.resources.insert(s.number, Resource::Table(t));
             }
@@ -174,7 +216,13 @@ impl Decoder<'_> {
         let h = if unknown_height { max_stripe } else { h };
         self.budget.bitmap(u64::from(w), u64::from(h))?;
         self.page = Some(Page {
-            bitmap: Bitmap::new(w, h, default_pixel),
+            bitmap: Bitmap {
+                w,
+                h,
+                stride: 0,
+                data: Vec::new(),
+            },
+            blank: true,
             default_pixel,
             unknown_height,
             max_stripe,
@@ -193,7 +241,7 @@ impl Decoder<'_> {
             let w = u64::from(p.bitmap.w);
             self.budget.size(w, h)?;
             self.budget.bitmap(w, h - old)?;
-            p.bitmap.set_height(h as u32, p.default_pixel);
+            p.set_height(h as u32);
         }
         Ok(())
     }
@@ -229,23 +277,30 @@ impl Decoder<'_> {
     }
 
     /// The symbols of every dictionary referred to, in order.
-    fn symbols(&mut self, refs: &[u32]) -> Result<Vec<Arc<Bitmap>>> {
+    fn symbols<'r>(
+        resources: &'r HashMap<u32, Resource>,
+        budget: &mut Budget,
+        refs: &[u32],
+    ) -> Result<Cow<'r, [Arc<Bitmap>]>> {
         let mut dicts = Vec::new();
         for r in refs {
-            match self.resources.get(r) {
+            match resources.get(r) {
                 Some(Resource::Symbols(d)) => dicts.push(d),
                 Some(_) => {}
-                None if self.opts.lenient => {}
+                None if budget.lenient => {}
                 None => return Err(Error::Invalid("referred-to segment not found")),
             }
         }
         let n: usize = dicts.iter().map(|d| d.symbols.len()).sum();
-        self.budget.symbols(n as u64)?;
+        budget.symbols(n as u64)?;
+        if let [d] = dicts[..] {
+            return Ok(Cow::Borrowed(&d.symbols));
+        }
         let mut out = Vec::with_capacity(n);
         for d in dicts {
             out.extend_from_slice(&d.symbols);
         }
-        Ok(out)
+        Ok(Cow::Owned(out))
     }
 
     fn tables(&self, refs: &[u32]) -> Vec<Arc<Table>> {
@@ -282,8 +337,7 @@ impl Decoder<'_> {
         self.grow(u64::from(info.y) + u64::from(info.h))?;
         if let Some(p) = self.page.as_mut() {
             self.budget.charge(bm.data.len() as u64)?;
-            p.bitmap
-                .draw(&bm, i64::from(info.x), i64::from(info.y), info.op);
+            p.draw(bm, info.x, info.y, info.op);
         }
         Ok(())
     }
@@ -298,7 +352,7 @@ impl Decoder<'_> {
         let id = ((flags >> 1) & 3) as u8;
         let t = Template::parse(id, id == 0 && flags & 0x10 != 0, &mut b)?;
         self.budget.charge(t.contexts() as u64 / 8)?;
-        let mut cx = vec![0; t.contexts()];
+        let mut cx = vec![0; t.table()];
         let mut a = Arith::new(b.rest());
         let tpgdon = flags & 8 != 0;
         Ok(generic::decode(
@@ -322,16 +376,23 @@ impl Decoder<'_> {
                 None => return Err(Error::Invalid("referred-to region not found")),
             }
         }
-        let reference = if let Some(r) = reference {
+        let extracted;
+        let reference = if let Some(r) = &reference {
             r
         } else {
             self.budget.bitmap(u64::from(info.w), u64::from(info.h))?;
-            let p = self
+            let page = self
                 .page
-                .as_ref()
-                .ok_or(Error::Invalid("segment before page information"))?;
-            p.bitmap
-                .extract(i64::from(info.x), i64::from(info.y), info.w, info.h)
+                .as_mut()
+                .ok_or(Error::Invalid("segment before page information"))?
+                .pixels();
+            if (info.x, info.y, info.w, info.h) == (0, 0, page.w, page.h) {
+                &*page
+            } else {
+                let (x, y) = (i64::from(info.x), i64::from(info.y));
+                extracted = page.extract(x, y, info.w, info.h);
+                &extracted
+            }
         };
         if (reference.w, reference.h) != (info.w, info.h) {
             return Err(Error::Invalid("refinement of a region of another size"));
@@ -340,7 +401,7 @@ impl Decoder<'_> {
         let mut cx = vec![0; t.contexts()];
         let mut a = Arith::new(b.rest());
         let r = Reference {
-            bitmap: &reference,
+            bitmap: reference,
             dx: 0,
             dy: 0,
         };
@@ -396,7 +457,7 @@ impl Decoder<'_> {
             template,
             read_final_oob: false,
         };
-        let symbols = self.symbols(&s.refs)?;
+        let symbols = Self::symbols(&self.resources, &mut self.budget, &s.refs)?;
         let mut gr = vec![0u8; if refine { template.contexts() } else { 0 }];
         self.budget.charge(gr.len() as u64 / 8)?;
         if huff {

@@ -2,6 +2,7 @@
 
 use crate::arith::Arith;
 use crate::bitmap::{fetch32, Bitmap};
+use crate::generic::spread;
 use crate::huffman::Bits;
 use crate::{Error, Result};
 
@@ -59,15 +60,137 @@ pub(crate) fn decode(
     w: u32,
     h: u32,
 ) -> Bitmap {
+    if t.one {
+        run::<true, false, { 1 << 10 }>(a, cx, t, tpgron, r, w, h)
+    } else if t.at == [NOMINAL; 2] {
+        run::<false, false, { 1 << 13 }>(a, cx, t, tpgron, r, w, h)
+    } else {
+        run::<false, true, { 1 << 13 }>(a, cx, t, tpgron, r, w, h)
+    }
+}
+
+/// A row seen through a window that moves right by bytes: the byte that a
+/// given position falls in and the two after it.
+struct Window<'r> {
+    row: &'r [u8],
+    /// The next byte to come in; far out of range when left of the row.
+    next: usize,
+    bytes: u32,
+    sh: u32,
+}
+
+impl<'r> Window<'r> {
+    /// Ready to [`Window::advance`] to bit `pos`.
+    fn new(row: &'r [u8], pos: i64) -> Self {
+        let mut w = Self {
+            row,
+            next: (pos >> 3) as usize,
+            bytes: 0,
+            sh: (pos & 7) as u32,
+        };
+        w.load();
+        w.load();
+        w
+    }
+
+    #[inline]
+    fn load(&mut self) {
+        let b = self.row.get(self.next).map_or(0, |&b| u32::from(b));
+        self.bytes = (self.bytes << 8) | b;
+        self.next = self.next.wrapping_add(1);
+    }
+
+    /// The 16 pixels from here on, and eight further the next time.
+    #[inline]
+    fn advance(&mut self) -> u16 {
+        self.load();
+        (self.bytes >> (8 - self.sh)) as u16
+    }
+
+    /// Whether this and the next eight views are white.
+    #[inline]
+    fn white(&self) -> bool {
+        let after = match self.row.get(self.next..).map(<[u8]>::first_chunk::<8>) {
+            Some(Some(v)) => *v == [0; 8],
+            // Partly outside: not worth finding out. All of it: white.
+            Some(None) => self.next == self.row.len(),
+            None => self.next < self.next.wrapping_add(8),
+        };
+        after && self.bytes & 0x00FF_FFFF == 0
+    }
+
+    /// Skip eight views that are white.
+    #[inline]
+    fn skip(&mut self) {
+        self.bytes = 0;
+        self.next = self.next.wrapping_add(8);
+    }
+}
+
+/// The contexts of eight pixels but for the one to their left. The rows begin
+/// with the pixel left of the first one's: `p` above in this bitmap, `q` the
+/// reference's.
+#[inline]
+fn contexts8<const ONE: bool>(p: u16, q: [u16; 3]) -> [u16; 8] {
+    /// Four lanes of 16 bits.
+    const LANES: u64 = 0x0001_0001_0001_0001;
+    let mut out = [0; 8];
+    for (half, out) in out.chunks_exact_mut(4).enumerate() {
+        // The three pixels around pixel `j` of the half at the top of lane
+        // `j`: ten pixels' worth of bits leave room for what is shifted out of
+        // the lane below (and above the top one, dropped).
+        let lanes =
+            |w: u16| u64::from((w & 0xFFC0) << (4 * half)).wrapping_mul(0x0008_0004_0002_0001);
+        // From there to bit `to`, those of `three`.
+        let put = |w: u16, three: u64, to: u32| (lanes(w) >> (13 - to)) & (LANES * (three << to));
+        let x = if ONE {
+            put(p, 7, 7) | (lanes(q[0]) >> 9) & (LANES << 5) | put(q[1], 7, 2) | put(q[2], 3, 0)
+        } else {
+            put(p, 7, 10) | put(q[0], 7, 6) | put(q[1], 7, 3) | put(q[2], 7, 0)
+        };
+        for (j, o) in out.iter_mut().enumerate() {
+            *o = (x >> (16 * j)) as u16;
+        }
+    }
+    out
+}
+
+/// For eight pixels: which have a uniform 3x3 neighbourhood in the reference,
+/// and which a black one.
+#[inline]
+fn typical(q: [u16; 3]) -> (u8, u8) {
+    let and = q[0] & q[1] & q[2];
+    let or = q[0] | q[1] | q[2];
+    let black = and & and << 1 & and >> 1;
+    let white = !(or | or << 1 | or >> 1);
+    (((black | white) >> 7) as u8, (black >> 7) as u8)
+}
+
+#[inline(never)]
+fn run<const ONE: bool, const CUSTOM: bool, const N: usize>(
+    coder: &mut Arith<'_>,
+    cx: &mut [u8],
+    t: RefTemplate,
+    tpgron: bool,
+    r: &Reference<'_>,
+    w: u32,
+    h: u32,
+) -> Bitmap {
     let mut out = Bitmap::new(w, h, false);
     let stride = out.stride;
+    let Some(cx) = cx.first_chunk_mut::<N>() else {
+        debug_assert!(false, "context array size");
+        return out;
+    };
     if w == 0 {
         return out;
     }
+    let mut a = *coder;
     let (ra1, ra2) = (t.at[0], t.at[1]);
-    let custom = !t.one && t.at != [NOMINAL; 2];
-    let mask = t.contexts() - 1;
-    let sltp = if t.one { 0x08 } else { 0x10 };
+    // RA1 at most seven back on this row is in the history.
+    let near = ra1.1 == 0 && ra1.0 > -8;
+    let left = if ONE { 6 } else { 9 };
+    let sltp = if ONE { 0x08 } else { 0x10 };
     let mut ltp = 0;
     for y in 0..i64::from(h) {
         if tpgron {
@@ -83,65 +206,198 @@ pub(crate) fn decode(
                 &above[s..s + stride]
             }
         };
-        let prev = up(1);
         let ry = y - r.dy;
-        let refs = [r.bitmap.row(ry - 1), r.bitmap.row(ry), r.bitmap.row(ry + 1)];
+        let row = |k: i64| Window::new(r.bitmap.row(ry + k), -r.dx - 1);
+        let (mut p, mut q0, mut q1, mut q2) = (Window::new(up(1), -1), row(-1), row(0), row(1));
+        let ra1_row = up(-i64::from(ra1.1));
         let ra2_row = r.bitmap.row(ry + i64::from(ra2.1));
         let mut hist = 0u32;
         let last = stride - 1;
-        for i in 0..stride {
-            let x0 = i as i64 * 8;
-            // Each window starts one pixel left of x0.
-            let p = fetch32(prev, x0 - 1);
-            let rx = x0 - r.dx - 1;
-            let q = [
-                fetch32(refs[0], rx),
-                fetch32(refs[1], rx),
-                fetch32(refs[2], rx),
-            ];
-            let (a1, a2) = if custom {
-                let x1 = x0 + i64::from(ra1.0);
-                (
-                    if ra1.1 < 0 {
-                        fetch32(up(-i64::from(ra1.1)), x1)
-                    } else {
-                        // Same row: only used far enough back to be stored.
-                        fetch32(&cur[..i], x1)
-                    },
-                    fetch32(ra2_row, rx + 1 + i64::from(ra2.0)),
-                )
-            } else {
-                (0, 0)
-            };
+        let mut at = 0;
+        while at < stride {
+            let i = at;
+            at += 1;
+            let above = p.advance();
+            let q = [q0.advance(), q1.advance(), q2.advance()];
             let n = if i == last { (w - 1) % 8 + 1 } else { 8 };
-            for j in 0..n {
-                let s = 29 - j;
-                let (q0, q1, q2) = ((q[0] >> s) & 7, (q[1] >> s) & 7, (q[2] >> s) & 7);
-                if ltp == 1 && q0 == q1 && q1 == q2 && (q0 == 0 || q0 == 7) {
-                    hist = (hist << 1) | (q0 & 1);
+            let (mut v1, mut v2) = (0, 0);
+            if CUSTOM {
+                let x0 = i as i64 * 8;
+                let x1 = x0 + i64::from(ra1.0);
+                let row = if ra1.1 < 0 { ra1_row } else { &cur[..i] };
+                v1 = (fetch32(row, x1) >> 24) as u8;
+                v2 = (fetch32(ra2_row, x0 - r.dx + i64::from(ra2.0)) >> 24) as u8;
+            }
+            let (mut sure, mut value) = (0, 0);
+            if ltp == 1 {
+                (sure, value) = typical(q);
+                if sure == 0xFF && i != last {
+                    cur[i] = value;
+                    hist = u32::from(value);
+                    if !CUSTOM && value == 0 {
+                        while at + 8 < stride && [&p, &q0, &q1, &q2].iter().all(|w| w.white()) {
+                            for w in [&mut p, &mut q0, &mut q1, &mut q2] {
+                                w.skip();
+                            }
+                            at += 8;
+                        }
+                    }
                     continue;
                 }
-                let h1 = hist & 1;
-                let p3 = (p >> s) & 7;
-                let mut c = if t.one {
-                    p3 << 7 | h1 << 6 | ((q0 >> 1) & 1) << 5 | q1 << 2 | (q2 & 3)
-                } else {
-                    p3 << 10 | h1 << 9 | q0 << 6 | q1 << 3 | q2
-                };
-                if custom {
-                    let v1 = if ra1.1 < 0 || ra1.0 <= -8 {
-                        a1 >> (31 - j)
-                    } else {
-                        // Same row: ra1.0 is -1 to -7.
-                        hist >> (u32::from(ra1.0.unsigned_abs()) - 1)
-                    };
-                    let v2 = a2 >> (31 - j);
-                    c = (c & !(1 << 12 | 1 << 8)) | (v1 & 1) << 12 | (v2 & 1) << 8;
+            }
+            if sure == 0 && i != last {
+                // The ten pixels of each row that the eight contexts have.
+                let any = above | q[0] | q[1] | q[2];
+                let all = above & q[0] & q[1] & q[2];
+                if u32::from(any >> 6) | (hist & 0xFF) | u32::from(v1 | v2) == 0 {
+                    if a.run(cx[0], 0, 8) {
+                        if !CUSTOM {
+                            while at + 8 < stride
+                                && [&p, &q0, &q1, &q2].iter().all(|w| w.white())
+                                && a.run(cx[0], 0, 64)
+                            {
+                                for w in [&mut p, &mut q0, &mut q1, &mut q2] {
+                                    w.skip();
+                                }
+                                at += 8;
+                            }
+                        }
+                        continue;
+                    }
+                } else if all >> 6 == 0x3FF
+                    && hist & 0xFF == 0xFF
+                    && (!CUSTOM || v2 == 0xFF && (near || v1 == 0xFF))
+                    && a.run(cx[N - 1], 1, 8)
+                {
+                    cur[i] = 0xFF;
+                    continue;
                 }
-                hist = (hist << 1) | a.bit(&mut cx[c as usize & mask]);
+            }
+            let mut contexts = contexts8::<ONE>(above, q);
+            if CUSTOM {
+                for c in &mut contexts {
+                    *c &= !(1 << 12 | 1 << 8);
+                }
+                if !near {
+                    spread(&mut contexts, v1, 1 << 12);
+                }
+                spread(&mut contexts, v2, 1 << 8);
+            }
+            if sure == 0 && !(CUSTOM && near) {
+                for &c in &contexts[..n as usize] {
+                    let c = u32::from(c) | (hist & 1) << left;
+                    hist = (hist << 1) | a.bit(&mut cx[c as usize & (N - 1)]);
+                }
+                cur[i] = (hist << (8 - n)) as u8;
+                continue;
+            }
+            for (j, &c) in (0..n).zip(&contexts) {
+                if (sure >> (7 - j)) & 1 == 1 {
+                    hist = (hist << 1) | u32::from((value >> (7 - j)) & 1);
+                    continue;
+                }
+                let mut c = u32::from(c) | (hist & 1) << left;
+                if CUSTOM && near {
+                    c |= ((hist >> (u32::from(ra1.0.unsigned_abs()) - 1)) & 1) << 12;
+                }
+                hist = (hist << 1) | a.bit(&mut cx[c as usize & (N - 1)]);
             }
             cur[i] = (hist << (8 - n)) as u8;
         }
     }
+    *coder = a;
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bit(row: &[u8], x: i64) -> u16 {
+        usize::try_from(x)
+            .ok()
+            .and_then(|x| Some(u16::from(row.get(x >> 3)? >> (7 - (x & 7)) & 1)))
+            .unwrap_or(0)
+    }
+
+    fn noise(n: usize, seed: &mut u32) -> Vec<u8> {
+        let mut byte = || {
+            *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (*seed >> 24) as u8
+        };
+        (0..n).map(|_| byte()).collect()
+    }
+
+    #[test]
+    fn windows_match_single_pixels() {
+        let mut seed = 5;
+        for len in [0usize, 1, 2, 9, 30] {
+            let mut row = noise(len, &mut seed);
+            // Room for white stretches.
+            for v in row.iter_mut().skip(3).take(19) {
+                *v = 0;
+            }
+            for pos in -150..300i64 {
+                let mut w = Window::new(&row, pos);
+                let mut at = pos;
+                for _ in 0..30 {
+                    if w.white() {
+                        for x in at..at + 72 {
+                            assert_eq!(bit(&row, x), 0, "{len} {pos} {x}");
+                        }
+                        w.skip();
+                        at += 64;
+                    }
+                    let v = w.advance();
+                    for k in 0..16 {
+                        assert_eq!(v >> (15 - k) & 1, bit(&row, at + k), "{len} {pos} {at}");
+                    }
+                    at += 8;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contexts_and_typical_match_single_pixels() {
+        let mut seed = 9;
+        for round in 0..3000 {
+            let mut rows: Vec<Vec<u8>> = (0..4).map(|_| noise(2, &mut seed)).collect();
+            if round % 3 != 0 {
+                // Uniform but for a few pixels.
+                let v = if round % 3 == 1 { 0 } else { 0xFF };
+                for r in &mut rows {
+                    let k = r[0] as usize;
+                    *r = vec![v; 2];
+                    if k < 60 {
+                        r[k / 8 % 2] ^= 0x80 >> (k % 8);
+                    }
+                }
+            }
+            let words: Vec<u16> = rows
+                .iter()
+                .map(|r| u16::from_be_bytes([r[0], r[1]]))
+                .collect();
+            let q = [words[1], words[2], words[3]];
+            let (zero, one) = (
+                contexts8::<false>(words[0], q),
+                contexts8::<true>(words[0], q),
+            );
+            let (sure, black) = typical(q);
+            for j in 0..8usize {
+                let three = |r: &Vec<u8>| (0..3).fold(0, |v, k| v << 1 | bit(r, (j + k) as i64));
+                let (p, a, b, c) = (
+                    three(&rows[0]),
+                    three(&rows[1]),
+                    three(&rows[2]),
+                    three(&rows[3]),
+                );
+                assert_eq!(zero[j], p << 10 | a << 6 | b << 3 | c);
+                assert_eq!(one[j], p << 7 | (a >> 1 & 1) << 5 | b << 2 | c & 3);
+                let uniform = a == b && b == c && (a == 0 || a == 7);
+                assert_eq!(sure >> (7 - j) & 1 == 1, uniform);
+                assert_eq!(black >> (7 - j) & 1 == 1, uniform && a == 7);
+            }
+        }
+    }
 }

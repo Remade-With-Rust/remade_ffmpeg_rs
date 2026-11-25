@@ -41,7 +41,7 @@
 //! assert_eq!(bitmap.into_pdf_samples(), [0xFF, 0x00]); // 0 = black
 //! # Ok::<(), rusty_jbig2::Error>(())
 //! ```
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 mod arith;
@@ -51,6 +51,7 @@ mod error;
 mod generic;
 mod halftone;
 mod huffman;
+mod kernels;
 mod mmr;
 mod page;
 mod refinement;

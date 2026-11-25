@@ -58,7 +58,7 @@ fn split(all: &Bitmap, pw: u32, ph: u32, n: u64, budget: &mut Budget) -> Result<
 
 fn contexts(t: &Template, budget: &mut Budget) -> Result<Vec<u8>> {
     budget.charge(t.contexts() as u64 / 8)?;
-    Ok(vec![0; t.contexts()])
+    Ok(vec![0; t.table()])
 }
 
 /// The halftone region's data after the region segment information field.
@@ -139,12 +139,14 @@ pub(crate) fn decode_region(
     }
 
     let cost = (u64::from(dict.pw) / 8 + 2) * u64::from(dict.ph);
+    let mut values = [0u32; 64];
     for m in 0..gh {
         for n in 0..gw {
-            let mut v = 0usize;
-            for p in &planes {
-                v = (v << 1) | p.get(n, m) as usize;
+            if n % 64 == 0 {
+                let cells = (gw - n).min(64) as usize;
+                gray_values(&planes, m, (n >> 3) as usize, &mut values[..cells]);
             }
+            let mut v = values[n as usize % 64] as usize;
             if v >= dict.patterns.len() {
                 if !budget.lenient {
                     return Err(Error::Invalid("gray value has no pattern"));
@@ -160,4 +162,51 @@ pub(crate) fn decode_region(
         }
     }
     Ok(reg)
+}
+
+/// Gray values from their bit planes, most significant first: cells of `row`
+/// from byte `byte` of the planes on.
+fn gray_values(planes: &[Bitmap], row: u32, byte: usize, out: &mut [u32]) {
+    out.fill(0);
+    for p in planes {
+        let bytes = p.row(i64::from(row)).get(byte..).unwrap_or(&[]);
+        for (vs, b) in out.chunks_mut(8).zip(bytes) {
+            for (v, m) in vs.iter_mut().zip([0x80, 0x40, 0x20, 0x10, 8, 4, 2, 1]) {
+                *v = (*v << 1) | u32::from(b & m != 0);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gray_values_match_single_pixels() {
+        let mut seed = 5u32;
+        for w in 1..40u32 {
+            for count in 0..12 {
+                let mut planes = Vec::new();
+                for _ in 0..count {
+                    let mut data = vec![0u8; w.div_ceil(8) as usize * 3];
+                    for v in &mut data {
+                        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        *v = (seed >> 24) as u8;
+                    }
+                    planes.push(Bitmap::from_packed(w, 3, data));
+                }
+                for y in 0..3 {
+                    for byte in 0..w.div_ceil(8) {
+                        let mut got = vec![9; (w - byte * 8) as usize];
+                        gray_values(&planes, y, byte as usize, &mut got);
+                        for (x, got) in (byte * 8..w).zip(got) {
+                            let want = planes.iter().fold(0, |v, p| v << 1 | p.get(x, y));
+                            assert_eq!(got, want);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

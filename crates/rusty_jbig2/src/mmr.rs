@@ -217,7 +217,7 @@ const LOOKUP_BITS: u32 = 13;
 const RUN_INVALID: u16 = u16::MAX;
 
 /// A 13-bit-indexed decode table: (code length, run).
-type RunTable = Vec<(u8, u16)>;
+type RunTable = Box<[(u8, u16); 1 << LOOKUP_BITS]>;
 
 fn build_run_table(codes: &[(u16, u8, u16)]) -> RunTable {
     let mut t = vec![(0u8, RUN_INVALID); 1 << LOOKUP_BITS];
@@ -226,7 +226,8 @@ fn build_run_table(codes: &[(u16, u8, u16)]) -> RunTable {
         let base = usize::from(code) << shift;
         t[base..base + (1 << shift)].fill((len, run));
     }
-    t
+    let t = t.into_boxed_slice().try_into();
+    t.unwrap_or_else(|_| unreachable!("of that length"))
 }
 
 fn tables() -> &'static (RunTable, RunTable) {
@@ -236,57 +237,137 @@ fn tables() -> &'static (RunTable, RunTable) {
 
 const EOFB: u32 = 0x00_1001;
 
+/// What seven bits mean: the code's length and, above -10, the offset of a
+/// vertical mode.
+const MODES: [(u8, i8); 128] = {
+    let mut t = [(0u8, BAD); 128];
+    let mut i = 0;
+    while i < 128 {
+        t[i] = match i {
+            0x40.. => (1, 0),
+            0x30.. => (3, 1),
+            0x20.. => (3, -1),
+            0x10.. => (3, HORIZONTAL),
+            0x08.. => (4, PASS),
+            0x06.. => (6, 2),
+            0x04.. => (6, -2),
+            0x03 => (7, 3),
+            0x02 => (7, -3),
+            0x01 => (7, EXTENSION),
+            _ => (0, BAD),
+        };
+        i += 1;
+    }
+    t
+};
+const HORIZONTAL: i8 = -10;
+const PASS: i8 = -11;
+const EXTENSION: i8 = -12;
+const BAD: i8 = -13;
+
+/// Bits, zeros past the end; what was read is compared with the end a row at
+/// a time.
 struct Reader<'a> {
     data: &'a [u8],
-    pos: usize,
+    /// The next byte that is not in `buf`.
+    next: usize,
+    /// At least 32 bits from the top on, whenever it is looked at.
+    buf: u64,
+    have: u32,
 }
 
-impl Reader<'_> {
-    /// The next `n` (at most 24) bits; zeros past the end.
+impl<'a> Reader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        let mut r = Self {
+            data,
+            next: 0,
+            buf: 0,
+            have: 0,
+        };
+        r.refill();
+        r
+    }
+
+    /// Position in bits.
+    fn pos(&self) -> usize {
+        self.next * 8 - self.have as usize
+    }
+
+    fn overrun(&self) -> bool {
+        self.pos() > self.data.len() * 8
+    }
+
+    #[inline]
+    fn refill(&mut self) {
+        if let Some(s) = self
+            .data
+            .get(self.next..)
+            .and_then(<[u8]>::first_chunk::<8>)
+        {
+            // What bits of it there are below the whole bytes taken come out
+            // the same the next time.
+            self.buf |= u64::from_be_bytes(*s) >> self.have;
+            let n = (63 - self.have) >> 3;
+            self.next += n as usize;
+            self.have += n * 8;
+        } else {
+            self.refill_at_end();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn refill_at_end(&mut self) {
+        while self.have <= 56 {
+            let b = self.data.get(self.next).map_or(0, |&b| u64::from(b));
+            self.buf |= b << (56 - self.have);
+            self.next += 1;
+            self.have += 8;
+        }
+    }
+
+    /// The next `n` (1 to 24) bits.
     #[inline]
     fn peek(&self, n: u32) -> u32 {
-        let byte = self.pos >> 3;
-        let w = if let Some(s) = self.data.get(byte..).and_then(<[u8]>::first_chunk::<4>) {
-            u32::from_be_bytes(*s)
-        } else {
-            let mut w = 0u32;
-            for i in 0..4 {
-                w = (w << 8) | u32::from(self.data.get(byte + i).copied().unwrap_or(0));
-            }
-            w
-        };
-        (w << (self.pos & 7)) >> (32 - n)
+        (self.buf >> (64 - n)) as u32
     }
 
+    /// At most 13 bits.
     #[inline]
-    fn consume(&mut self, n: u32) -> Result<()> {
-        self.pos += n as usize;
-        if self.pos > self.data.len() * 8 {
-            return Err(Error::Truncated);
+    fn consume(&mut self, n: u32) {
+        self.buf <<= n;
+        self.have -= n;
+        if self.have < 32 {
+            self.refill();
         }
-        Ok(())
     }
 
-    /// One run of the given colour, make-up codes summed. Runs are capped
-    /// where they are used, and every code consumes bits.
-    fn run(&mut self, white: bool) -> Result<u32> {
-        let (wt, bt) = tables();
-        let t = if white { wt } else { bt };
+    /// One run by the table of its colour, make-up codes summed. Runs are
+    /// capped where they are used, and every code consumes bits. `None`: not a
+    /// code.
+    #[inline]
+    fn run(&mut self, t: &RunTable) -> Option<u32> {
         let mut total = 0u32;
         loop {
             let (len, run) = t[self.peek(LOOKUP_BITS) as usize];
             if run == RUN_INVALID {
-                return Err(if self.pos + 13 > self.data.len() * 8 {
-                    Error::Truncated
-                } else {
-                    Error::Invalid("MMR run code")
-                });
+                return None;
             }
-            self.consume(u32::from(len))?;
-            total = total.saturating_add(u32::from(run));
+            self.consume(u32::from(len));
             if run < 64 {
-                return Ok(total);
+                return Some(total.saturating_add(u32::from(run)));
             }
+            total = total.saturating_add(u32::from(run));
+        }
+    }
+
+    /// What is wrong where a code of `bits` bits was expected.
+    #[cold]
+    fn error(&self, bits: usize, what: &'static str) -> Error {
+        if self.pos() + bits > self.data.len() * 8 {
+            Error::Truncated
+        } else {
+            Error::Invalid(what)
         }
     }
 }
@@ -304,79 +385,126 @@ fn push_change(cur: &mut Vec<u32>, p: u32, width: u32) {
     }
 }
 
-/// `reference` holds the previous row's changing elements followed by three
-/// `width` sentinels. Its even entries change to black.
-fn decode_row(r: &mut Reader<'_>, width: u32, reference: &[u32], cur: &mut Vec<u32>) -> Result<()> {
+/// Decode a row into `row`, zeroed, and its changing elements into `cur`.
+/// `reference` holds the previous row's changing elements, increasing,
+/// followed by three `width` sentinels. Its even entries change to black.
+fn decode_row(
+    r: &mut Reader<'_>,
+    runs: &(RunTable, RunTable),
+    width: u32,
+    reference: &[u32],
+    cur: &mut Vec<u32>,
+    row: &mut [u8],
+) -> Result<()> {
     cur.clear();
     let w = i64::from(width);
-    let mut a0: i64 = -1;
-    let mut white = true;
+    let mut a0 = -1i64;
+    // Where to look for b1: odd when black.
     let mut bi = 0usize;
     while a0 < w {
-        // b1: the first change right of a0 of the opposite colour.
-        while bi > 0 && i64::from(reference[bi - 1]) > a0 {
-            bi -= 1;
+        // b1: the first change right of a0 of the opposite colour. The
+        // elements increase, so it is not left of `bi`.
+        let mut b1 = w;
+        while let Some(&b) = reference.get(bi) {
+            b1 = i64::from(b);
+            if b1 > a0 {
+                break;
+            }
+            bi += 2;
         }
-        let parity = usize::from(!white);
-        while bi + 2 < reference.len() && (i64::from(reference[bi]) <= a0 || (bi & 1) != parity) {
-            bi += 1;
+        let white = bi & 1 == 0;
+        let (len, mode) = MODES[r.peek(7) as usize];
+        if mode > HORIZONTAL {
+            r.consume(u32::from(len));
+            // A damaged code can put a1 left of a0; a zero-length run then,
+            // and every mode consumes bits, so a stuck a0 still terminates.
+            let from = a0.max(0);
+            let a1 = (b1 + i64::from(mode)).max(from).min(w);
+            push_change(cur, a1 as u32, width);
+            if !white {
+                paint(row, from as usize, a1 as usize);
+            }
+            a0 = a1;
+            // A step of at most three left passes at most the one element
+            // before b1 (it would have to pass two more to be of use).
+            let before = mode < 0 && bi > 0;
+            if before && reference.get(bi - 1).is_some_and(|&b| i64::from(b) > a0) {
+                bi -= 1;
+            } else {
+                bi += 1;
+            }
+            continue;
         }
-        let b1 = i64::from(reference[bi]);
-        let b2 = i64::from(reference.get(bi + 1).copied().unwrap_or(width));
-
-        let p = r.peek(7);
-        let (len, vertical) = match p {
-            0x40.. => (1, 0),
-            0x30.. => (3, 1),
-            0x20.. => (3, -1),
-            0x10.. => {
-                r.consume(3)?;
-                let start = a0.max(0);
-                let a1 = (start + i64::from(r.run(white)?)).min(w);
-                let a2 = (a1 + i64::from(r.run(!white)?)).min(w);
+        let from = a0.max(0);
+        match mode {
+            HORIZONTAL => {
+                r.consume(3);
+                let (first, second) = if white {
+                    (&runs.0, &runs.1)
+                } else {
+                    (&runs.1, &runs.0)
+                };
+                let bad = |r: &Reader<'_>| r.error(13, "MMR run code");
+                let Some(n) = r.run(first) else {
+                    return Err(bad(r));
+                };
+                let a1 = (from + i64::from(n)).min(w);
+                let Some(n) = r.run(second) else {
+                    return Err(bad(r));
+                };
+                let a2 = (a1 + i64::from(n)).min(w);
                 push_change(cur, a1 as u32, width);
                 push_change(cur, a2 as u32, width);
+                let (s, e) = if white { (a1, a2) } else { (from, a1) };
+                paint(row, s as usize, e as usize);
                 a0 = a2;
-                continue;
             }
-            0x08.. => {
-                r.consume(4)?;
+            PASS => {
+                r.consume(4);
+                let b2 = reference.get(bi + 1).map_or(w, |&b| i64::from(b));
+                if !white {
+                    paint(row, from as usize, b2 as usize);
+                }
                 a0 = b2;
-                continue;
             }
-            0x06.. => (6, 2),
-            0x04.. => (6, -2),
-            0x03 => (7, 3),
-            0x02 => (7, -3),
-            0x01 => return Err(Error::Invalid("MMR extension code")),
+            EXTENSION => return Err(Error::Invalid("MMR extension code")),
             _ => {
                 if a0 < 0 && r.peek(24) == EOFB {
                     // The image ends here, rows short.
                     return Err(Error::Truncated);
                 }
-                return Err(if r.pos + 7 > r.data.len() * 8 {
-                    Error::Truncated
-                } else {
-                    Error::Invalid("MMR mode code")
-                });
+                return Err(r.error(7, "MMR mode code"));
             }
-        };
-        r.consume(len)?;
-        // A damaged code can put a1 left of a0; a zero-length run then, and
-        // every mode consumes bits, so a stuck a0 still terminates.
-        let a1 = (b1 + vertical).max(a0.max(0)).min(w);
-        push_change(cur, a1 as u32, width);
-        a0 = a1;
-        white = !white;
+        }
+    }
+    // Zeros past the end are no code, so this is where they would show.
+    if r.overrun() {
+        return Err(Error::Truncated);
     }
     Ok(())
 }
 
-/// Set bits `s..e` of a zeroed row.
+/// Set bits `s..e` of a row.
+#[inline]
 fn paint(row: &mut [u8], s: usize, e: usize) {
     if s >= e {
         return;
     }
+    let sb = s >> 3;
+    let end = (s & 7) + (e - s);
+    if end <= 64 {
+        if let Some(w) = row.get_mut(sb..).and_then(<[u8]>::first_chunk_mut::<8>) {
+            let m = (!0u64 << (64 - (e - s))) >> (s & 7);
+            *w = (u64::from_be_bytes(*w) | m).to_be_bytes();
+            return;
+        }
+    }
+    paint_bytes(row, s, e);
+}
+
+/// [`paint`], long runs and ends of rows. `s < e`.
+#[inline(never)]
+fn paint_bytes(row: &mut [u8], s: usize, e: usize) {
     let (sb, eb) = (s >> 3, e >> 3);
     let head = 0xFFu8 >> (s & 7);
     let tail = !(0xFFu8 >> (e & 7));
@@ -396,29 +524,100 @@ fn paint(row: &mut [u8], s: usize, e: usize) {
 /// the first damaged one on are white if `lenient`, else an error.
 pub(crate) fn decode(data: &[u8], w: u32, h: u32, lenient: bool) -> Result<(Bitmap, usize)> {
     let mut out = Bitmap::new(w, h, false);
-    let mut r = Reader { data, pos: 0 };
+    let mut r = Reader::new(data);
+    let runs = tables();
     let mut reference = vec![w; 3];
     let mut cur = Vec::new();
     if w > 0 {
         for row in out.data.chunks_exact_mut(out.stride) {
-            match decode_row(&mut r, w, &reference, &mut cur) {
+            match decode_row(&mut r, runs, w, &reference, &mut cur, row) {
                 Ok(()) => {}
-                Err(_) if lenient => break,
+                Err(_) if lenient => {
+                    row.fill(0);
+                    break;
+                }
                 Err(e) => return Err(e),
-            }
-            for pair in cur.chunks(2) {
-                paint(
-                    row,
-                    pair[0] as usize,
-                    pair.get(1).map_or(w, |&e| e) as usize,
-                );
             }
             std::mem::swap(&mut reference, &mut cur);
             reference.extend_from_slice(&[w; 3]);
         }
     }
-    if r.peek(24) == EOFB && r.pos + 24 <= data.len() * 8 {
-        r.pos += 24;
+    let mut pos = r.pos();
+    if r.peek(24) == EOFB && pos + 24 <= data.len() * 8 {
+        pos += 24;
     }
-    Ok((out, r.pos.div_ceil(8)))
+    Ok((out, pos.div_ceil(8)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paint_matches_single_bits() {
+        for len in [1usize, 3, 7, 8, 9, 17, 30] {
+            for s in 0..len * 8 {
+                for e in s..=len * 8 {
+                    let mut row = vec![0x10u8; len];
+                    paint(&mut row, s, e);
+                    for x in 0..len * 8 {
+                        let want = (s..e).contains(&x) || x & 7 == 3;
+                        assert_eq!(
+                            (row[x >> 3] >> (7 - (x & 7))) & 1 == 1,
+                            want,
+                            "{len} {s} {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reader_matches_single_bits() {
+        let data: Vec<u8> = (0..41u32).map(|i| (i * 73 + 11) as u8).collect();
+        let bit = |i: usize| {
+            data.get(i >> 3)
+                .map_or(0, |b| u32::from(b >> (7 - (i & 7))) & 1)
+        };
+        for seed in 1..14usize {
+            let mut r = Reader::new(&data);
+            let (mut pos, mut k) = (0, seed);
+            while pos < 44 * 8 {
+                for n in [1u32, 7, 13, 24] {
+                    let want = (0..n as usize).fold(0, |v, i| v << 1 | bit(pos + i));
+                    assert_eq!(r.peek(n), want);
+                }
+                k = (k * 5 + 3) % 1009;
+                let n = k % 13 + 1;
+                r.consume(n as u32);
+                pos += n;
+                assert_eq!(r.pos(), pos);
+                assert_eq!(r.overrun(), pos > data.len() * 8);
+            }
+        }
+    }
+
+    #[test]
+    fn modes_are_the_prefix_code() {
+        let codes: [(&str, i8); 10] = [
+            ("1", 0),
+            ("011", 1),
+            ("010", -1),
+            ("001", HORIZONTAL),
+            ("0001", PASS),
+            ("000011", 2),
+            ("000010", -2),
+            ("0000011", 3),
+            ("0000010", -3),
+            ("0000001", EXTENSION),
+        ];
+        for (i, &(len, mode)) in MODES.iter().enumerate() {
+            let bits = format!("{i:07b}");
+            match codes.iter().find(|(c, _)| bits.starts_with(c)) {
+                Some(&(c, m)) => assert_eq!((usize::from(len), mode), (c.len(), m)),
+                None => assert_eq!((i, mode), (0, BAD)),
+            }
+        }
+    }
 }

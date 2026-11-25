@@ -38,6 +38,16 @@ impl<'a> Bits<'a> {
         Ok(((v >> (last * 8 - end)) & ((1u64 << n) - 1)) as u32)
     }
 
+    /// The next eight bits, if there are that many.
+    #[inline]
+    fn peek8(&self) -> Option<u8> {
+        let at = self.pos >> 3;
+        if let Some(&[a, b]) = self.data.get(at..).and_then(<[u8]>::first_chunk::<2>) {
+            return Some(((u32::from(a) << 8 | u32::from(b)) >> (8 - (self.pos & 7))) as u8);
+        }
+        (self.pos & 7 == 0).then(|| self.data.get(at).copied())?
+    }
+
     pub(crate) fn align(&mut self) {
         self.pos = (self.pos + 7) & !7;
     }
@@ -75,6 +85,9 @@ enum Line {
 pub(crate) struct Prefix {
     count: Vec<u32>,
     sorted: Vec<u32>,
+    /// By the next eight bits: the length of the code they begin with, if it
+    /// is that short, and its index in `sorted`.
+    short: Box<[(u8, u8); 256]>,
 }
 
 impl Prefix {
@@ -97,11 +110,43 @@ impl Prefix {
                 at[usize::from(l)] += 1;
             }
         }
-        Self { count, sorted }
+        let mut short = Box::new([(0u8, 0u8); 256]);
+        // Codes in canonical order, left-aligned in eight bits.
+        let (mut code, mut index) = (0usize, 0usize);
+        for (len, &n) in count.iter().enumerate().take(9).skip(1) {
+            for _ in 0..n {
+                let size = 256 >> len;
+                // An over-subscribed code's excess is never reached.
+                let Some(entries) = short.get_mut(code..code + size) else {
+                    break;
+                };
+                entries.fill((len as u8, index as u8));
+                code += size;
+                index += 1;
+            }
+        }
+        Self {
+            count,
+            sorted,
+            short,
+        }
     }
 
     /// Reads one code; the index of the symbol it was assigned to.
     pub(crate) fn read(&self, b: &mut Bits<'_>) -> Result<usize> {
+        if let Some(bits) = b.peek8() {
+            let (len, index) = self.short[usize::from(bits)];
+            if len != 0 {
+                b.pos += usize::from(len);
+                return Ok(self.sorted[usize::from(index)] as usize);
+            }
+        }
+        self.read_long(b)
+    }
+
+    /// [`Prefix::read`], a bit at a time.
+    #[inline(never)]
+    fn read_long(&self, b: &mut Bits<'_>) -> Result<usize> {
         // `diff` is the code read so far minus the first code of its length.
         let mut diff = 0u64;
         let mut index = 0u64;
@@ -293,6 +338,34 @@ mod tests {
                     }
                     Line::Down(low) => assert_eq!(first, Some(low + 1), "B.{}", i + 1),
                     Line::Oob => {}
+                }
+            }
+        }
+    }
+
+    /// The short-code table against reading bit by bit: lengths on both sides
+    /// of eight, incomplete and over-full codes, and data that runs out.
+    #[test]
+    fn short_codes_match_bit_by_bit() {
+        let mut seed = 3u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 16
+        };
+        for round in 0..400u32 {
+            let max = 1 + round % 11;
+            let n = next() % 60;
+            let lens: Vec<u8> = (0..n).map(|_| (next() % (max + 1)) as u8).collect();
+            let p = Prefix::new(&lens);
+            for len in 0..6usize {
+                let data: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+                for pos in 0..=len * 8 {
+                    let (mut a, mut b) = (Bits { data: &data, pos }, Bits { data: &data, pos });
+                    let (got, want) = (p.read(&mut a), p.read_long(&mut b));
+                    assert_eq!(got, want, "{lens:?} {data:?} {pos}");
+                    if got.is_ok() {
+                        assert_eq!(a.pos, b.pos);
+                    }
                 }
             }
         }

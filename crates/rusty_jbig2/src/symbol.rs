@@ -1,5 +1,6 @@
 //! Symbol dictionary decoding (6.5, 7.4.2).
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::arith::{Arith, IntCtx};
@@ -81,7 +82,7 @@ pub(crate) fn standard_table(n: usize) -> Arc<Table> {
 /// `previous` is the last referred-to dictionary, whose contexts may be used.
 pub(crate) fn decode(
     data: &[u8],
-    input: &[Arc<Bitmap>],
+    input: Cow<'_, [Arc<Bitmap>]>,
     custom: &[Arc<Table>],
     previous: Option<&SymbolDict>,
     budget: &mut Budget,
@@ -129,7 +130,7 @@ pub(crate) fn decode(
 
     // 7.4.2.2: start from zero statistics or the previous dictionary's.
     let mut cx = Contexts {
-        gb: vec![0; hd.template.as_ref().map_or(0, Template::contexts)],
+        gb: vec![0; hd.template.as_ref().map_or(0, Template::table)],
         template: hd.template.clone(),
         gr: vec![0; hd.ref_template.map_or(0, RefTemplate::contexts)],
         ref_template: hd.ref_template,
@@ -156,16 +157,16 @@ pub(crate) fn decode(
         budget.charge((cx.gb.len() + cx.gr.len()) as u64 * 8)?;
     }
 
-    let mut all: Vec<Arc<Bitmap>> = input.to_vec();
+    let mut all = input.into_owned();
     let export = match tables {
         Some(t) => decode_huff(&hd, &t, &mut b, &mut all, &mut cx, budget)?,
         None => decode_arith(&hd, b.rest(), &mut all, &mut cx, budget)?,
     };
     let symbols: Vec<_> = all
-        .iter()
+        .into_iter()
         .zip(&export)
         .filter(|(_, &e)| e)
-        .map(|(s, _)| s.clone())
+        .map(|(s, _)| s)
         .collect();
     if symbols.len() != hd.exported as usize {
         return Err(Error::Invalid("exported symbol count mismatch"));
@@ -232,7 +233,12 @@ fn decode_arith(
         (IntCtx::new(), IntCtx::new(), IntCtx::new(), IntCtx::new());
     let total = all.len() + hd.new as usize;
     // Only aggregate coding uses the symbol ID contexts.
-    let mut tcx = ArithCtx::new(if hd.refagg { total } else { 0 }, budget)?;
+    let mut tcx = if hd.refagg {
+        Some(ArithCtx::new(total, budget)?)
+    } else {
+        budget.charge(1)?;
+        None
+    };
     let template = hd
         .template
         .as_ref()
@@ -248,7 +254,7 @@ fn decode_arith(
             }
             width = size(i64::from(width), dw)?;
             budget.bitmap(u64::from(width), u64::from(height))?;
-            let bm = if let Some(rt) = hd.ref_template {
+            let bm = if let (Some(rt), Some(tcx)) = (hd.ref_template, &mut tcx) {
                 let n = instances(a.int_some(&mut iaai)?)?;
                 if n == 1 {
                     let id = a.iaid(&mut tcx.id, tcx.id_len);
@@ -261,7 +267,7 @@ fn decode_arith(
                     refinement::decode(&mut a, &mut cx.gr, rt, false, &r, width, height)
                 } else {
                     let p = aggregate_params(hd, rt, width, height, n);
-                    let mut c = Coder::Arith(&mut a, &mut tcx);
+                    let mut c = Coder::Arith(&mut a, tcx);
                     text::decode(&p, &mut c, all, &mut cx.gr, budget)?
                 }
             } else {
