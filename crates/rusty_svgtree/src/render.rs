@@ -143,6 +143,11 @@ fn render_node(node: &Node, ctx: &mut Context, ts: Transform, pixmap: &mut Pixma
         Node::Image(i) => {
             render_image(i, ctx, ts, pixmap);
         }
+        Node::Text(t) => {
+            if let Some(g) = &t.flattened {
+                render_nodes(g, ctx, ts, pixmap);
+            }
+        }
     }
 }
 
@@ -695,6 +700,11 @@ fn draw_clip_children(
                 }
             }
             Node::Image(_) => {}
+            Node::Text(t) => {
+                if let Some(g) = &t.flattened {
+                    draw_clip_children(g, mode, ts, ctx, pixmap);
+                }
+            }
         }
     }
 }
@@ -883,6 +893,7 @@ mod tests {
             let data = Arc::new(pb.finish().unwrap());
             let bbox = data.bounds();
             Node::Path(Box::new(tree::Path {
+                id: String::new(),
                 abs_transform: Transform::identity(),
                 visible: true,
                 fill: Some(tree::Fill {
@@ -1098,6 +1109,7 @@ mod tests {
             };
             let bbox = data.bounds();
             let path = tree::Path {
+                id: String::new(),
                 abs_transform: Transform::identity(),
                 visible: true,
                 fill: Some(tree::Fill {

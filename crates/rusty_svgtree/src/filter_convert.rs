@@ -465,12 +465,13 @@ fn convert_image(
     let mut root = Group::default();
     if let Some(node) = fe.href() {
         convert_element(node, state, cache, &mut root);
-        if root.children.is_empty() {
+        if !root.has_content() {
             return None;
         }
     } else {
         let (kind, size) = cache.load_image(fe.attribute(AId::Href)?, state.opt)?;
         place_image(
+            String::new(),
             kind,
             true,
             image_quality(fe),

@@ -26,24 +26,37 @@
 #![forbid(unsafe_code)]
 
 mod colors;
+#[cfg(feature = "fonts")]
+mod colr;
 mod convert;
 mod css;
 pub mod filter;
 mod filter_convert;
 mod filter_kernels;
 mod filter_render;
+#[cfg(feature = "fonts")]
+mod fonts;
 mod image;
 mod marker;
 mod render;
 mod svgtree;
+pub mod text;
+mod text_convert;
+#[cfg(feature = "text")]
+mod text_layout;
 mod tree;
 mod values;
+mod writer;
 
+#[cfg(feature = "fonts")]
+pub use fonts::Fonts;
 pub use rusty_raster;
 pub use tree::{
     BaseGradient, ClipPath, Color, Fill, Group, Image, ImageKind, LinearGradient, Mask, Node,
     Paint, PaintOrder, Path, Pattern, RadialGradient, Stop, Stroke,
 };
+
+pub use writer::WriteOptions;
 
 use rusty_raster::{PixmapMut, Size, Transform};
 
@@ -86,6 +99,12 @@ pub struct Options {
     pub dpi: f32,
     /// The default `font-size`, for `em`/`ex` units.
     pub font_size: f32,
+    /// The default `font-family`.
+    pub font_family: String,
+    /// Where the fonts of text come from; with `None`, text is in the tree
+    /// but draws nothing. Documents cannot load fonts.
+    #[cfg(feature = "text")]
+    pub fonts: Option<std::sync::Arc<dyn text::FontProvider>>,
     /// The size used when `width`/`height` are percentages without a
     /// `viewBox`.
     pub default_size: Size,
@@ -124,6 +143,9 @@ impl Default for Options {
         Options {
             dpi: 96.0,
             font_size: 12.0,
+            font_family: "Times New Roman".to_string(),
+            #[cfg(feature = "text")]
+            fonts: None,
             default_size: Size::from_wh(100.0, 100.0).unwrap_or_else(|| unreachable!()),
             languages: vec!["en".to_string()],
             max_nodes: 500_000,
@@ -141,7 +163,8 @@ impl Default for Options {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[non_exhaustive]
 pub struct Skipped {
-    /// `<text>` elements.
+    /// `<text>` elements that draw nothing: there are no fonts, or a limit
+    /// was reached. (They are in the tree.)
     pub text: usize,
     /// `<image>` and `feImage` references that were not loaded: not a
     /// `data:` URI, not a supported format, broken, or past a limit.
@@ -245,6 +268,31 @@ impl Tree {
     /// What the document has that the tree does not.
     pub fn skipped(&self) -> Skipped {
         self.skipped
+    }
+
+    /// The tree as SVG, with every style resolved. It parses to a tree that
+    /// draws the same (a filter function becomes a `<filter>`, which has a
+    /// region).
+    pub fn to_svg_string(&self, opt: &WriteOptions) -> String {
+        writer::write(self, opt)
+    }
+
+    /// The first node with an id, in paint order (also inside groups, not in
+    /// clip paths, masks or patterns).
+    pub fn node_by_id(&self, id: &str) -> Option<&Node> {
+        if id.is_empty() {
+            return None;
+        }
+        let mut stack: Vec<&Node> = self.root.children.iter().rev().collect();
+        while let Some(n) = stack.pop() {
+            if n.id() == id {
+                return Some(n);
+            }
+            if let Node::Group(g) = n {
+                stack.extend(g.children.iter().rev());
+            }
+        }
+        None
     }
 
     /// The root group.

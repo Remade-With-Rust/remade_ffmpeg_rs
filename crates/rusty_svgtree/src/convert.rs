@@ -61,6 +61,12 @@ pub(crate) struct Cache {
     /// and in the renderer, which recurses over what is converted.
     depth: u32,
     max_depth: u32,
+    /// Byte-spans shaped so far.
+    #[cfg(feature = "text")]
+    text_work: u64,
+    /// Glyph drawings, by what they depend on.
+    #[cfg(feature = "text")]
+    pub(crate) glyphs: HashMap<crate::text_layout::DrawingKey, Option<crate::text_layout::Drawing>>,
     /// Whether a paint still has to be resolved against its `use` element.
     has_context: bool,
     /// The builder every shape is built in, kept with its capacity: a shape
@@ -125,6 +131,98 @@ impl Cache {
         loaded
     }
 
+    /// Resolves a path's paints against its box, or against the context
+    /// element they come from; a paint that cannot apply is dropped.
+    pub(crate) fn resolve_path_paints(
+        &mut self,
+        fill: &mut Option<Fill>,
+        stroke: &mut Option<Stroke>,
+        bbox: Rect,
+        path_ts: Transform,
+    ) {
+        if let Some(f) = fill {
+            if !self.resolve_paint(&mut f.paint, &mut f.context, bbox, path_ts) {
+                *fill = None;
+            }
+        }
+        if let Some(s) = stroke {
+            if !self.resolve_paint(&mut s.paint, &mut s.context, bbox, path_ts) {
+                *stroke = None;
+            }
+        }
+    }
+
+    fn resolve_paint(
+        &mut self,
+        paint: &mut Paint,
+        context: &mut Option<Box<ContextElement>>,
+        bbox: Rect,
+        path_ts: Transform,
+    ) -> bool {
+        match context.as_deref().copied() {
+            None => paint_to_user_space(paint, bbox),
+            Some(ContextElement::Path(ts, bbox)) => {
+                *context = None;
+                process_context_paint(paint, ts, bbox.map(|b| b.to_rect()), path_ts)
+            }
+            Some(ContextElement::Use) => {
+                // Once the box of the `use` element is known.
+                self.has_context = true;
+                true
+            }
+        }
+    }
+
+    /// The box of a path's stroke.
+    pub(crate) fn stroke_box(
+        &mut self,
+        data: &rusty_raster::Path,
+        stroke: Option<&Stroke>,
+    ) -> Option<Rect> {
+        let mut rs = stroke?.to_raster();
+        rs.dash = None;
+        self.stroker.stroke(data, &rs, 1.0)?.compute_tight_bounds()
+    }
+
+    /// Spends text layout work; `false` once the budget is gone.
+    #[cfg(feature = "text")]
+    pub(crate) fn spend_text_work(&mut self, n: u64) -> bool {
+        self.text_work = self.text_work.saturating_add(n);
+        self.text_work <= crate::text_layout::MAX_SHAPE_WORK
+    }
+
+    /// The content of an SVG glyph, and how many elements it has.
+    #[cfg(feature = "text")]
+    pub(crate) fn glyph_document(
+        &mut self,
+        data: &[u8],
+        id: Option<&str>,
+        opt: &Options,
+    ) -> Option<(Group, usize)> {
+        let limits = self.nested.as_mut()?;
+        let mut inner = Nested {
+            depth: limits.depth + 1,
+            ..*limits
+        };
+        // A glyph's own text would need fonts again.
+        let opt = Options {
+            fonts: None,
+            ..opt.clone()
+        };
+        let tree = crate::Tree::parse(data, &opt, &mut inner);
+        limits.nodes_left = inner.nodes_left;
+        let tree = tree.ok()?;
+        let nodes = tree.node_count;
+        let Some(id) = id else {
+            return Some((tree.root, nodes));
+        };
+        let node = tree.node_by_id(id)?.clone();
+        let mut g = Group::default();
+        g.children.push(node);
+        g.calculate_bounding_boxes();
+        Some((g, nodes))
+    }
+
     /// The (empty) builder to build a shape in.
     // Not `unwrap_or_default()`: `PathBuilder::default()` is not
     // `PathBuilder::new()` (it does not inject the initial move-to).
@@ -187,6 +285,29 @@ fn ts_from_matrix(m: values::Matrix) -> Transform {
     )
 }
 
+impl State<'_> {
+    /// A node's id; content made by a marker has none, or it would repeat.
+    pub(crate) fn element_id(&self, node: SvgNode) -> String {
+        if self.parent_markers.is_empty() {
+            node.element_id().to_string()
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// An attribute's list of lengths, in user units, up to its first malformed
+/// one.
+pub(crate) fn length_list_attr(node: SvgNode, name: AId, state: &State) -> Vec<f32> {
+    let Some(v) = node.attribute(name) else {
+        return Vec::new();
+    };
+    values::length_list_prefix(v)
+        .into_iter()
+        .map(|l| convert_length(l, node, name, Units::UserSpaceOnUse, state))
+        .collect()
+}
+
 impl<'a> SvgNode<'a> {
     fn length_attr(&self, name: AId) -> Option<Length> {
         values::length(self.attribute(name)?)
@@ -223,7 +344,7 @@ impl<'a> SvgNode<'a> {
 
     /// A transform attribute; invalid (non-finite or degenerate) becomes
     /// identity, as usvg does. `transform-origin` is applied.
-    fn resolve_transform(&self, name: AId, state: &State) -> Transform {
+    pub(crate) fn resolve_transform(&self, name: AId, state: &State) -> Transform {
         let mut ts = match self.attribute(name).and_then(values::transform) {
             Some(m) => {
                 let t = ts_from_matrix(m);
@@ -256,7 +377,7 @@ impl<'a> SvgNode<'a> {
         }
     }
 
-    fn is_visible_element(&self, opt: &Options) -> bool {
+    pub(crate) fn is_visible_element(&self, opt: &Options) -> bool {
         self.attribute(AId::Display).map(values::trim) != Some("none")
             && self.has_valid_transform(AId::Transform)
             && switch_condition_passed(*self, opt)
@@ -365,7 +486,7 @@ pub(crate) fn convert_length(
     }
 }
 
-fn resolve_font_size(node: SvgNode, state: &State) -> f32 {
+pub(crate) fn resolve_font_size(node: SvgNode, state: &State) -> f32 {
     let nodes: Vec<SvgNode> = node.ancestors().collect();
     let mut font_size = state.opt.font_size;
     for n in nodes.iter().rev() {
@@ -764,8 +885,7 @@ fn convert_element_impl(
         }
         EId::Image => convert_image(node, state, cache, parent),
         EId::Svg | EId::G => convert_children(node, state, cache, parent),
-        // Text is deferred (see README).
-        EId::Text => cache.skipped.text += 1,
+        EId::Text => crate::text_convert::convert(node, state, cache, parent),
         _ => {}
     }
 }
@@ -805,9 +925,9 @@ fn convert_clip_path_elements(clip: SvgNode, state: &State, cache: &mut Cache, p
                 tag,
                 EId::Rect | EId::Circle | EId::Ellipse | EId::Polyline | EId::Polygon | EId::Path
             ) {
-                if let Some(path) = convert_shape(node, state, cache) {
-                    convert_path(node, path, state, cache, g);
-                }
+                convert_shape_element(node, state, cache, g);
+            } else if tag == EId::Text {
+                crate::text_convert::convert(node, state, cache, g);
             }
         }) {
             parent.children.push(Node::Group(g));
@@ -889,6 +1009,11 @@ fn open_group(node: SvgNode, state: &State, force: bool, parent: &Group) -> Opti
     }
     Some(OpenGroup {
         group: Box::new(Group {
+            id: if is_g_or_use {
+                state.element_id(node)
+            } else {
+                String::new()
+            },
             transform,
             abs_transform: parent.abs_transform.pre_concat(transform),
             opacity,
@@ -959,7 +1084,7 @@ pub(crate) fn parse_blend_mode(v: &str) -> Option<BlendMode> {
 // ---------------------------------------------------------------- shapes --
 
 #[inline(never)]
-fn convert_shape(
+pub(crate) fn convert_shape(
     node: SvgNode,
     state: &State,
     cache: &mut Cache,
@@ -1175,41 +1300,9 @@ fn convert_path(
     }
     // objectBoundingBox paint servers to user space (usvg does this in a
     // second pass; the result is the same for paths).
-    let mut own_paint = |paint: &mut Paint, context: &mut Option<Box<ContextElement>>| {
-        match context.as_deref().copied() {
-            None => paint_to_user_space(paint, bounding_box),
-            Some(ContextElement::Path(ts, bbox)) => {
-                *context = None;
-                let bbox = bbox.map(|b| b.to_rect());
-                process_context_paint(paint, ts, bbox, parent.abs_transform)
-            }
-            Some(ContextElement::Use) => {
-                // Once the box of the `use` element is known.
-                cache.has_context = true;
-                true
-            }
-        }
-    };
-    if let Some(f) = fill.as_mut() {
-        if !own_paint(&mut f.paint, &mut f.context) {
-            fill = None;
-        }
-    }
-    if let Some(s) = stroke.as_mut() {
-        if !own_paint(&mut s.paint, &mut s.context) {
-            stroke = None;
-        }
-    }
-    let stroke_bounding_box = stroke
-        .as_ref()
-        .and_then(|s| {
-            let mut rs = s.to_raster();
-            rs.dash = None;
-            cache
-                .stroker
-                .stroke(&data, &rs, 1.0)?
-                .compute_tight_bounds()
-        })
+    cache.resolve_path_paints(&mut fill, &mut stroke, bounding_box, parent.abs_transform);
+    let stroke_bounding_box = cache
+        .stroke_box(&data, stroke.as_ref())
         .unwrap_or(bounding_box);
     let markers = if visible_attr && !state.in_clip_path && has_markers(node) {
         let mut g = Group {
@@ -1238,6 +1331,7 @@ fn convert_path(
         None
     };
     let path = Path {
+        id: state.element_id(node),
         abs_transform: parent.abs_transform,
         visible,
         fill,
@@ -1264,6 +1358,7 @@ fn convert_path(
                 a.fill = None;
                 b.stroke = None;
             }
+            b.id = String::new();
             a.visible = a.visible && (a.fill.is_some() || a.stroke.is_some());
             b.visible = b.visible && (b.fill.is_some() || b.stroke.is_some());
             parent.children.push(Node::Path(Box::new(a)));
@@ -1364,7 +1459,7 @@ fn convert_markers(
             };
             convert_children(mnode, &ms, cache, &mut g);
             g.calculate_bounding_boxes();
-            if !g.children.is_empty() {
+            if g.has_content() {
                 parent.children.push(Node::Group(Box::new(g)));
             }
         });
@@ -1382,6 +1477,11 @@ fn parse_angle(v: &str) -> Option<f32> {
         _ => return None,
     };
     Some(deg as f32)
+}
+
+/// `paint-order`, without markers.
+pub(crate) fn paint_order(v: &str) -> PaintOrder {
+    parse_paint_order(v).0
 }
 
 fn parse_paint_order(v: &str) -> (PaintOrder, usize) {
@@ -1508,7 +1608,12 @@ fn push_pattern_transform(root: &mut Group, transform: Transform) {
 // ----------------------------------------------------------------- style --
 
 #[inline(never)]
-fn resolve_fill(node: SvgNode, has_bbox: bool, state: &State, cache: &mut Cache) -> Option<Fill> {
+pub(crate) fn resolve_fill(
+    node: SvgNode,
+    has_bbox: bool,
+    state: &State,
+    cache: &mut Cache,
+) -> Option<Fill> {
     let rule = |n: SvgNode, attr: AId| match n.find_attribute(attr).map(values::trim) {
         Some("evenodd") => FillRule::EvenOdd,
         _ => FillRule::Winding,
@@ -1551,7 +1656,7 @@ fn resolve_fill(node: SvgNode, has_bbox: bool, state: &State, cache: &mut Cache)
 }
 
 #[inline(never)]
-fn resolve_stroke(
+pub(crate) fn resolve_stroke(
     node: SvgNode,
     has_bbox: bool,
     state: &State,
@@ -1604,7 +1709,7 @@ fn resolve_stroke(
 }
 
 /// An inherited length (`stroke-width`, `stroke-dashoffset`).
-fn resolve_length(node: SvgNode, name: AId, state: &State, def: f32) -> f32 {
+pub(crate) fn resolve_length(node: SvgNode, name: AId, state: &State, def: f32) -> f32 {
     if let Some(n) = node.ancestor_with_attribute(name) {
         if let Some(l) = n.length_attr(name) {
             return convert_length(l, n, name, Units::UserSpaceOnUse, state);
@@ -1827,6 +1932,35 @@ fn resolve_context_paints(group: &mut Group, ts: Transform, bbox: Option<Rect>) 
                 }
             }
             Node::Image(_) => {}
+            Node::Text(t) => {
+                let at = t.abs_transform;
+                for span in t.chunks.iter_mut().flat_map(|c| &mut c.spans) {
+                    let d = &mut span.decoration;
+                    let styles = [&mut d.underline, &mut d.overline, &mut d.line_through]
+                        .into_iter()
+                        .flatten()
+                        .map(|s| (&mut s.fill, &mut s.stroke));
+                    for (fill, stroke) in
+                        std::iter::once((&mut span.fill, &mut span.stroke)).chain(styles)
+                    {
+                        if fill
+                            .as_mut()
+                            .is_some_and(|f| !resolve(&mut f.paint, &mut f.context, at))
+                        {
+                            *fill = None;
+                        }
+                        if stroke
+                            .as_mut()
+                            .is_some_and(|s| !resolve(&mut s.paint, &mut s.context, at))
+                        {
+                            *stroke = None;
+                        }
+                    }
+                }
+                if let Some(g) = &mut t.flattened {
+                    resolve_context_paints(g, ts, bbox);
+                }
+            }
         }
     }
 }
@@ -2150,7 +2284,7 @@ fn convert_pattern(node: SvgNode, state: &State, cache: &mut Cache) -> Option<Se
             ..Group::default()
         };
         convert_children(with_children, state, cache, &mut g);
-        if !g.children.is_empty() {
+        if g.has_content() {
             g.calculate_bounding_boxes();
             root.children.push(Node::Group(Box::new(g)));
         }
@@ -2158,7 +2292,7 @@ fn convert_pattern(node: SvgNode, state: &State, cache: &mut Cache) -> Option<Se
         convert_children(with_children, state, cache, &mut root);
     }
     cache.active.pop();
-    if root.children.is_empty() {
+    if !root.has_content() {
         return None;
     }
     root.calculate_bounding_boxes();
@@ -2236,7 +2370,7 @@ fn convert_clip_path(
         convert_clip_path_elements(node, &cs, cache, &mut root);
     }
     cache.active.pop();
-    if !ok || root.children.is_empty() {
+    if !ok || !root.has_content() {
         return None;
     }
     root.calculate_bounding_boxes();
@@ -2326,7 +2460,7 @@ fn convert_mask(
                         ..Group::default()
                     };
                     convert_children(node, state, cache, &mut g);
-                    if g.children.is_empty() {
+                    if !g.has_content() {
                         ok = false;
                     } else {
                         g.calculate_bounding_boxes();
@@ -2337,7 +2471,7 @@ fn convert_mask(
             }
         } else {
             convert_children(node, state, cache, &mut root);
-            if root.children.is_empty() {
+            if !root.has_content() {
                 ok = false;
             }
         }
@@ -2497,6 +2631,7 @@ fn clip_element(clip_rect: NonZeroRect, transform: Transform) -> Group {
     let data = Arc::new(PathBuilder::from_rect(clip_rect.to_rect()));
     let bbox = clip_rect.to_rect();
     let path = Path {
+        id: String::new(),
         abs_transform: Transform::identity(),
         visible: true,
         fill: Some(Fill {
@@ -2646,7 +2781,16 @@ fn convert_image(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut G
     let Some(rect) = NonZeroRect::from_xywh(x, y, width, height) else {
         return;
     };
-    let _ = place_image(kind, visible, quality, node.aspect(), actual, rect, parent);
+    let _ = place_image(
+        state.element_id(node),
+        kind,
+        visible,
+        quality,
+        node.aspect(),
+        actual,
+        rect,
+        parent,
+    );
 }
 
 /// `image-rendering` as a sampling quality.
@@ -2659,7 +2803,9 @@ pub(crate) fn image_quality(node: SvgNode) -> FilterQuality {
 }
 
 /// Appends an image of intrinsic size `actual`, fitted into `rect`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn place_image(
+    id: String,
     kind: ImageKind,
     visible: bool,
     quality: FilterQuality,
@@ -2695,6 +2841,7 @@ pub(crate) fn place_image(
         ..Group::default()
     };
     g.children.push(Node::Image(Box::new(Image {
+        id,
         visible,
         size: actual,
         quality,

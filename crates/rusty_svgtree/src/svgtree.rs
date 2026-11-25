@@ -34,6 +34,9 @@ pub(crate) enum EId {
     Polygon,
     Image,
     Text,
+    Tspan,
+    Tref,
+    TextPath,
     LinearGradient,
     RadialGradient,
     Stop,
@@ -87,6 +90,9 @@ impl EId {
             "polygon" => EId::Polygon,
             "image" => EId::Image,
             "text" => EId::Text,
+            "tspan" => EId::Tspan,
+            "tref" => EId::Tref,
+            "textPath" => EId::TextPath,
             "linearGradient" => EId::LinearGradient,
             "radialGradient" => EId::RadialGradient,
             "stop" => EId::Stop,
@@ -303,6 +309,14 @@ attribute_ids! {
     RequiredExtensions = "requiredExtensions",
     RequiredFeatures = "requiredFeatures",
     SystemLanguage = "systemLanguage",
+    FontOpticalSizing = "font-optical-sizing",
+    FontVariationSettings = "font-variation-settings",
+    Kerning = "kerning",
+    LengthAdjust = "lengthAdjust",
+    Rotate = "rotate",
+    Space = "space",
+    StartOffset = "startOffset",
+    TextLength = "textLength",
     FilterUnits = "filterUnits",
     PrimitiveUnits = "primitiveUnits",
     In = "in",
@@ -378,11 +392,13 @@ impl AId {
                 | AId::FloodOpacity
                 | AId::FontFamily
                 | AId::FontKerning
+                | AId::FontOpticalSizing
                 | AId::FontSize
                 | AId::FontSizeAdjust
                 | AId::FontStretch
                 | AId::FontStyle
                 | AId::FontVariant
+                | AId::FontVariationSettings
                 | AId::FontWeight
                 | AId::ImageRendering
                 | AId::Isolation
@@ -520,7 +536,10 @@ struct NodeData {
     first_child: Option<NodeId>,
     last_child: Option<NodeId>,
     next_sibling: Option<NodeId>,
+    /// `None` for the document root and for text.
     tag: Option<EId>,
+    /// The attributes; of a text node, `start` is its index in
+    /// `Document::texts` plus one, and there are none.
     attrs: std::ops::Range<u32>,
     /// The attributes this element has.
     own: AttrSet,
@@ -533,6 +552,8 @@ struct NodeData {
 pub(crate) struct Document<'x> {
     nodes: Vec<NodeData>,
     attrs: Vec<Attr<'x>>,
+    /// Character data of text content elements.
+    texts: Vec<String>,
     /// Element ids, borrowed from the XML text like the attribute values.
     links: HashMap<&'x str, NodeId>,
 }
@@ -571,6 +592,18 @@ impl<'a> SvgNode<'a> {
 
     pub(crate) fn tag_name(&self) -> Option<EId> {
         self.d().tag
+    }
+
+    /// The characters of a text node.
+    pub(crate) fn text(&self) -> Option<&'a str> {
+        let d = self.d();
+        if d.tag.is_some() || d.attrs.start == 0 {
+            return None;
+        }
+        self.doc
+            .texts
+            .get(d.attrs.start as usize - 1)
+            .map(String::as_str)
     }
 
     pub(crate) fn element_id(&self) -> &'a str {
@@ -782,11 +815,11 @@ impl<'x> Document<'x> {
     }
 
     /// Appends an element whose attributes are `attrs`, which hold exactly
-    /// the ids in `own`.
+    /// the ids in `own` (or a text node, see `NodeData`).
     fn append(
         &mut self,
         parent: NodeId,
-        tag: EId,
+        tag: Option<EId>,
         attrs: std::ops::Range<u32>,
         own: AttrSet,
     ) -> NodeId {
@@ -798,7 +831,7 @@ impl<'x> Document<'x> {
             first_child: None,
             last_child: None,
             next_sibling: None,
-            tag: Some(tag),
+            tag,
             attrs,
             own,
             chain,
@@ -834,6 +867,9 @@ impl<'x> Document<'x> {
 /// Compound-selector tests allowed for the whole document (about a second of
 /// matching); past it, remaining style rules stop matching.
 const CSS_MATCH_BUDGET: u64 = 50_000_000;
+
+/// Bytes of text a document may have once `use` and `tref` are expanded.
+const MAX_TEXT_BYTES: usize = 1 << 25;
 
 /// Node visits allowed for the cycle-breaking passes below (each pass).
 const FIXUP_BUDGET: usize = 20_000_000;
@@ -946,6 +982,8 @@ struct Builder<'a> {
     use_check_steps: usize,
     /// Work budget for style-sheet matching (compound tests).
     css_budget: u64,
+    /// Bytes of text so far.
+    text_bytes: usize,
     sheet: Vec<css::Rule>,
     /// `sheet` bucketed by what each rule's subject needs (built once the
     /// whole sheet is parsed, for a sheet long enough to gain from it), and
@@ -978,6 +1016,7 @@ pub(crate) fn build(xml: &XmlDoc, limits: Limits) -> Result<Document<'_>, Error>
         use_chain: Vec::new(),
         use_check_steps: 0,
         css_budget: CSS_MATCH_BUDGET,
+        text_bytes: 0,
         sheet: Vec::new(),
         rule_index: None,
         rule_scratch: Vec::new(),
@@ -994,6 +1033,7 @@ pub(crate) fn build(xml: &XmlDoc, limits: Limits) -> Result<Document<'_>, Error>
                 chain: AttrSet::default(),
             }],
             attrs: Vec::new(),
+            texts: Vec::new(),
             links: HashMap::new(),
         },
         limits,
@@ -1101,13 +1141,143 @@ impl<'a> Builder<'a> {
         let node_id = self.parse_element(x, parent, tag, ignore_ids)?;
         if tag == EId::Use {
             self.parse_use(x, origin, node_id, depth + 1)?;
-        } else if tag != EId::Text {
+        } else if tag == EId::Text {
+            self.parse_text(xid, node_id, ignore_ids, depth)?;
+        } else {
             let mut c = self.xml.first_child(xid);
             while let Some(k) = c {
                 self.parse_node(k, origin, node_id, ignore_ids, depth + 1)?;
                 c = self.xml.next_sibling(k);
             }
         }
+        Ok(())
+    }
+
+    /// The content of a `text` element: its character data and its text
+    /// content elements.
+    #[inline(never)]
+    fn parse_text(
+        &mut self,
+        xid: XId,
+        node_id: NodeId,
+        ignore_ids: bool,
+        depth: u32,
+    ) -> Result<(), Error> {
+        let space = SvgNode {
+            id: node_id,
+            doc: &self.doc,
+        }
+        .ancestors()
+        .find_map(|n| n.attribute(AId::Space))
+            == Some("preserve");
+        let first = self.doc.nodes.len();
+        self.parse_text_content(xid, node_id, space, ignore_ids, true, depth)?;
+        trim_text_nodes(&mut self.doc, node_id, first, space);
+        Ok(())
+    }
+
+    fn parse_text_content(
+        &mut self,
+        xid: XId,
+        parent: NodeId,
+        space: bool,
+        ignore_ids: bool,
+        is_root: bool,
+        depth: u32,
+    ) -> Result<(), Error> {
+        if depth > self.limits.max_depth {
+            return Err(Error::ElementsLimitReached);
+        }
+        let mut child = self.xml.first_child(xid);
+        while let Some(id) = child {
+            child = self.xml.next_sibling(id);
+            let is_text = |k: XId| matches!(self.xml.kind(k), NodeKind::Text | NodeKind::CData);
+            if is_text(id) {
+                // Adjacent character data is one text.
+                let mut text = std::borrow::Cow::Borrowed(self.xml.content(id));
+                while let Some(next) = child.filter(|k| is_text(*k)) {
+                    text.to_mut().push_str(self.xml.content(next));
+                    child = self.xml.next_sibling(next);
+                }
+                self.append_text(parent, &text, space)?;
+                continue;
+            }
+            let x = XNode { doc: self.xml, id };
+            let is_a = x.is_element() && self.xml.name(id) == "a";
+            let tag = match x.svg_tag() {
+                // Links are plain text.
+                Some(EId::G) if is_a => EId::Tspan,
+                Some(t @ (EId::Tspan | EId::Tref)) => t,
+                // A text path is a direct child of `text`.
+                Some(EId::TextPath) if is_root => EId::TextPath,
+                _ => continue,
+            };
+            // A `tref` becomes a `tspan` with the text it references.
+            let own = if tag == EId::TextPath {
+                tag
+            } else {
+                EId::Tspan
+            };
+            let node = self.parse_element(x, parent, own, ignore_ids)?;
+            let own_space = match (SvgNode {
+                id: node,
+                doc: &self.doc,
+            })
+            .attribute(AId::Space)
+            {
+                Some(v) => v == "preserve",
+                None => space,
+            };
+            if tag == EId::Tref {
+                if let Some(link) = self.resolve_href(x) {
+                    let linked = XNode {
+                        doc: self.xml,
+                        id: link,
+                    };
+                    if linked.is_element() && linked.svg_tag().is_some() {
+                        let room = self.text_room();
+                        let text = character_data(self.xml, link, room);
+                        self.append_text(node, &text, own_space)?;
+                    }
+                }
+            } else {
+                self.parse_text_content(id, node, own_space, ignore_ids, false, depth + 1)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// How many more bytes of text the document may have (`use` and `tref`
+    /// copy text).
+    fn text_room(&self) -> usize {
+        MAX_TEXT_BYTES.saturating_sub(self.text_bytes)
+    }
+
+    #[inline(never)]
+    fn append_text(&mut self, parent: NodeId, text: &str, space: bool) -> Result<(), Error> {
+        self.check_nodes()?;
+        if text.len() > self.text_room() {
+            return Err(Error::ElementsLimitReached);
+        }
+        self.text_bytes += text.len();
+        // White space becomes spaces, and one space unless it is preserved.
+        let mut out = String::with_capacity(text.len());
+        let mut prev = '0';
+        for c in text.chars() {
+            let c = match c {
+                '\r' | '\n' | '\t' => ' ',
+                c => c,
+            };
+            if !space && c == ' ' && prev == ' ' {
+                continue;
+            }
+            prev = c;
+            out.push(c);
+        }
+        self.doc.texts.push(out);
+        let index = self.doc.texts.len() as u32;
+        self.doc
+            .append(parent, None, index..index, AttrSet::default());
         Ok(())
     }
 
@@ -1194,6 +1364,17 @@ impl<'a> Builder<'a> {
                     if ns == Some(XLINK_NS) || (ns.is_none() && prefix == "xlink") {
                         xlink_href = Some(self.xml.content(aid));
                     }
+                } else if name == "space" && prefix == "xml" {
+                    append_attribute(
+                        &mut self.doc,
+                        &mut own,
+                        parent,
+                        start,
+                        AId::Space,
+                        Src::Xml(self.xml.content(aid)),
+                        false,
+                        false,
+                    );
                 }
                 continue;
             }
@@ -1271,7 +1452,9 @@ impl<'a> Builder<'a> {
         }
 
         let end = self.doc.attrs.len();
-        let id = self.doc.append(parent, tag, start as u32..end as u32, own);
+        let id = self
+            .doc
+            .append(parent, Some(tag), start as u32..end as u32, own);
         Ok(id)
     }
 }
@@ -1291,9 +1474,53 @@ fn apply_declaration<'x>(
         for n in [AId::MarkerStart, AId::MarkerMid, AId::MarkerEnd] {
             append_attribute(doc, own, parent, start, n, value, important, true);
         }
+    } else if name == "font" {
+        apply_font(doc, own, parent, start, value, important);
     } else if let Some(name) = AId::from_name(name).filter(|n| n.is_presentation()) {
         append_attribute(doc, own, parent, start, name, value, important, true);
     }
+}
+
+/// The `font` shorthand: what it does not name is reset.
+fn apply_font<'x>(
+    doc: &mut Document<'x>,
+    own: &mut AttrSet,
+    parent: NodeId,
+    start: usize,
+    value: Src<'x, '_>,
+    important: bool,
+) {
+    let Some(f) = crate::values::font_shorthand(value.as_str()) else {
+        return;
+    };
+    // A part of the value, kept as the value itself is.
+    let part = |p: &str| -> Src<'x, '_> {
+        match value {
+            Src::Xml(all) => {
+                let at = p.as_ptr() as usize - all.as_ptr() as usize;
+                Src::Xml(all.get(at..at + p.len()).unwrap_or(""))
+            }
+            Src::Sheet(all) => {
+                let at = p.as_ptr() as usize - all.as_ptr() as usize;
+                Src::Sheet(all.get(at..at + p.len()).unwrap_or(""))
+            }
+        }
+    };
+    let mut set = |name: AId, value: Src<'x, '_>| {
+        append_attribute(doc, own, parent, start, name, value, important, true);
+    };
+    for (name, p) in [
+        (AId::FontStyle, f.style),
+        (AId::FontVariant, f.variant),
+        (AId::FontWeight, f.weight),
+        (AId::FontStretch, f.stretch),
+    ] {
+        set(name, p.map_or(Src::Xml("normal"), part));
+    }
+    set(AId::FontSizeAdjust, Src::Xml("none"));
+    set(AId::FontKerning, Src::Xml("auto"));
+    set(AId::FontSize, part(f.size));
+    set(AId::FontFamily, part(f.family));
 }
 
 /// Appends (or, with `replace`, overrides) an attribute of the element
@@ -1483,5 +1710,125 @@ fn fix_recursive_fe_images(doc: &mut Document) {
     }
     for id in fixes {
         doc.set_attribute_value(id, AId::Filter, "none");
+    }
+}
+
+/// The text of an element and everything in it, at most `max` bytes.
+fn character_data(xml: &XmlDoc, root: XId, max: usize) -> String {
+    let mut out = String::new();
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        match xml.kind(id) {
+            NodeKind::Text | NodeKind::CData => {
+                out.push_str(xml.content(id));
+                if out.len() > max {
+                    break;
+                }
+            }
+            NodeKind::Element => {
+                let first = stack.len();
+                let mut c = xml.first_child(id);
+                while let Some(k) = c {
+                    stack.push(k);
+                    c = xml.next_sibling(k);
+                }
+                stack[first..].reverse();
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Trims the spaces at both ends of a `text` element, and those doubled where
+/// its text nodes meet, the way Chrome does (a port of usvg's
+/// `trim_text_nodes`; `space` is `xml:space="preserve"`).
+fn trim_text_nodes(doc: &mut Document, text: NodeId, first: usize, space: bool) {
+    // The text nodes, how deep each is and whether it keeps its spaces.
+    let mut nodes: Vec<(usize, usize, bool)> = Vec::new();
+    for i in first..doc.nodes.len() {
+        let n = &doc.nodes[i];
+        if n.tag.is_some() || n.attrs.start == 0 {
+            continue;
+        }
+        let node = SvgNode {
+            id: NodeId(i as u32),
+            doc,
+        };
+        let mut depth = 0;
+        let mut up = node.parent();
+        while let Some(p) = up.filter(|p| p.id != text) {
+            depth += 1;
+            up = p.parent();
+        }
+        let own = node.parent().and_then(|p| p.attribute(AId::Space));
+        let keeps = own.map_or(space, |v| v == "preserve");
+        nodes.push((n.attrs.start as usize - 1, depth, keeps));
+    }
+    let texts = &mut doc.texts;
+    let first_is = |t: &String| t.starts_with(' ');
+    let last_is = |t: &String| t.ends_with(' ');
+    fn drop_first(t: &mut String) {
+        if t.starts_with(' ') {
+            t.remove(0);
+        }
+    }
+    fn drop_last(t: &mut String) {
+        if t.ends_with(' ') {
+            t.pop();
+        }
+    }
+    if let [(only, _, _)] = nodes[..] {
+        if !space {
+            let t = &mut texts[only];
+            if t.len() == 1 {
+                drop_first(t);
+            } else {
+                drop_first(t);
+                drop_last(t);
+            }
+        }
+        return;
+    }
+    let pairs = nodes.len().saturating_sub(1);
+    let mut last_non_empty: Option<(usize, bool)> = None;
+    for i in 0..pairs {
+        let (mut one, depth1, mut keeps1) = nodes[i];
+        let (two, depth2, keeps2) = nodes[i + 1];
+        if texts[one].is_empty() {
+            if let Some((n, k)) = last_non_empty {
+                one = n;
+                keeps1 = k;
+            }
+        }
+        let c1 = first_is(&texts[one]);
+        let c2 = last_is(&texts[one]);
+        let c3 = first_is(&texts[two]);
+        let c4 = last_is(&texts[two]);
+        if depth1 < depth2 {
+            // `Text <tspan> text` is `Text <tspan>text`.
+            if c3 && !keeps2 {
+                drop_first(&mut texts[two]);
+            }
+        } else if c2 && c3 {
+            if !keeps1 && !keeps2 {
+                drop_last(&mut texts[one]);
+            } else if keeps1 && !keeps2 {
+                drop_first(&mut texts[two]);
+            }
+        }
+        let is_first = i == 0;
+        let is_last = i == pairs - 1;
+        if is_first && c1 && !keeps1 && !texts[one].is_empty() {
+            drop_first(&mut texts[one]);
+        } else if is_last && c4 && !texts[two].is_empty() && !keeps2 {
+            drop_last(&mut texts[two]);
+        }
+        if is_last && c2 && texts[two].is_empty() && last_is(&texts[one]) {
+            drop_last(&mut texts[one]);
+        }
+        if !texts[one].trim().is_empty() {
+            last_non_empty = Some((one, keeps1));
+        }
     }
 }

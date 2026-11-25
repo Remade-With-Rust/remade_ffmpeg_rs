@@ -12,6 +12,10 @@ resvg project.
 | `src/filter_convert.rs` | usvg `parser/filter.rs` | this crate's document; cycles broken, numbers clamped, work bounded |
 | `src/filter_render.rs` | resvg `filter/mod.rs` | results dropped after their last use, dead primitives skipped, memory and work budgets |
 | `src/filter_kernels.rs` | resvg `filter/*.rs` | same output, other algorithms (see the module docs) |
+| `src/text.rs` | usvg `tree/text.rs` | plain data types, a font provider trait |
+| `src/text_convert.rs` | usvg `parser/text.rs`, `parser/svgtree/text.rs` (the latter in `src/svgtree.rs`) | this crate's document; linear position lookup, bounded |
+| `src/text_layout.rs` | usvg `text/layout.rs`, `text/flatten.rs` | fonts through the trait; indexed lookups; bounded |
+| `src/fonts.rs`, `src/colr.rs` | usvg `text/mod.rs`, `text/flatten.rs`, `text/colr.rs` | behind the trait; own SVG output; bounded |
 
 Attributions resvg's filter code carries, kept for what descends from it:
 
