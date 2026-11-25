@@ -30,6 +30,16 @@ pub(crate) struct Context {
     filter_work: u64,
 }
 
+/// The area layers may cover on a canvas.
+fn max_bbox(width: u32, height: u32) -> Option<IntRect> {
+    IntRect::from_xywh(
+        i32::try_from(width).ok()?.saturating_mul(-2),
+        i32::try_from(height).ok()?.saturating_mul(-2),
+        width.saturating_mul(5),
+        height.saturating_mul(5),
+    )
+}
+
 impl Context {
     pub(crate) fn new(
         width: u32,
@@ -39,12 +49,7 @@ impl Context {
         max_filter_work: u64,
     ) -> Option<Self> {
         Some(Context {
-            max_bbox: IntRect::from_xywh(
-                i32::try_from(width).ok()?.saturating_mul(-2),
-                i32::try_from(height).ok()?.saturating_mul(-2),
-                width.saturating_mul(5),
-                height.saturating_mul(5),
-            )?,
+            max_bbox: max_bbox(width, height)?,
             canvas: (width, height),
             live_bytes: 0,
             max_live_bytes,
@@ -762,6 +767,29 @@ fn apply_mask(mask: &tree::Mask, ctx: &mut Context, ts: Transform, pixmap: &mut 
 
 // ---------------------------------------------------------------- images --
 
+/// An embedded document: drawn into a layer of its own.
+fn render_document(
+    tree: &crate::Tree,
+    ctx: &mut Context,
+    ts: Transform,
+    pixmap: &mut PixmapMut,
+) -> Option<()> {
+    let mut sub = ctx.alloc(pixmap.width(), pixmap.height())?;
+    let old = ctx.swap_max_bbox(max_bbox(sub.width(), sub.height())?);
+    render_nodes(tree.root(), ctx, ts, &mut sub.as_mut());
+    ctx.swap_max_bbox(old);
+    pixmap.draw_pixmap(
+        0,
+        0,
+        sub.as_ref(),
+        &PixmapPaint::default(),
+        Transform::identity(),
+        None,
+    );
+    ctx.free(&sub);
+    Some(())
+}
+
 fn render_image(
     image: &tree::Image,
     ctx: &mut Context,
@@ -770,6 +798,9 @@ fn render_image(
 ) -> Option<()> {
     if !image.visible {
         return None;
+    }
+    if let tree::ImageKind::Svg(tree) = &image.kind {
+        return render_document(tree, ctx, ts, pixmap);
     }
     let raster = crate::image::decode(&image.kind, ctx.max_image_pixels)?;
     let rect = rusty_raster::Size::from_wh(raster.width() as f32, raster.height() as f32)?
@@ -852,6 +883,7 @@ mod tests {
             let data = Arc::new(pb.finish().unwrap());
             let bbox = data.bounds();
             Node::Path(Box::new(tree::Path {
+                abs_transform: Transform::identity(),
                 visible: true,
                 fill: Some(tree::Fill {
                     paint: tree::Paint::Color(tree::Color {
@@ -861,6 +893,7 @@ mod tests {
                     }),
                     opacity: 1.0,
                     rule: FillRule::Winding,
+                    context: None,
                 }),
                 stroke: None,
                 paint_order: PaintOrder::FillAndStroke,
@@ -1065,6 +1098,7 @@ mod tests {
             };
             let bbox = data.bounds();
             let path = tree::Path {
+                abs_transform: Transform::identity(),
                 visible: true,
                 fill: Some(tree::Fill {
                     paint: tree::Paint::Color(tree::Color {

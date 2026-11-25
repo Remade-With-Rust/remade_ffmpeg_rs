@@ -6052,11 +6052,14 @@ dependencies = [
 name = "rusty_svgtree"
 version = "0.1.7"
 dependencies = [
+ "miniz_oxide 0.8.9",
  "resvg",
  "rusty_alloc-api",
+ "rusty_gif",
  "rusty_jpeg",
  "rusty_png",
  "rusty_raster",
+ "rusty_webp",
  "rusty_xml",
 ]
 

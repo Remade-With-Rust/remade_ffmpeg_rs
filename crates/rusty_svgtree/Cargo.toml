@@ -10,23 +10,29 @@ license = "Apache-2.0"
 repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
 homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
 authors = ["Mata Network <https://www.mata.network>"]
-description = "Pure-Rust SVG parser and renderer: parses SVG into a simplified render tree (usvg-style: paths, shapes, transforms, viewBox, CSS, gradients, use/symbol, clip paths, masks, group opacity, embedded PNG/JPEG) and renders it with rusty_raster. Hostile inputs error or clamp. Measured against resvg."
+description = "Pure-Rust SVG parser and renderer: parses SVG into a simplified render tree (usvg-style: paths, shapes, transforms, viewBox, CSS, gradients, use/symbol, clip paths, masks, group opacity, filters, embedded PNG/JPEG/GIF/WebP/SVG, svgz) and renders it with rusty_raster. Hostile inputs error or clamp. Measured against resvg."
 readme = "README.md"
 keywords = ["svg", "vector", "render", "rasterizer", "graphics"]
 categories = ["graphics", "rendering", "multimedia::images"]
 include = ["/LICENSE", "/NOTICE.md", "/README.md", "/src/"]
 
 [features]
-default = ["raster-images"]
-# Decode embedded `data:` PNG/JPEG images through the house rusty_png and
-# rusty_jpeg crates. Off, `<image>` elements are parsed and skipped.
-raster-images = ["dep:rusty_png", "dep:rusty_jpeg"]
+default = ["raster-images", "svgz"]
+# Decode embedded `data:` PNG, JPEG, GIF and WebP images through the house
+# crates. Off, only embedded SVG images are drawn.
+raster-images = ["dep:rusty_png", "dep:rusty_jpeg", "dep:gif", "dep:rusty_webp"]
+# Read gzip-compressed documents (and embedded ones). The inflater is the
+# release rusty_png already pulls in.
+svgz = ["dep:miniz_oxide"]
 
 [dependencies]
 rusty_raster.workspace = true
 rusty_xml = "0.10.6"
 rusty_png = { workspace = true, optional = true }
 rusty_jpeg = { workspace = true, optional = true }
+gif = { workspace = true, optional = true }
+rusty_webp = { workspace = true, optional = true }
+miniz_oxide = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The oracle: every corpus SVG is rendered by both stacks and compared.

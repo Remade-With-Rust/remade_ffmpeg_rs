@@ -128,7 +128,14 @@ fn pattern_self_reference() {
 #[test]
 fn huge_dimensions_error() {
     let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1000000000" height="1000000000"><rect width="10" height="10"/></svg>"#;
-    assert_eq!(run(svg).err(), Some(Error::InvalidSize));
+    // Nothing is allocated for a document's size: it is an error only past a
+    // limit the caller sets.
+    assert!(run(svg).is_ok());
+    let opt = Options {
+        max_canvas_pixels: 1 << 28,
+        ..Options::default()
+    };
+    assert_eq!(run_with(svg, &opt).err(), Some(Error::InvalidSize));
     let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1e40" height="10"/>"#;
     assert!(run(svg).is_err());
     let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="-5" height="10"/>"#;
@@ -695,4 +702,109 @@ fn filter_external_references_are_not_followed() {
         assert!(p.data().chunks_exact(4).all(|c| c[0] == 0), "{href}");
     }
     let _ = std::fs::remove_file(&dir);
+}
+
+// ------------------------------------------------------------- nesting --
+
+/// Runs `f` on a thread with a 1 MiB stack (a Windows main thread's) in
+/// release; debug frames are several times as large.
+fn on_small_stack(f: impl FnOnce() + Send + 'static) {
+    let size = if cfg!(debug_assertions) { 8 } else { 1 } << 20;
+    std::thread::Builder::new()
+        .stack_size(size)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn wrap(open: &str, close: &str, n: usize, inner: &str) -> String {
+    format!("{}{inner}{}", open.repeat(n), close.repeat(n))
+}
+
+#[test]
+fn deep_legal_nesting_renders() {
+    on_small_stack(|| {
+        for open in [
+            "<g>",
+            r#"<g opacity=".999">"#,
+            r#"<g transform="translate(0 .01)">"#,
+        ] {
+            let svg = doc(&wrap(
+                open,
+                "</g>",
+                1000,
+                r#"<rect width="90" height="90"/>"#,
+            ));
+            let r = run(&svg);
+            assert!(r.is_ok(), "{open}: {:?}", r.err());
+        }
+        for open in ["<svg>", r#"<a><switch>"#] {
+            let close = if open == "<svg>" {
+                "</svg>"
+            } else {
+                "</switch></a>"
+            };
+            for n in [200, 250, 1000, 100_000] {
+                let _ = run(&doc(&wrap(
+                    open,
+                    close,
+                    n,
+                    r#"<rect width="9" height="9"/>"#,
+                )));
+            }
+        }
+    });
+}
+
+#[test]
+fn deep_content_behind_every_reference() {
+    // Each of 40 masks (clip paths, patterns, filters) holds 1000 nested
+    // groups with the reference to the next at the bottom.
+    on_small_stack(|| {
+        for kind in ["mask", "clipPath", "pattern", "marker", "filter"] {
+            let mut body = String::new();
+            for i in 0..40 {
+                let reference = match kind {
+                    "mask" => format!(r#"mask="url(#m{})""#, i + 1),
+                    "clipPath" => format!(r#"clip-path="url(#m{})""#, i + 1),
+                    "pattern" => format!(r#"fill="url(#m{})""#, i + 1),
+                    "marker" => format!(r#"marker-end="url(#m{})""#, i + 1),
+                    _ => format!(r#"filter="url(#m{})""#, i + 1),
+                };
+                let content = wrap(
+                    "<g>",
+                    "</g>",
+                    1000,
+                    &format!(r#"<path d="M0 0L9 0 9 9z" {reference}/>"#),
+                );
+                body.push_str(&if kind == "filter" {
+                    format!(
+                        r##"<filter id="m{i}" filterUnits="userSpaceOnUse" x="0" y="0" width="9" height="9"><feImage href="#e{i}"/></filter><g id="e{i}">{content}</g>"##
+                    )
+                } else if kind == "pattern" {
+                    format!(
+                        r#"<pattern id="m{i}" patternUnits="userSpaceOnUse" width="9" height="9">{content}</pattern>"#
+                    )
+                } else {
+                    format!(r#"<{kind} id="m{i}">{content}</{kind}>"#)
+                });
+            }
+            body.push_str(r##"<path d="M0 0L9 0 9 9z" @/>"##);
+            let first = match kind {
+                "mask" => r#"mask="url(#m0)""#,
+                "clipPath" => r#"clip-path="url(#m0)""#,
+                "pattern" => r#"fill="url(#m0)""#,
+                "marker" => r#"marker-end="url(#m0)""#,
+                _ => r#"filter="url(#m0)""#,
+            };
+            let body = body.replace('@', first);
+            let opt = Options {
+                max_nodes: 100_000,
+                max_filter_work: 1 << 28,
+                ..Options::default()
+            };
+            let _ = run_with(&doc(&body), &opt);
+        }
+    });
 }

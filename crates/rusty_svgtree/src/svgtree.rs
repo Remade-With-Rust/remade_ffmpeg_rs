@@ -761,6 +761,11 @@ impl<'a> Iterator for HrefIter<'a> {
 }
 
 impl<'x> Document<'x> {
+    /// How many elements there are.
+    pub(crate) fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
     pub(crate) fn root(&self) -> SvgNode<'_> {
         SvgNode {
             id: NodeId(0),
@@ -1112,6 +1117,7 @@ impl<'a> Builder<'a> {
         self.id_map.get(id).copied()
     }
 
+    #[inline(never)]
     fn parse_use(
         &mut self,
         x: XNode,
@@ -1161,6 +1167,7 @@ impl<'a> Builder<'a> {
         r
     }
 
+    #[inline(never)]
     fn parse_element(
         &mut self,
         x: XNode<'a>,
@@ -1380,37 +1387,12 @@ fn resolve_inherit<'x>(doc: &Document<'x>, parent: NodeId, name: AId) -> Option<
 
 /// Breaks 1- and 2-step reference cycles through `attr` (`clip-path` on a
 /// `clipPath`'s content pointing back at it), exactly as usvg does: the
-/// offending attribute becomes `none`. Longer cycles are caught by the
-/// converter's recursion guard.
+/// offending attribute becomes `none`, and is `none` from then on (a cycle
+/// of two is broken at one of its two ends, not at both). Longer cycles are
+/// caught by the converter's recursion guard.
 fn fix_recursive_links(doc: &mut Document, eid: EId, attr: AId) {
-    let mut fixes: Vec<NodeId> = Vec::new();
-    let mut steps = 0usize;
-    'outer: {
-        let d = &*doc;
-        for node in d.root().descendants().filter(|n| n.tag_name() == Some(eid)) {
-            for child in node.descendants() {
-                steps += 1;
-                if steps > FIXUP_BUDGET {
-                    break 'outer;
-                }
-                if let Some(link) = child.func_iri_attribute(attr) {
-                    if link == node {
-                        fixes.push(child.id);
-                    } else {
-                        for n2 in link.descendants() {
-                            steps += 1;
-                            if steps > FIXUP_BUDGET {
-                                break 'outer;
-                            }
-                            if n2.func_iri_attribute(attr) == Some(node) {
-                                fixes.push(n2.id);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let d = &*doc;
+    let fixes = find_cycles(d, eid, |n| n.func_iri_attribute(attr));
     for id in fixes {
         doc.set_attribute_value(id, attr, "none");
     }
@@ -1418,50 +1400,58 @@ fn fix_recursive_links(doc: &mut Document, eid: EId, attr: AId) {
 
 /// Pattern content painting with its own pattern: the paint becomes `none`.
 fn fix_recursive_patterns(doc: &mut Document, attr: AId) {
-    let mut fixes: Vec<NodeId> = Vec::new();
+    let d = &*doc;
+    let fixes = find_cycles(d, EId::Pattern, |n| {
+        match crate::values::paint(n.attribute(attr)?)? {
+            crate::values::Paint::Url(id, _) => d.element_by_id(id),
+            _ => None,
+        }
+    });
+    for id in fixes {
+        doc.set_attribute_value(id, attr, "none");
+    }
+}
+
+/// The nodes whose reference (`link`) is to be dropped so that no element of
+/// kind `eid` is reached from its own content in one or two steps.
+fn find_cycles<'a>(
+    doc: &'a Document<'a>,
+    eid: EId,
+    link: impl Fn(&SvgNode<'a>) -> Option<SvgNode<'a>>,
+) -> std::collections::HashSet<NodeId> {
+    let mut fixes = std::collections::HashSet::new();
     let mut steps = 0usize;
-    'outer: {
-        let d = &*doc;
-        for pat in d
-            .root()
-            .descendants()
-            .filter(|n| n.tag_name() == Some(EId::Pattern))
-        {
-            for node in pat.descendants() {
+    for node in doc.root().descendants() {
+        if node.tag_name() != Some(eid) {
+            continue;
+        }
+        for child in node.descendants() {
+            steps += 1;
+            if steps > FIXUP_BUDGET {
+                return fixes;
+            }
+            if fixes.contains(&child.id) {
+                continue;
+            }
+            let Some(target) = link(&child) else {
+                continue;
+            };
+            if target == node {
+                fixes.insert(child.id);
+                continue;
+            }
+            for n2 in target.descendants() {
                 steps += 1;
                 if steps > FIXUP_BUDGET {
-                    break 'outer;
+                    return fixes;
                 }
-                let Some(v) = node.attribute(attr) else {
-                    continue;
-                };
-                if let Some(crate::values::Paint::Url(link_id, _)) = crate::values::paint(v) {
-                    if link_id == pat.element_id() {
-                        fixes.push(node.id);
-                    } else if let Some(linked) = d.element_by_id(link_id) {
-                        for n2 in linked.descendants() {
-                            steps += 1;
-                            if steps > FIXUP_BUDGET {
-                                break 'outer;
-                            }
-                            if let Some(v2) = n2.attribute(attr) {
-                                if let Some(crate::values::Paint::Url(l2, _)) =
-                                    crate::values::paint(v2)
-                                {
-                                    if l2 == pat.element_id() {
-                                        fixes.push(n2.id);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                if !fixes.contains(&n2.id) && link(&n2) == Some(node) {
+                    fixes.insert(n2.id);
                 }
             }
         }
     }
-    for id in fixes {
-        doc.set_attribute_value(id, attr, "none");
-    }
+    fixes
 }
 
 /// An `feImage` referencing an element that is filtered by the same filter:

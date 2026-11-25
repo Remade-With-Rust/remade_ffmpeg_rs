@@ -10,6 +10,8 @@ use crate::Options;
 enum Format {
     Png,
     Jpeg,
+    Gif,
+    WebP,
 }
 
 fn sniff(data: &[u8]) -> Option<Format> {
@@ -17,6 +19,10 @@ fn sniff(data: &[u8]) -> Option<Format> {
         Some(Format::Png)
     } else if data.starts_with(&[0xff, 0xd8, 0xff]) {
         Some(Format::Jpeg)
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        Some(Format::Gif)
+    } else if data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WEBP") {
+        Some(Format::WebP)
     } else {
         None
     }
@@ -127,11 +133,27 @@ fn percent_decode(text: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Documents nested in documents (`data:` SVG images) this deep are not
+/// loaded.
+const MAX_NESTING: u32 = 8;
+
+/// The limits a document shares with the ones it embeds.
+#[derive(Clone, Copy)]
+pub(crate) struct Nested {
+    pub depth: u32,
+    /// Elements all of them together may still have.
+    pub nodes_left: usize,
+}
+
 /// Resolves an `<image>` `href`. Only `data:` URIs are loaded (no file or
-/// network access by design); PNG and JPEG are recognised by MIME type or
-/// by content. Returns the encoded data and its intrinsic size, read from the
-/// header only.
-pub(crate) fn load_href(href: &str, opt: &Options) -> Option<(ImageKind, Size)> {
+/// network access by design); the format is recognised by MIME type or by
+/// content. Returns the data and its intrinsic size, read from the header
+/// only.
+pub(crate) fn load_href(
+    href: &str,
+    opt: &Options,
+    nested: &mut Nested,
+) -> Option<(ImageKind, Size)> {
     let href = href.trim();
     if !crate::values::starts_with_ci(href, "data:") {
         return None;
@@ -156,7 +178,14 @@ pub(crate) fn load_href(href: &str, opt: &Options) -> Option<(ImageKind, Size)> 
     let format = match mime.as_str() {
         "image/png" => Format::Png,
         "image/jpeg" | "image/jpg" => Format::Jpeg,
-        "" | "text/plain" | "application/octet-stream" => sniff(&data)?,
+        "image/gif" => Format::Gif,
+        "image/webp" => Format::WebP,
+        "image/svg+xml" => return load_svg(&data, opt, nested),
+        "application/octet-stream" => sniff(&data)?,
+        "" | "text/plain" => match sniff(&data) {
+            Some(f) => f,
+            None => return load_svg(&data, opt, nested),
+        },
         _ => return None,
     };
     let (w, h) = probe_size(format, &data)?;
@@ -164,11 +193,140 @@ pub(crate) fn load_href(href: &str, opt: &Options) -> Option<(ImageKind, Size)> 
         return None;
     }
     let size = Size::from_wh(w as f32, h as f32)?;
+    let data = std::sync::Arc::new(data);
     let kind = match format {
-        Format::Png => crate::convert::image_kind_png(data),
-        Format::Jpeg => crate::convert::image_kind_jpeg(data),
+        Format::Png => ImageKind::Png(data),
+        Format::Jpeg => ImageKind::Jpeg(data),
+        Format::Gif => ImageKind::Gif(data),
+        Format::WebP => ImageKind::WebP(data),
     };
     Some((kind, size))
+}
+
+/// A document embedded in another: it shares the outer one's element limit.
+fn load_svg(data: &[u8], opt: &Options, nested: &mut Nested) -> Option<(ImageKind, Size)> {
+    if nested.depth >= MAX_NESTING || nested.nodes_left == 0 {
+        return None;
+    }
+    let mut inner = Nested {
+        depth: nested.depth + 1,
+        ..*nested
+    };
+    let tree = crate::Tree::parse(data, opt, &mut inner);
+    nested.nodes_left = inner.nodes_left;
+    let tree = tree.ok()?;
+    let size = tree.size();
+    Some((ImageKind::Svg(std::sync::Arc::new(tree)), size))
+}
+
+/// Decompresses gzip data, at most `max` bytes of it (more is an error).
+#[cfg(feature = "svgz")]
+pub(crate) fn gunzip(data: &[u8], max: u64) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut rest = data;
+    // A gzip file is any number of members, one after the other.
+    while rest.starts_with(&[0x1f, 0x8b]) {
+        let flags = *rest.get(3)?;
+        if *rest.get(2)? != 8 || flags & 0xe0 != 0 {
+            return None;
+        }
+        let mut at = 10usize;
+        if flags & 4 != 0 {
+            let len = rest.get(at..at + 2)?;
+            at += 2 + usize::from(u16::from_le_bytes([len[0], len[1]]));
+        }
+        for text in [8, 16] {
+            if flags & text != 0 {
+                at += rest.get(at..)?.iter().position(|&b| b == 0)? + 1;
+            }
+        }
+        if flags & 2 != 0 {
+            at += 2;
+        }
+        let body = rest.get(at..)?;
+        let room = usize::try_from(max).unwrap_or(usize::MAX) - out.len();
+        let (part, used) = inflate(body, room)?;
+        let trailer = body.get(used..used + 8)?;
+        let word = |i: usize| {
+            trailer
+                .get(i..i + 4)?
+                .try_into()
+                .ok()
+                .map(u32::from_le_bytes)
+        };
+        if word(0)? != crc32(&part) || word(4)? != part.len() as u32 {
+            return None;
+        }
+        out.extend_from_slice(&part);
+        rest = &body[used + 8..];
+    }
+    Some(out)
+}
+
+/// Raw deflate data, at most `max` bytes of output, and how much of `data`
+/// it took.
+#[cfg(feature = "svgz")]
+fn inflate(data: &[u8], max: usize) -> Option<(Vec<u8>, usize)> {
+    use miniz_oxide::inflate::core::{decompress, inflate_flags, DecompressorOxide};
+    use miniz_oxide::inflate::TINFLStatus;
+    let mut state = Box::<DecompressorOxide>::default();
+    let mut out = vec![
+        0u8;
+        data.len()
+            .saturating_mul(2)
+            .clamp(1024, 1 << 26)
+            .min(max.max(1))
+    ];
+    let (mut read, mut written) = (0, 0);
+    loop {
+        let (status, r, w) = decompress(
+            &mut state,
+            &data[read..],
+            &mut out,
+            written,
+            inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+        );
+        read += r;
+        written += w;
+        match status {
+            TINFLStatus::Done => {
+                out.truncate(written);
+                return Some((out, read));
+            }
+            TINFLStatus::HasMoreOutput if out.len() < max => {
+                let len = out.len().saturating_mul(2).min(max);
+                out.try_reserve_exact(len - out.len()).ok()?;
+                out.resize(len, 0);
+            }
+            _ => return None,
+        }
+    }
+}
+
+#[cfg(feature = "svgz")]
+fn crc32(data: &[u8]) -> u32 {
+    const TABLE: [u32; 256] = {
+        let mut t = [0u32; 256];
+        let mut i = 0;
+        while i < 256 {
+            let mut c = i as u32;
+            let mut k = 0;
+            while k < 8 {
+                c = if c & 1 != 0 {
+                    0xedb8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+                k += 1;
+            }
+            t[i] = c;
+            i += 1;
+        }
+        t
+    };
+    !data
+        .iter()
+        .fold(!0u32, |c, b| TABLE[usize::from(c as u8 ^ b)] ^ (c >> 8))
 }
 
 #[cfg(feature = "raster-images")]
@@ -184,6 +342,18 @@ fn probe_size(format: Format, data: &[u8]) -> Option<(u32, u32)> {
             d.read_info().ok()?;
             let info = d.info()?;
             Some((u32::from(info.width), u32::from(info.height)))
+        }
+        // The logical screen.
+        Format::Gif => {
+            let b = data.get(6..10)?;
+            Some((
+                u32::from(u16::from_le_bytes([b[0], b[1]])),
+                u32::from(u16::from_le_bytes([b[2], b[3]])),
+            ))
+        }
+        Format::WebP => {
+            let d = rusty_webp::WebPDecoder::new(std::io::Cursor::new(data)).ok()?;
+            Some(d.dimensions())
         }
     }
 }
@@ -206,6 +376,9 @@ pub(crate) fn decode(kind: &ImageKind, max_pixels: u64) -> Option<Pixmap> {
     match kind {
         ImageKind::Png(data) => decode_png(data, max_pixels),
         ImageKind::Jpeg(data) => decode_jpeg(data, max_pixels),
+        ImageKind::Gif(data) => decode_gif(data, max_pixels),
+        ImageKind::WebP(data) => decode_webp(data, max_pixels),
+        ImageKind::Svg(_) => None,
     }
 }
 
@@ -328,6 +501,57 @@ fn decode_jpeg(data: &[u8], max_pixels: u64) -> Option<Pixmap> {
         }
     };
     Pixmap::from_vec(rgba, IntSize::from_wh(w, h)?)
+}
+
+/// The first frame, at its own size (as resvg draws it).
+#[cfg(feature = "raster-images")]
+fn decode_gif(data: &[u8], max_pixels: u64) -> Option<Pixmap> {
+    let mut opts = gif::DecodeOptions::new();
+    opts.set_color_output(gif::ColorOutput::RGBA);
+    opts.set_memory_limit(gif::MemoryLimit::Bytes(std::num::NonZeroU64::new(
+        max_pixels.saturating_mul(4),
+    )?));
+    let mut d = opts.read_info(data).ok()?;
+    let frame = d.read_next_frame().ok()??;
+    let size = IntSize::from_wh(u32::from(frame.width), u32::from(frame.height))?;
+    if u64::from(size.width()) * u64::from(size.height()) > max_pixels {
+        return None;
+    }
+    let mut rgba = frame.buffer.to_vec();
+    premultiply(&mut rgba);
+    Pixmap::from_vec(rgba, size)
+}
+
+#[cfg(feature = "raster-images")]
+fn decode_webp(data: &[u8], max_pixels: u64) -> Option<Pixmap> {
+    let mut d = rusty_webp::WebPDecoder::new(std::io::Cursor::new(data)).ok()?;
+    let (w, h) = d.dimensions();
+    if u64::from(w) * u64::from(h) > max_pixels {
+        return None;
+    }
+    d.set_memory_limit(usize::try_from(max_pixels.saturating_mul(4)).unwrap_or(usize::MAX));
+    let mut buf = vec![0; d.output_buffer_size()?];
+    d.read_image(&mut buf).ok()?;
+    let rgba = if d.has_alpha() {
+        premultiply(&mut buf);
+        buf
+    } else {
+        rgb_to_rgba(&buf, (w as usize).checked_mul(h as usize)?)?
+    };
+    Pixmap::from_vec(rgba, IntSize::from_wh(w, h)?)
+}
+
+/// Multiplies alpha in, rounded as resvg does for these formats.
+#[cfg(feature = "raster-images")]
+fn premultiply(rgba: &mut [u8]) {
+    for p in rgba.chunks_exact_mut(4) {
+        if p[3] != 255 {
+            let a = f64::from(p[3]) / 255.0;
+            for c in &mut p[..3] {
+                *c = (f64::from(*c) * a + 0.5) as u8;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

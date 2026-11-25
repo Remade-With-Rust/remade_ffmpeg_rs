@@ -18,7 +18,7 @@ pub enum Node {
     Group(Box<Group>),
     /// A filled and/or stroked path.
     Path(Box<Path>),
-    /// An embedded raster image.
+    /// An embedded image.
     Image(Box<Image>),
 }
 
@@ -46,6 +46,10 @@ impl Node {
 #[derive(Clone, Debug)]
 pub struct Group {
     pub(crate) transform: Transform,
+    pub(crate) abs_transform: Transform,
+    /// Content painted with `context-fill` / `context-stroke` takes this
+    /// group's box and coordinates (a `use`).
+    pub(crate) is_context: bool,
     pub(crate) opacity: f32,
     pub(crate) blend_mode: BlendMode,
     pub(crate) isolate: bool,
@@ -62,6 +66,8 @@ impl Default for Group {
     fn default() -> Self {
         Group {
             transform: Transform::identity(),
+            abs_transform: Transform::identity(),
+            is_context: false,
             opacity: 1.0,
             blend_mode: BlendMode::SourceOver,
             isolate: false,
@@ -99,6 +105,12 @@ impl Group {
     /// The group's transform relative to its parent.
     pub fn transform(&self) -> Transform {
         self.transform
+    }
+
+    /// The group's transform relative to the root (of the tree, or of the
+    /// clip path, mask, pattern or `feImage` the group is in).
+    pub fn abs_transform(&self) -> Transform {
+        self.abs_transform
     }
 
     /// Group opacity, `0..=1`.
@@ -209,6 +221,7 @@ pub enum PaintOrder {
 /// A path with resolved paint.
 #[derive(Clone, Debug)]
 pub struct Path {
+    pub(crate) abs_transform: Transform,
     pub(crate) visible: bool,
     pub(crate) fill: Option<Fill>,
     pub(crate) stroke: Option<Stroke>,
@@ -220,6 +233,12 @@ pub struct Path {
 }
 
 impl Path {
+    /// The path's transform relative to the root (see
+    /// [`Group::abs_transform`]).
+    pub fn abs_transform(&self) -> Transform {
+        self.abs_transform
+    }
+
     /// Whether the path is drawn (`visibility`).
     pub fn is_visible(&self) -> bool {
         self.visible
@@ -281,6 +300,7 @@ pub struct Fill {
     pub(crate) paint: Paint,
     pub(crate) opacity: f32,
     pub(crate) rule: FillRule,
+    pub(crate) context: Option<Box<ContextElement>>,
 }
 
 impl Fill {
@@ -311,6 +331,17 @@ pub struct Stroke {
     pub(crate) linejoin: LineJoin,
     pub(crate) dasharray: Option<Vec<f32>>,
     pub(crate) dashoffset: f32,
+    pub(crate) context: Option<Box<ContextElement>>,
+}
+
+/// What a paint taken over from a context element is resolved against
+/// (only during conversion).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ContextElement {
+    /// The `use` element around it, once its box is known.
+    Use,
+    /// The path a marker is drawn on: its coordinates and box.
+    Path(Transform, Option<NonZeroRect>),
 }
 
 impl Stroke {
@@ -539,16 +570,24 @@ impl Mask {
     }
 }
 
-/// Encoded image data; decoded at render time with a pixel-count limit.
+/// Image data. Raster images stay encoded, and are decoded at render time
+/// with a pixel-count limit.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum ImageKind {
     /// PNG bytes.
     Png(Arc<Vec<u8>>),
     /// JPEG bytes.
     Jpeg(Arc<Vec<u8>>),
+    /// GIF bytes; the first frame is drawn.
+    Gif(Arc<Vec<u8>>),
+    /// WebP bytes.
+    WebP(Arc<Vec<u8>>),
+    /// An SVG document.
+    Svg(Arc<crate::Tree>),
 }
 
-/// An embedded raster image, drawn at `0,0` with its intrinsic size (the
+/// An embedded image, drawn at `0,0` with its intrinsic size (the
 /// parent group carries the placement transform).
 #[derive(Clone, Debug)]
 pub struct Image {
@@ -559,12 +598,12 @@ pub struct Image {
 }
 
 impl Image {
-    /// Intrinsic size in pixels.
+    /// Intrinsic size (pixels, or user units of an SVG).
     pub fn size(&self) -> Size {
         self.size
     }
 
-    /// The encoded data.
+    /// The image data.
     pub fn kind(&self) -> &ImageKind {
         &self.kind
     }
