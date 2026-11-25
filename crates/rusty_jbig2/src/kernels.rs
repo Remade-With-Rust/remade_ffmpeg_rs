@@ -89,7 +89,12 @@ impl Narrow {
         let mut pad = [0u8; 72];
         let src = if src.len() <= 64 {
             // Every row of a small source gets a whole word to load.
-            pad[..src.len()].copy_from_slice(src);
+            // A pattern's usual size without a call.
+            if let Some(w) = src.first_chunk::<8>().filter(|_| src.len() == 8) {
+                pad[..8].copy_from_slice(w);
+            } else {
+                pad[..src.len()].copy_from_slice(src);
+            }
             &pad
         } else {
             src
