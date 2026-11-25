@@ -159,6 +159,51 @@ fn whole_words(rows: usize, len: usize, at: usize, stride: usize) -> usize {
     n
 }
 
+/// A draw of rows of several 64-bit words.
+pub(crate) struct Words {
+    count: usize,
+    head: u64,
+    tail: u64,
+    sh: u32,
+}
+
+impl Words {
+    /// Rows from bit `lead` (below 8) to bit `end` of the destination, the
+    /// source beginning at bit `sh` (below 8).
+    pub(crate) fn new(lead: u32, end: i64, sh: u32) -> Self {
+        Self {
+            count: (end as u64).div_ceil(64) as usize,
+            head: !0 >> lead,
+            tail: !0 << ((end as u64).wrapping_neg() & 63),
+            sh,
+        }
+    }
+
+    /// Draw a row, unless less than its words and a byte are left.
+    #[inline]
+    pub(crate) fn row<C: Combine>(&self, d: &mut [u8], s: &[u8]) -> bool {
+        let bytes = self.count * 8;
+        let (Some(d), Some(s)) = (d.get_mut(..bytes), s.get(..=bytes)) else {
+            return false;
+        };
+        let after = s[8..].iter().step_by(8);
+        let mut m = self.head;
+        let mut left = self.count;
+        for ((d, s), a) in d.chunks_exact_mut(8).zip(s.chunks_exact(8)).zip(after) {
+            if let (Some(d), Some(s)) = (d.first_chunk_mut::<8>(), s.first_chunk::<8>()) {
+                left -= 1;
+                if left == 0 {
+                    m &= self.tail;
+                }
+                let v = (u64::from_be_bytes(*s) << self.sh) | (u64::from(*a) >> (8 - self.sh));
+                *d = C::f(u64::from_be_bytes(*d), v, m).to_be_bytes();
+                m = !0;
+            }
+        }
+        true
+    }
+}
+
 /// Any other draw, in bytes: the source's shifted ones between two masked
 /// ones of the destination.
 pub(crate) struct Wide {

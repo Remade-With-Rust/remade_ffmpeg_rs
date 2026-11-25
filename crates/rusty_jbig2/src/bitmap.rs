@@ -1,4 +1,4 @@
-use crate::kernels::{And, Combine, Narrow, Or, Replace, Wide, Xnor, Xor};
+use crate::kernels::{And, Combine, Narrow, Or, Replace, Wide, Words, Xnor, Xor};
 use crate::{Error, Result};
 
 /// A 1-bit image: packed rows, most significant bit first, each row padded
@@ -257,9 +257,31 @@ impl Bitmap {
             head: 0xFF >> lead,
             tail,
         };
+        // The bytes of longer rows vectorise.
+        if bits > 512 {
+            for yy in y0..y1 {
+                let start = yy as usize * self.stride;
+                w.row::<C>(&mut self.data[start + b0..start + b1], src.row(yy - y));
+            }
+            return;
+        }
+        let words = Words::new(lead, x1 - b0 as i64 * 8, w.sh);
         for yy in y0..y1 {
             let start = yy as usize * self.stride;
-            w.row::<C>(&mut self.data[start + b0..start + b1], src.row(yy - y));
+            // What these words hold beyond the row is masked, whether it is
+            // another row's or what precedes the source's first pixel.
+            let from = (yy - y) as usize * src.stride;
+            let done = from
+                .checked_add_signed(w.first as isize)
+                .is_some_and(|from| {
+                    words.row::<C>(
+                        &mut self.data[start + b0..],
+                        src.data.get(from..).unwrap_or(&[]),
+                    )
+                });
+            if !done {
+                w.row::<C>(&mut self.data[start + b0..start + b1], src.row(yy - y));
+            }
         }
     }
 }
