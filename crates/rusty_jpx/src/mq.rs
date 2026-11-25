@@ -187,16 +187,16 @@ impl<'a> Mq<'a> {
         let ctx = ctx as usize;
         let e = cx.0[ctx];
         let qe = e & !0xFFFF;
-        let mut a = self.a.wrapping_sub(qe);
+        let a;
         let (c, low) = self.c.overflowing_sub(qe);
         // The sub-interval sizes may be inverted (conditional exchange): then
         // the smaller one belongs to the MPS.
         let lps = if low {
-            let lps = a >= qe;
             a = qe;
-            lps
+            self.a.wrapping_sub(qe) >= qe
         } else {
             self.c = c;
+            a = self.a.wrapping_sub(qe);
             if a >> 63 != 0 {
                 self.a = a;
                 return e as u32 & 1;
