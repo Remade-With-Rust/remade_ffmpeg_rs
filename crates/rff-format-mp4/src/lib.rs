@@ -24,16 +24,20 @@
 //! The fragmented profile lives in [`fmp4`] (init/media segments) and powers
 //! the DASH VOD muxer in [`dash`].
 
+mod chapters;
 #[cfg(test)]
 mod container_tests;
 pub mod dash;
 mod entry;
 mod faststart;
 pub mod fmp4;
+mod groups;
 #[cfg(test)]
 mod issue114_tests;
 #[cfg(test)]
 mod issue114b_tests;
+#[cfg(test)]
+mod issue114c_tests;
 mod meta;
 #[cfg(test)]
 mod raw_remux_tests;
@@ -45,11 +49,15 @@ use rff_core::{CodecId, Error, MediaType, Packet, Rational, Result, Timecode};
 
 use entry::PcmLayout;
 pub use faststart::faststart_in_place;
+use groups::GroupTable;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use rff_format::chapter::MAX_CHAPTERS;
+
 use rff_format::{
-    Demuxer, EditEntry, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, ReadSeek,
-    SampleIndex, SampleInfo, SeekInput, SeekOutput, Stream,
+    Chapter, Demuxer, EditEntry, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, ReadSeek,
+    SampleGrouping, SampleIndex, SampleInfo, SeekInput, SeekOutput, Stream, TrackReference,
 };
 use rff_format::{SampleSource, SharedInput};
 
@@ -329,6 +337,8 @@ struct Tables {
     /// Per stream: the stored sample table, no edit list applied
     /// ([`SampleIndex::raw_sample_info`]).
     stored: Vec<Vec<SampleLoc>>,
+    /// Per stream: its sample groups ([`SampleIndex::sample_groups`]).
+    groups: Vec<Vec<SampleGrouping>>,
 }
 
 impl Tables {
@@ -377,6 +387,12 @@ struct Mp4Demuxer {
     metadata: rff_core::Dictionary,
     /// The seekable input, shared, for [`SampleIndex::sample_source`].
     shared: Option<SharedInput>,
+    /// [`Demuxer::chapters`].
+    chapters: Vec<Chapter>,
+    /// [`Demuxer::set_timecode_streams`].
+    timecode_streams: bool,
+    /// Per stream: what it refers to ([`Demuxer::track_references`]).
+    refs: Vec<Vec<TrackReference>>,
 }
 
 /// [`SampleIndex::sample_source`] for MP4: the demuxer's tables (shared)
@@ -410,6 +426,9 @@ impl SampleSource for Mp4SampleSource {
     }
     fn movie_timescale(&self) -> Option<u32> {
         (self.t.movie_timescale > 0).then_some(self.t.movie_timescale)
+    }
+    fn sample_groups(&self, stream: usize) -> &[SampleGrouping] {
+        self.t.groups.get(stream).map_or(&[], Vec::as_slice)
     }
     fn raw_sample_count(&self, stream: usize) -> u64 {
         self.t.stored.get(stream).map_or(0, |t| t.len() as u64)
@@ -447,6 +466,9 @@ impl Mp4Demuxer {
             raw: false,
             metadata: rff_core::Dictionary::new(),
             shared: None,
+            chapters: Vec::new(),
+            timecode_streams: false,
+            refs: Vec::new(),
         }
     }
 
@@ -537,8 +559,12 @@ fn fetch(src: &mut Source, t: &Tables, raw_out: bool, loc: &SampleLoc) -> Result
 
 impl Mp4Demuxer {
     /// Build streams + the file-ordered sample table from `moov` (and the
-    /// fragments' `moof`s), and say which timecode samples to read.
-    fn parse_moov(&mut self, top: &TopLevel) -> Result<(Vec<Stream>, Vec<PendingTimecode>)> {
+    /// fragments' `moof`s), and say which timecode and chapter samples are
+    /// still to be read.
+    fn parse_moov(
+        &mut self,
+        top: &TopLevel,
+    ) -> Result<(Vec<Stream>, Vec<PendingTimecode>, PendingChapters)> {
         let moov_children = child_boxes(&top.moov);
         let mut tab = Tables::default();
         // Movie timescale (mvhd), the unit of edit-list segment durations.
@@ -556,20 +582,49 @@ impl Mp4Demuxer {
         let mut stored: Vec<Vec<SampleLoc>> = Vec::new();
         let mut frags: Vec<FragTrack> = Vec::new();
         let mut tmcd_refs: Vec<Vec<u32>> = Vec::new();
+        let mut refs: Vec<Vec<TrackIds>> = Vec::new();
+        let mut groups: Vec<GroupTable> = Vec::new();
         let mut timecodes: Vec<(u32, Timecode, u64)> = Vec::new();
+        let chpl = chapters::read_chpl(&moov_children);
+        let movie_us = find(&moov_children, b"mvhd").and_then(|mvhd| {
+            let d = if mvhd.first() == Some(&1) {
+                i64::try_from(be64(mvhd, 24)).ok()?
+            } else {
+                match be32(mvhd, 16) {
+                    u32::MAX => return None,
+                    d => i64::from(d),
+                }
+            };
+            (movie_timescale > 0).then(|| rescale(d, 1_000_000, i64::from(movie_timescale)))
+        });
         // FFmpeg's `advanced_editlist`: on until a track has no `stts` entries (a
         // fragmented file's empty `moov`), then off for that track and every later one.
         let mut advanced_editlist = true;
-        for (typ, trak) in moov_children {
-            if &typ != b"trak" {
+        // Every `trak`, then (when they are to be streams of their own) the
+        // timecode ones again: those come last, so no other index moves.
+        let mut traks: Vec<TrakToParse> = Vec::new();
+        for (typ, trak) in &moov_children {
+            if typ != b"trak" {
                 continue;
             }
             if stts_entries(trak) == 0 {
                 advanced_editlist = false;
             }
-            let timing = (movie_timescale, advanced_editlist);
-            match parse_track(trak, streams.len(), timing, top.qt) {
+            traks.push((trak, (movie_timescale, advanced_editlist), None));
+        }
+        // The streams that are timecode tracks: (stream, timecode).
+        let mut timecode_streams: Vec<(usize, usize)> = Vec::new();
+        let mut at = 0;
+        while let Some(&(trak, timing, as_stream)) = traks.get(at) {
+            at += 1;
+            if as_stream.is_some() && streams.is_empty() {
+                break;
+            }
+            match parse_track(trak, streams.len(), timing, top.qt, as_stream.is_some()) {
                 Some(Parsed::Media(t)) => {
+                    if let Some(tc) = as_stream {
+                        timecode_streams.push((streams.len(), tc));
+                    }
                     frags.push(FragTrack {
                         track_id: t.track_id,
                         audio: t.stream.media_type == MediaType::Audio,
@@ -588,12 +643,19 @@ impl Mp4Demuxer {
                     tab.pcm.push(t.pcm);
                     tab.edits.push(t.edits);
                     tmcd_refs.push(t.tmcd_refs);
+                    refs.push(t.refs);
+                    groups.push(t.groups);
                 }
                 Some(Parsed::Timecode {
                     track_id,
                     timecode,
                     sample_offset,
-                }) => timecodes.push((track_id, timecode, sample_offset)),
+                }) => {
+                    if self.timecode_streams {
+                        traks.push((trak, timing, Some(timecodes.len())));
+                    }
+                    timecodes.push((track_id, timecode, sample_offset));
+                }
                 None => {}
             }
         }
@@ -601,7 +663,14 @@ impl Mp4Demuxer {
             return Err(Error::unsupported("mp4 demux: no usable tracks"));
         }
         // A fragmented file's samples live in its `moof`s, after the (empty) index.
-        append_fragments(&top.moofs, &mut frags, &mut tracks, &mut stored);
+        append_fragments(
+            &top.moofs,
+            &mut frags,
+            &mut tracks,
+            &mut stored,
+            &mut groups,
+        );
+        tab.groups = groups.into_iter().map(GroupTable::finish).collect();
         tab.stored = stored;
         for (stream, samples) in streams.iter_mut().zip(&tracks) {
             stream.nb_frames = Some(samples.len() as u64);
@@ -612,25 +681,79 @@ impl Mp4Demuxer {
         }
         // A timecode track times the track that references it (`tref/tmcd`);
         // unreferenced, it belongs to the first video track (camera files).
-        let pending = timecodes
-            .into_iter()
-            .map(|(id, timecode, offset)| {
-                let stream = tmcd_refs
-                    .iter()
-                    .position(|r| r.contains(&id))
-                    .or_else(|| {
-                        streams
-                            .iter()
-                            .position(|s| s.media_type == MediaType::Video)
-                    })
-                    .unwrap_or(0);
-                PendingTimecode {
-                    stream,
-                    timecode,
-                    offset,
-                }
+        let mut pending: Vec<PendingTimecode> = timecode_streams
+            .iter()
+            .map(|&(stream, tc)| PendingTimecode {
+                stream,
+                timecode: timecodes[tc].1.clone(),
+                offset: timecodes[tc].2,
             })
             .collect();
+        pending.extend(timecodes.into_iter().map(|(id, timecode, offset)| {
+            let stream = tmcd_refs
+                .iter()
+                .position(|r| r.contains(&id))
+                .or_else(|| {
+                    streams
+                        .iter()
+                        .position(|s| s.media_type == MediaType::Video)
+                })
+                .unwrap_or(0);
+            PendingTimecode {
+                stream,
+                timecode,
+                offset,
+            }
+        }));
+        // What streams refer to, by stream index: the first track of an id.
+        let mut by_id: HashMap<u32, usize> = HashMap::new();
+        for (i, f) in frags.iter().enumerate() {
+            by_id.entry(f.track_id).or_insert(i);
+        }
+        self.refs = refs
+            .into_iter()
+            .map(|r| {
+                r.into_iter()
+                    .filter_map(|(kind, ids)| {
+                        let to: Vec<usize> =
+                            ids.iter().filter_map(|id| by_id.get(id).copied()).collect();
+                        (!to.is_empty()).then(|| TrackReference::new(kind, to))
+                    })
+                    .collect()
+            })
+            .collect();
+        // The chapter track: the first text-like track a track refers to as
+        // its chapters. (A video one holds chapter pictures.)
+        let chapter_track = self
+            .refs
+            .iter()
+            .flatten()
+            .filter(|r| &r.kind == b"chap")
+            .flat_map(|r| &r.streams)
+            .copied()
+            .find(|&t| {
+                !matches!(streams[t].media_type, MediaType::Video | MediaType::Audio)
+                    && !tracks[t].is_empty()
+            });
+        let pending_chapters = PendingChapters {
+            samples: chapter_track.map_or_else(Vec::new, |t| {
+                let list = &tracks[t][..tracks[t].len().min(MAX_CHAPTERS + 1)];
+                (0..list.len())
+                    .map(|i| chapters::TextSample {
+                        offset: list[i].offset,
+                        size: list[i].size,
+                        start: list[i].dts,
+                        end: match list.get(i + 1) {
+                            Some(next) => next.dts,
+                            None => list[i].dts.saturating_add(list[i].duration),
+                        },
+                    })
+                    .collect()
+            }),
+            time_base: chapter_track.map_or(Rational::new(1, 1), |t| streams[t].time_base),
+            chpl,
+            movie_us,
+        };
         // Yield samples in file order (natural interleave), each track's in its own
         // order: an edit list can replay samples, so a track's index isn't always in
         // offset order.
@@ -661,7 +784,7 @@ impl Mp4Demuxer {
             tab.samples.push(SampleLoc { ..*loc });
         }
         self.t = Arc::new(tab);
-        Ok((streams, pending))
+        Ok((streams, pending, pending_chapters))
     }
 }
 
@@ -685,6 +808,31 @@ impl PendingTimecode {
                 ..self.timecode
             });
         }
+    }
+}
+
+/// The chapters `moov` describes, their titles still to be read from `mdat`.
+struct PendingChapters {
+    /// The chapter track's samples.
+    samples: Vec<chapters::TextSample>,
+    time_base: Rational,
+    /// Nero chapters, complete but for their ends.
+    chpl: Vec<Chapter>,
+    /// The movie's duration, where a last chapter without an end stops.
+    movie_us: Option<i64>,
+}
+
+impl PendingChapters {
+    /// Read the titles with `read` (at most so many bytes at an offset).
+    fn finish(self, read: impl FnMut(u64, u64) -> Option<Vec<u8>>) -> Vec<Chapter> {
+        let (mut list, mut open) =
+            chapters::read_track(self.samples.into_iter(), self.time_base, read);
+        if list.is_empty() {
+            list = self.chpl;
+            open = vec![true; list.len()];
+        }
+        rff_format::chapter::fill_ends(&mut list, &open, self.movie_us);
+        list
     }
 }
 
@@ -802,12 +950,17 @@ impl Demuxer for Mp4Demuxer {
             Source::Stream(mut input) => {
                 let mut buf = Vec::new();
                 input.read_to_end(&mut buf)?;
-                let (mut streams, timecodes) = self.parse_moov(&top_level(&buf)?)?;
+                let (mut streams, timecodes, chapters) = self.parse_moov(&top_level(&buf)?)?;
                 for tc in timecodes {
                     let at = usize::try_from(tc.offset).unwrap_or(usize::MAX);
                     let sample = buf.get(at..at.saturating_add(4));
                     tc.apply(&mut streams, sample);
                 }
+                self.chapters = chapters.finish(|at, len| {
+                    let rest = buf.get(usize::try_from(at).ok()?..)?;
+                    let len = usize::try_from(len).ok()?.min(rest.len());
+                    Some(rest[..len].to_vec())
+                });
                 self.src = Source::Buffered(Arc::new(buf));
                 Ok(streams)
             }
@@ -816,13 +969,19 @@ impl Demuxer for Mp4Demuxer {
                 let mut input = SharedInput::new(input);
                 self.shared = Some(input.clone());
                 let top = read_top_level(&mut input)?;
-                let (mut streams, timecodes) = self.parse_moov(&top)?;
+                let (mut streams, timecodes, chapters) = self.parse_moov(&top)?;
                 for tc in timecodes {
                     let mut sample = [0u8; 4];
                     let ok = input.seek(SeekFrom::Start(tc.offset)).is_ok()
                         && input.read_exact(&mut sample).is_ok();
                     tc.apply(&mut streams, ok.then_some(&sample[..]));
                 }
+                self.chapters = chapters.finish(|at, len| {
+                    input.seek(SeekFrom::Start(at)).ok()?;
+                    let mut b = Vec::new();
+                    (&mut input).take(len).read_to_end(&mut b).ok()?;
+                    Some(b)
+                });
                 // The reader's position is wherever the moov walk left it;
                 // start from an unknown position so the first sample seeks.
                 self.src = Source::Random {
@@ -879,6 +1038,19 @@ impl Demuxer for Mp4Demuxer {
     fn metadata(&self) -> Option<&rff_core::Dictionary> {
         Some(&self.metadata)
     }
+
+    fn chapters(&self) -> &[Chapter] {
+        &self.chapters
+    }
+
+    fn set_timecode_streams(&mut self, on: bool) -> bool {
+        self.timecode_streams = on;
+        true
+    }
+
+    fn track_references(&self, index: usize) -> &[TrackReference] {
+        self.refs.get(index).map_or(&[], Vec::as_slice)
+    }
 }
 
 /// The error for a sample whose bytes lie outside the file.
@@ -923,6 +1095,10 @@ impl SampleIndex for Mp4Demuxer {
         self.fetch(&loc)
     }
 
+    fn sample_groups(&self, stream: usize) -> &[SampleGrouping] {
+        self.t.groups.get(stream).map_or(&[], Vec::as_slice)
+    }
+
     /// The tables are shared (an `Arc`); the source reads through its own
     /// handle on the shared input (or the shared buffer of a piped file).
     fn sample_source(&mut self) -> Option<Arc<dyn SampleSource>> {
@@ -953,6 +1129,10 @@ fn stts_entries(trak: &[u8]) -> u32 {
     stts.unwrap_or(0)
 }
 
+/// A `trak` to parse: its body, `timing` as [`parse_track`] takes it, and for a
+/// timecode track that is to be a stream, which timecode it is.
+type TrakToParse<'a> = (&'a [u8], (u32, bool), Option<usize>);
+
 /// One `trak`, as the demuxer uses it.
 enum Parsed {
     Media(Box<MediaTrack>),
@@ -965,6 +1145,9 @@ enum Parsed {
     },
 }
 
+/// One `tref` child: the kind of reference and the track ids it names.
+type TrackIds = ([u8; 4], Vec<u32>);
+
 struct MediaTrack {
     stream: Stream,
     samples: Vec<SampleLoc>,
@@ -975,6 +1158,9 @@ struct MediaTrack {
     track_id: u32,
     /// Timecode tracks this one references (`tref/tmcd`).
     tmcd_refs: Vec<u32>,
+    /// Everything it references.
+    refs: Vec<TrackIds>,
+    groups: GroupTable,
     /// What fragment decode times are shifted by (the edit list's offset).
     frag_offset: i64,
     /// Decode time where the sample table ends: a fragment without `tfdt`
@@ -986,8 +1172,15 @@ struct MediaTrack {
 
 /// Build a [`Stream`] + sample list + optional H.264 config from one `trak`.
 /// `timing` is the movie timescale and whether FFmpeg's `advanced_editlist` is
-/// on; `qt` whether the file is QuickTime (sound description layout).
-fn parse_track(trak: &[u8], index: usize, timing: (u32, bool), qt: bool) -> Option<Parsed> {
+/// on; `qt` whether the file is QuickTime (sound description layout);
+/// `timecode_stream` whether a timecode track is to be a stream of its own.
+fn parse_track(
+    trak: &[u8],
+    index: usize,
+    timing: (u32, bool),
+    qt: bool,
+    timecode_stream: bool,
+) -> Option<Parsed> {
     let trak_children = child_boxes(trak);
     let track_id = find(&trak_children, b"tkhd").map_or(0, |t| {
         if t.first() == Some(&1) {
@@ -996,15 +1189,19 @@ fn parse_track(trak: &[u8], index: usize, timing: (u32, bool), qt: bool) -> Opti
             be32(t, 12)
         }
     });
-    let tmcd_refs: Vec<u32> = find(&trak_children, b"tref")
+    let refs: Vec<TrackIds> = find(&trak_children, b"tref")
         .map(|tref| {
             child_boxes(tref)
                 .iter()
-                .filter(|(t, _)| t == b"tmcd")
-                .flat_map(|(_, p)| p.chunks_exact(4).map(|c| be32(c, 0)))
+                .map(|(t, p)| (*t, p.chunks_exact(4).map(|c| be32(c, 0)).collect()))
                 .collect()
         })
         .unwrap_or_default();
+    let tmcd_refs: Vec<u32> = refs
+        .iter()
+        .filter(|(t, _)| t == b"tmcd")
+        .flat_map(|(_, ids)| ids.iter().copied())
+        .collect();
     let mdia = child_boxes(find(&trak_children, b"mdia")?);
     let hdlr = find(&mdia, b"hdlr")?;
     // FullBox(4) + pre_defined(4) → handler_type fourcc.
@@ -1036,7 +1233,8 @@ fn parse_track(trak: &[u8], index: usize, timing: (u32, bool), qt: bool) -> Opti
         .min(stsd.len());
     let entry = stsd.get(16..entry_end).unwrap_or(&[]);
 
-    if &handler == b"tmcd" || &fourcc == b"tmcd" {
+    let is_timecode = &handler == b"tmcd" || &fourcc == b"tmcd";
+    if is_timecode && !timecode_stream {
         let timecode = entry::parse_tmcd_entry(entry)?;
         let first_chunk = match find(&stbl, b"stco") {
             Some(stco) if be32(stco, 4) > 0 => u64::from(be32(stco, 8)),
@@ -1073,6 +1271,14 @@ fn parse_track(trak: &[u8], index: usize, timing: (u32, bool), qt: bool) -> Opti
     }
     if fourcc.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
         stream.codec_tag = Some(fourcc);
+    }
+
+    // A timecode track's description is its extradata, as FFmpeg gives it:
+    // the sample entry from after the data reference index on.
+    if is_timecode {
+        stream.media_type = MediaType::Data;
+        stream.codec_tag = Some(*b"tmcd");
+        stream.extradata = entry.get(8..).unwrap_or(&[]).to_vec();
     }
 
     // Codec dimensions / audio params from the sample entry.
@@ -1178,6 +1384,8 @@ fn parse_track(trak: &[u8], index: usize, timing: (u32, bool), qt: bool) -> Opti
     };
     let (samples, stored) =
         build_samples(&stbl, index, &timing, pcm.map(|p| p.frame_bytes as u64))?;
+    let bias = groups::pcm_bias(&stbl, pcm.is_some(), stored.len());
+    let groups = GroupTable::from_stbl(&stbl, bias);
     stream.duration = duration; // already in mdhd-timescale = time_base units
     stream.nb_frames = Some(samples.len() as u64);
     let frag_offset = time_offset(&timing);
@@ -1192,6 +1400,8 @@ fn parse_track(trak: &[u8], index: usize, timing: (u32, bool), qt: bool) -> Opti
         pcm,
         track_id,
         tmcd_refs,
+        refs,
+        groups,
         frag_offset,
         end,
         edits: edit_entries,
@@ -1307,6 +1517,7 @@ fn append_fragments(
     frags: &mut [FragTrack],
     tracks: &mut [Vec<SampleLoc>],
     stored: &mut [Vec<SampleLoc>],
+    groups: &mut [GroupTable],
 ) {
     for (moof_offset, moof) in moofs {
         // Without an explicit base, each `traf`'s data follows the previous
@@ -1357,6 +1568,7 @@ fn append_fragments(
                 };
             }
             let mut cursor = base;
+            let first = stored.get(t).map_or(0, Vec::len);
             for (typ, trun) in &kids {
                 if typ != b"trun" {
                     continue;
@@ -1427,6 +1639,10 @@ fn append_fragments(
                 }
             }
             implicit = cursor;
+            let added = stored.get(t).map_or(0, Vec::len) - first;
+            if let Some(g) = groups.get_mut(t) {
+                g.add_fragment(&kids, first as u64, added as u64);
+            }
         }
     }
 }
@@ -2102,9 +2318,26 @@ struct TrackOut {
     /// H.264 / HEVC: whether packets arrive Annex-B or already
     /// length-prefixed, and how each becomes a stored sample.
     nal: Option<NalSampleWriter>,
+    /// [`Muxer::set_track_references`], by output stream.
+    refs: Vec<TrackReference>,
+}
+
+/// Whether `s` is a timecode track to store as it is (see
+/// [`Demuxer::set_timecode_streams`]).
+fn is_timecode_stream(s: &Stream) -> bool {
+    s.codec_id == CodecId::None && s.media_type == MediaType::Data && s.codec_tag == Some(*b"tmcd")
 }
 
 impl TrackOut {
+    fn is_timecode(&self) -> bool {
+        &self.fourcc == b"tmcd"
+    }
+
+    /// Whether a timecode track among the outputs already times this one.
+    fn has_timecode_ref(&self) -> bool {
+        self.refs.iter().any(|r| &r.kind == b"tmcd")
+    }
+
     fn new(stream: &Stream, fourcc: [u8; 4]) -> TrackOut {
         let nal = match stream.codec_id {
             CodecId::H264 => Some(NalSampleWriter::new(&stream.extradata, false)),
@@ -2113,6 +2346,7 @@ impl TrackOut {
         };
         TrackOut {
             nal,
+            refs: Vec::new(),
             stream: stream.clone(),
             fourcc,
             config: None,
@@ -2133,6 +2367,16 @@ impl TrackOut {
     /// configuration the stream's extradata already settles.
     fn for_flavor(stream: &Stream, flavor: Flavor) -> Result<TrackOut> {
         let qt = flavor == Flavor::Mov;
+        if is_timecode_stream(stream) {
+            if stream.extradata.len() < 18 {
+                return Err(Error::invalid(
+                    "mp4 mux: a timecode stream needs its `tmcd` sample description as extradata",
+                ));
+            }
+            let mut t = TrackOut::new(stream, *b"tmcd");
+            t.qt = qt;
+            return Ok(t);
+        }
         if !flavor.codecs().contains(&stream.codec_id) {
             return Err(refuse(stream, flavor));
         }
@@ -2553,18 +2797,98 @@ struct TmcdOut {
 /// The tracks that carry a start timecode, each needing a `tmcd` track.
 fn timecode_tracks(tracks: &[TrackOut]) -> Vec<usize> {
     (0..tracks.len())
-        .filter(|&t| tracks[t].stream.timecode.is_some() && !tracks[t].sizes.is_empty())
+        .filter(|&t| {
+            let t = &tracks[t];
+            t.stream.timecode.is_some()
+                && !t.sizes.is_empty()
+                && !t.is_timecode()
+                && !t.has_timecode_ref()
+        })
         .collect()
 }
 
+/// Apply [`Muxer::set_track_references`] calls to the tracks, keeping what
+/// refers to tracks there are. Timecode streams no track refers to time the
+/// first video track, which is how readers take an unreferenced one.
+fn apply_refs(tracks: &mut [TrackOut], refs: &mut Vec<(usize, Vec<TrackReference>)>) {
+    let n = tracks.len();
+    for (s, list) in refs.drain(..) {
+        let Some(t) = tracks.get_mut(s) else { continue };
+        t.refs = list
+            .into_iter()
+            .filter_map(|mut r| {
+                r.streams.retain(|&to| to < n && to != s);
+                (!r.streams.is_empty()).then_some(r)
+            })
+            .collect();
+    }
+    if tracks.iter().any(TrackOut::has_timecode_ref) {
+        return;
+    }
+    let timecode = tracks.iter().position(TrackOut::is_timecode);
+    let video = tracks
+        .iter_mut()
+        .find(|t| t.stream.media_type == MediaType::Video);
+    if let (Some(tc), Some(video)) = (timecode, video) {
+        video.refs.push(TrackReference::new(*b"tmcd", vec![tc]));
+    }
+}
+
+/// Samples the muxer adds after the media in `mdat`: the start frames of the
+/// timecode tracks it makes, then the chapter track's titles.
+struct Extras {
+    /// The media track each timecode track times.
+    timecoded: Vec<usize>,
+    /// The chapter samples' sizes; empty without a chapter track.
+    chapter_sizes: Vec<u32>,
+    bytes: Vec<u8>,
+}
+
+impl Extras {
+    fn new(tracks: &[TrackOut], movie: &MovieOptions) -> Extras {
+        let timecoded = timecode_tracks(tracks);
+        let mut bytes = Vec::new();
+        for &media in &timecoded {
+            let tc = tracks[media].stream.timecode.as_ref();
+            pu32(&mut bytes, tc.map_or(0, |tc| tc.start_frame));
+        }
+        let chapter_sizes = chapters::text_samples(&movie.chapters, &mut bytes);
+        Extras {
+            timecoded,
+            chapter_sizes,
+            bytes,
+        }
+    }
+
+    /// Where the timecode samples are when the extras start at `base`.
+    fn timecodes(&self, base: u64) -> Vec<TmcdOut> {
+        self.timecoded
+            .iter()
+            .enumerate()
+            .map(|(k, &media)| TmcdOut {
+                media,
+                offset: base + 4 * k as u64,
+            })
+            .collect()
+    }
+
+    /// Where the chapter samples are when the extras start at `base`.
+    fn titles(&self, base: u64) -> u64 {
+        base + 4 * self.timecoded.len() as u64
+    }
+}
+
 /// The `moov` box: `mvhd` plus one `trak` per track, from the sample tables,
-/// then one QuickTime timecode track per entry of `tmcd`.
+/// then one QuickTime timecode track per track that needs one, then the
+/// chapter track. The `extras` start at `extras_at` in the file.
 fn build_moov(
     tracks: &[TrackOut],
     plans: &[TimingPlan],
-    tmcd: &[TmcdOut],
+    (extras, extras_at): (&Extras, u64),
     movie: &MovieOptions,
 ) -> Vec<u8> {
+    let tmcd = &extras.timecodes(extras_at)[..];
+    let chapter_id = (!movie.chapters.is_empty()).then_some((tracks.len() + tmcd.len()) as u32 + 1);
     let movie_timescale = movie.timescale.max(1);
     let mut traks = Vec::new();
     let mut max_movie_dur = 0u64;
@@ -2605,12 +2929,22 @@ fn build_moov(
             .iter()
             .position(|m| m.media == t)
             .map(|k| (tracks.len() + 1 + k) as u32);
+        // Chapters hang off every audio and video track, as FFmpeg has them.
+        let chap = chapter_id.filter(|_| !track.is_timecode());
+        let mut tref: Vec<TrackIds> = track
+            .refs
+            .iter()
+            .filter(|r| chap.is_none() || &r.kind != b"chap")
+            .map(|r| (r.kind, r.streams.iter().map(|&s| s as u32 + 1).collect()))
+            .collect();
+        tref.extend(tmcd_ref.map(|id| (*b"tmcd", vec![id])));
+        tref.extend(chap.map(|id| (*b"chap", vec![id])));
         traks.push(build_trak_with(
             track,
             (t + 1) as u32,
             plan,
             (media_dur, movie_dur, delay),
-            tmcd_ref,
+            &tref,
         ));
     }
     for (k, m) in tmcd.iter().enumerate() {
@@ -2627,7 +2961,21 @@ fn build_moov(
             track.qt,
         ));
     }
-    let next_track_id = (tracks.len() + tmcd.len()) as u32 + 1;
+    let qt = tracks.first().is_some_and(|t| t.qt);
+    // The movie's own timeline starts where its earliest track does; chapters
+    // are on the packets' timeline.
+    let origin = (movie_start, movie_timescale);
+    if let Some(id) = chapter_id {
+        traks.push(chapters::build_track(
+            &movie.chapters,
+            &extras.chapter_sizes,
+            (id, extras.titles(extras_at)),
+            origin,
+            movie_timescale,
+            qt,
+        ));
+    }
+    let next_track_id = chapter_id.unwrap_or((tracks.len() + tmcd.len()) as u32) + 1;
     let mut moov_body = build_mvhd(
         movie_timescale,
         max_movie_dur,
@@ -2637,7 +2985,7 @@ fn build_moov(
     for trak in traks {
         moov_body.extend_from_slice(&trak);
     }
-    moov_body.extend_from_slice(&movie.udta(tracks.first().is_some_and(|t| t.qt)));
+    moov_body.extend_from_slice(&movie.udta(qt, origin));
     bx(b"moov", &moov_body)
 }
 
@@ -2651,6 +2999,10 @@ struct MovieOptions {
     metadata: rff_core::Dictionary,
     /// `mvhd` creation / modification time, seconds since 1904.
     creation_time: u64,
+    /// [`Muxer::set_chapters`], in time order.
+    chapters: Vec<Chapter>,
+    /// `movflags=+disable_chpl`: a chapter track only, no Nero `chpl`.
+    disable_chpl: bool,
 }
 
 impl Default for MovieOptions {
@@ -2659,6 +3011,8 @@ impl Default for MovieOptions {
             timescale: 1000,
             metadata: rff_core::Dictionary::new(),
             creation_time: 0,
+            chapters: Vec::new(),
+            disable_chpl: false,
         }
     }
 }
@@ -2667,6 +3021,10 @@ impl MovieOptions {
     /// Handle a muxer option this struct owns; `None` when it is not one.
     fn set_option(&mut self, key: &str, value: &str) -> Option<bool> {
         match key {
+            "movflags" => {
+                self.disable_chpl = has_movflag(value, "disable_chpl");
+                None // the muxer reads `faststart` from it
+            }
             "movie_timescale" => Some(match value.trim().parse::<u32>() {
                 Ok(ts) if ts > 0 => {
                     self.timescale = ts;
@@ -2689,9 +3047,15 @@ impl MovieOptions {
             .unwrap_or(0);
     }
 
-    /// The `udta` box for the metadata (empty when there is none).
-    fn udta(&self, qt: bool) -> Vec<u8> {
-        meta::build_udta(&self.metadata, qt)
+    /// The `udta` box for the metadata and Nero chapters (empty when there
+    /// are none). `origin` as [`chapters::nero`] takes it.
+    fn udta(&self, qt: bool, origin: (i64, u32)) -> Vec<u8> {
+        let chpl = if self.disable_chpl {
+            Vec::new()
+        } else {
+            chapters::nero(&self.chapters, origin)
+        };
+        meta::build_udta(&self.metadata, qt, &chpl)
     }
 }
 
@@ -2711,6 +3075,8 @@ struct Mp4Muxer {
     movie: MovieOptions,
     /// [`Muxer::set_edit_list`] calls, applied once the tracks exist.
     edits: Vec<(usize, Vec<EditEntry>)>,
+    /// [`Muxer::set_track_references`] calls, applied once the tracks exist.
+    refs: Vec<(usize, Vec<TrackReference>)>,
     /// Resolved in [`write_header`](Muxer::write_header): an unmappable codec
     /// is rejected before a single byte is written, and by construction there
     /// is no path that reaches the box writer without a real fourcc.
@@ -2731,6 +3097,7 @@ impl Mp4Muxer {
             faststart: false,
             movie: MovieOptions::default(),
             edits: Vec::new(),
+            refs: Vec::new(),
             tracks: Vec::new(),
             packets: Vec::new(),
         }
@@ -2740,12 +3107,12 @@ impl Mp4Muxer {
 /// Whether a `movflags` value turns `faststart` on (`+faststart`,
 /// `faststart`, `+frag_keyframe+faststart`, ...).
 fn wants_faststart(key: &str, value: &str) -> Option<bool> {
-    (key == "movflags").then(|| {
-        value
-            .split('+')
-            .chain(std::iter::once(""))
-            .any(|f| f.trim() == "faststart")
-    })
+    (key == "movflags").then(|| has_movflag(value, "faststart"))
+}
+
+/// Whether the `movflags` value `value` names `flag`.
+fn has_movflag(value: &str, flag: &str) -> bool {
+    value.split('+').any(|f| f.trim() == flag)
 }
 
 /// Write a whole buffered movie: `ftyp`, then `mdat` and `moov` (or, with
@@ -2789,9 +3156,9 @@ fn write_buffered<W: Write + ?Sized>(
     entries.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let ftyp = flavor.ftyp();
-    let timecoded = timecode_tracks(tracks);
+    let extras = Extras::new(tracks, movie);
     let body_len: u64 =
-        data.iter().flatten().map(|d| d.len() as u64).sum::<u64>() + 4 * timecoded.len() as u64;
+        data.iter().flatten().map(|d| d.len() as u64).sum::<u64>() + extras.bytes.len() as u64;
     let mdat_header = mdat_header(body_len);
     // Lay the samples out from `base`, then build `moov` over that layout.
     let layout = |tracks: &mut [TrackOut], base: u64| -> Vec<u8> {
@@ -2805,16 +3172,8 @@ fn write_buffered<W: Write + ?Sized>(
             off += data[t][i].len() as u64;
             prev = Some(t);
         }
-        // Timecode samples go last in `mdat`, 4 bytes each.
-        let tmcd: Vec<TmcdOut> = timecoded
-            .iter()
-            .enumerate()
-            .map(|(k, &media)| TmcdOut {
-                media,
-                offset: off + 4 * k as u64,
-            })
-            .collect();
-        build_moov(tracks, &plans, &tmcd, movie)
+        // Timecode and chapter samples go last in `mdat`.
+        build_moov(tracks, &plans, (&extras, off), movie)
     };
     let head = start + (ftyp.len() + mdat_header.len()) as u64;
     let moov = if faststart {
@@ -2843,14 +3202,7 @@ fn write_buffered<W: Write + ?Sized>(
     for &(_, t, i) in &entries {
         out.write_all(&data[t][i])?;
     }
-    for &media in &timecoded {
-        let start = tracks[media]
-            .stream
-            .timecode
-            .as_ref()
-            .map_or(0, |tc| tc.start_frame);
-        out.write_all(&start.to_be_bytes())?;
-    }
+    out.write_all(&extras.bytes)?;
     if !faststart {
         out.write_all(&moov)?;
     }
@@ -2907,8 +3259,19 @@ impl Muxer for Mp4Muxer {
         true
     }
 
+    fn set_chapters(&mut self, chapters: &[Chapter]) -> bool {
+        self.movie.chapters = rff_format::chapter::in_time_order(chapters);
+        true
+    }
+
+    fn set_track_references(&mut self, stream: usize, references: &[TrackReference]) -> bool {
+        self.refs.push((stream, references.to_vec()));
+        true
+    }
+
     fn write_trailer(&mut self) -> Result<()> {
         apply_edits(&mut self.tracks, &mut self.edits);
+        apply_refs(&mut self.tracks, &mut self.refs);
         let packets = std::mem::take(&mut self.packets);
         write_buffered(
             &mut *self.out,
@@ -2948,6 +3311,8 @@ struct Mp4StreamMuxer {
     spool: Option<faststart::Spool>,
     movie: MovieOptions,
     edits: Vec<(usize, Vec<EditEntry>)>,
+    /// [`Muxer::set_track_references`] calls, applied once the tracks exist.
+    refs: Vec<(usize, Vec<TrackReference>)>,
     tracks: Vec<TrackOut>,
     /// H.264 sample conversion buffer, reused across packets.
     scratch: Vec<u8>,
@@ -2977,6 +3342,7 @@ impl Mp4StreamMuxer {
             spool: None,
             movie: MovieOptions::default(),
             edits: Vec::new(),
+            refs: Vec::new(),
             tracks: Vec::new(),
             scratch: Vec::new(),
             last_track: None,
@@ -2995,8 +3361,8 @@ impl Mp4StreamMuxer {
             .take()
             .ok_or_else(|| Error::invalid("mp4 mux: faststart spool missing"))?;
         let ftyp = self.flavor.ftyp();
-        let timecoded = timecode_tracks(&self.tracks);
-        let body_len = spool.len() + 4 * timecoded.len() as u64;
+        let extras = Extras::new(&self.tracks, &self.movie);
+        let body_len = spool.len() + extras.bytes.len() as u64;
         let mdat_header = mdat_header(body_len);
         // Chunk offsets so far count from the spool's start.
         let relative: Vec<Vec<(u64, u32)>> = self.tracks.iter().map(|t| t.chunks.clone()).collect();
@@ -3010,15 +3376,8 @@ impl Mp4StreamMuxer {
             for (t, rel) in self.tracks.iter_mut().zip(&relative) {
                 t.chunks = rel.iter().map(|&(o, n)| (o + base, n)).collect();
             }
-            let tmcd: Vec<TmcdOut> = timecoded
-                .iter()
-                .enumerate()
-                .map(|(k, &media)| TmcdOut {
-                    media,
-                    offset: base + spool.len() + 4 * k as u64,
-                })
-                .collect();
-            moov = build_moov(&self.tracks, plans, &tmcd, &self.movie);
+            let at = base + spool.len();
+            moov = build_moov(&self.tracks, plans, (&extras, at), &self.movie);
             if moov.len() as u64 == moov_len {
                 break;
             }
@@ -3028,14 +3387,7 @@ impl Mp4StreamMuxer {
         self.out.write_all(&moov)?;
         self.out.write_all(&mdat_header)?;
         spool.copy_to(&mut *self.out)?;
-        for &media in &timecoded {
-            let frame = self.tracks[media]
-                .stream
-                .timecode
-                .as_ref()
-                .map_or(0, |tc| tc.start_frame);
-            self.out.write_all(&frame.to_be_bytes())?;
-        }
+        self.out.write_all(&extras.bytes)?;
         self.out.flush()?;
         Ok(())
     }
@@ -3103,6 +3455,16 @@ impl Muxer for Mp4StreamMuxer {
         true
     }
 
+    fn set_chapters(&mut self, chapters: &[Chapter]) -> bool {
+        self.movie.chapters = rff_format::chapter::in_time_order(chapters);
+        true
+    }
+
+    fn set_track_references(&mut self, stream: usize, references: &[TrackReference]) -> bool {
+        self.refs.push((stream, references.to_vec()));
+        true
+    }
+
     fn write_header(&mut self, streams: &[Stream]) -> Result<()> {
         if self.mdat_slot.is_some() {
             return Err(Error::invalid("mp4 mux: header already written"));
@@ -3156,6 +3518,7 @@ impl Muxer for Mp4StreamMuxer {
             .mdat_slot
             .ok_or_else(|| Error::invalid("mp4 mux: trailer before header"))?;
         apply_edits(&mut self.tracks, &mut self.edits);
+        apply_refs(&mut self.tracks, &mut self.refs);
         require_configs(&mut self.tracks)?;
         let plans: Vec<TimingPlan> = self.tracks.iter().map(timing_plan).collect();
         if self.faststart {
@@ -3163,22 +3526,12 @@ impl Muxer for Mp4StreamMuxer {
             self.finished = true;
             return Ok(());
         }
-        // Timecode samples close `mdat`, 4 bytes each.
-        let mut tmcd = Vec::new();
-        for media in timecode_tracks(&self.tracks) {
-            let start = self.tracks[media]
-                .stream
-                .timecode
-                .as_ref()
-                .map_or(0, |tc| tc.start_frame);
-            self.out.write_all(&start.to_be_bytes())?;
-            tmcd.push(TmcdOut {
-                media,
-                offset: self.pos,
-            });
-            self.pos += 4;
-        }
-        let moov = build_moov(&self.tracks, &plans, &tmcd, &self.movie);
+        // Timecode and chapter samples close `mdat`.
+        let extras = Extras::new(&self.tracks, &self.movie);
+        let extras_at = self.pos;
+        self.out.write_all(&extras.bytes)?;
+        self.pos += extras.bytes.len() as u64;
+        let moov = build_moov(&self.tracks, &plans, (&extras, extras_at), &self.movie);
         let mdat_end = self.pos;
         self.out.write_all(&moov)?;
         let end = mdat_end + moov.len() as u64;
@@ -3391,7 +3744,7 @@ fn build_trak(
         track_id,
         plan,
         (media_duration, movie_duration, 0),
-        None,
+        &[],
     )
 }
 
@@ -3414,7 +3767,7 @@ fn build_hdlr(handler: &[u8; 4], name: &str, qt: bool) -> Vec<u8> {
     fbx(b"hdlr", 0, 0, &hd)
 }
 
-/// [`build_trak`], with the id of the timecode track this one references.
+/// [`build_trak`], with the tracks this one references.
 /// `durations` is `(media, movie, delay)`: the media length in the track's
 /// timescale, the presentation length and the empty-edit delay before it in
 /// the movie timescale.
@@ -3423,7 +3776,7 @@ fn build_trak_with(
     track_id: u32,
     plan: &TimingPlan,
     (media_duration, movie_duration, delay): (u64, u64, u64),
-    tmcd_ref: Option<u32>,
+    tref: &[TrackIds],
 ) -> Vec<u8> {
     let s = &track.stream;
 
@@ -3489,10 +3842,17 @@ fn build_trak_with(
 
     let is_video = s.media_type == MediaType::Video;
 
-    let hdlr = build_hdlr(if is_video { b"vide" } else { b"soun" }, "rff", track.qt);
+    let timecode = track.is_timecode();
+    let hdlr = if timecode {
+        build_hdlr(b"tmcd", "TimeCodeHandler", track.qt)
+    } else {
+        build_hdlr(if is_video { b"vide" } else { b"soun" }, "rff", track.qt)
+    };
 
     // minf: media header (vmhd / smhd) + dinf + stbl
-    let media_header = if is_video {
+    let media_header = if timecode {
+        entry::tmcd_gmhd()
+    } else if is_video {
         fbx(b"vmhd", 0, 1, &[0, 0, 0, 0, 0, 0, 0, 0])
     } else {
         fbx(b"smhd", 0, 0, &[0, 0, 0, 0]) // balance + reserved
@@ -3526,9 +3886,15 @@ fn build_trak_with(
     } else {
         elst_box(&edits)
     };
-    let tref = match tmcd_ref {
-        Some(id) => bx(b"tref", &bx(b"tmcd", &id.to_be_bytes())),
-        None => Vec::new(),
+    let tref = if tref.is_empty() {
+        Vec::new()
+    } else {
+        let mut kinds = Vec::new();
+        for (kind, ids) in tref {
+            let ids: Vec<u8> = ids.iter().flat_map(|id| id.to_be_bytes()).collect();
+            kinds.extend_from_slice(&bx(kind, &ids));
+        }
+        bx(b"tref", &kinds)
     };
     bx(b"trak", &[tkhd, edts, tref, mdia].concat())
 }
@@ -3701,6 +4067,9 @@ fn build_stbl(track: &TrackOut, plan: &TimingPlan) -> Vec<u8> {
     let mut stsd_version = 0u8;
     if let Some(pcm) = &track.pcm {
         entry = entry::pcm_entry(s, pcm);
+    } else if track.is_timecode() {
+        entry.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]); // reserved, data reference
+        entry.extend_from_slice(&s.extradata);
     } else {
         entry.extend_from_slice(&[0u8; 6]); // reserved
         pu16(&mut entry, 1); // data_reference_index
@@ -3875,6 +4244,11 @@ fn build_stbl(track: &TrackOut, plan: &TimingPlan) -> Vec<u8> {
         }
         fbx(b"stco", 0, 0, &stco_b)
     };
+
+    // Every timecode sample stands alone.
+    if track.is_timecode() {
+        return bx(b"stbl", &[stsd, stts, ctts, stsc, stsz, stco].concat());
+    }
 
     // stss: keyframe sample numbers (1-based).
     let mut stss_b = Vec::new();

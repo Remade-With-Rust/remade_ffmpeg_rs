@@ -32,8 +32,9 @@ const KEYS: &[(&str, &[u8; 4], &[u8; 4])] = &[
     ("synopsis", b"ldes", b"ldes"),
 ];
 
-/// The `udta` box for `metadata` (empty when no key has an atom).
-pub(crate) fn build_udta(metadata: &Dictionary, qt: bool) -> Vec<u8> {
+/// The `udta` box for `metadata`, with the box `extra` (empty when no key has
+/// an atom and `extra` is empty).
+pub(crate) fn build_udta(metadata: &Dictionary, qt: bool, extra: &[u8]) -> Vec<u8> {
     let mut items = Vec::new();
     for &(key, ilst_atom, qt_atom) in KEYS {
         let Some(value) = metadata.get(key) else {
@@ -55,11 +56,13 @@ pub(crate) fn build_udta(metadata: &Dictionary, qt: bool) -> Vec<u8> {
             items.extend_from_slice(&bx(ilst_atom, &bx(b"data", &data)));
         }
     }
-    if items.is_empty() {
-        return Vec::new();
-    }
-    if qt {
-        return bx(b"udta", &items);
+    if qt || items.is_empty() {
+        items.extend_from_slice(extra);
+        return if items.is_empty() {
+            Vec::new()
+        } else {
+            bx(b"udta", &items)
+        };
     }
     // meta (FullBox) / hdlr 'mdir' 'appl' / ilst
     let mut hdlr = Vec::new();
@@ -75,7 +78,7 @@ pub(crate) fn build_udta(metadata: &Dictionary, qt: bool) -> Vec<u8> {
         0,
         &[fbx(b"hdlr", 0, 0, &hdlr), bx(b"ilst", &items)].concat(),
     );
-    bx(b"udta", &meta)
+    bx(b"udta", &[&meta[..], extra].concat())
 }
 
 /// The text of an `ilst` item: its first `data` box of a text type.
