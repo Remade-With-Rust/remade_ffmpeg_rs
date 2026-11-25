@@ -441,20 +441,13 @@ fn row_nominal<'d, S: Shape, const N: usize>(
     let mut c = first::<S>(r2, r1);
     let (mut w2, mut w1) = (u32::from(r2[0]), u32::from(r1[0]));
     let mut i = 0;
-    while i < len {
-        let last = i + 1 == len;
-        let mut n = (w - 1) % 8 + 1;
-        w2 = (w2 << 8) & 0xFFFF;
-        w1 = (w1 << 8) & 0xFFFF;
-        if !last {
-            n = 8;
-            w2 |= u32::from(r2[i + 1]);
-            w1 |= u32::from(r1[i + 1]);
-        }
+    while i + 1 < len {
+        w2 = (w2 << 8) & 0xFFFF | u32::from(r2[i + 1]);
+        w1 = (w1 << 8) & 0xFFFF | u32::from(r1[i + 1]);
         let mut next = entering::<S>(w2, w1);
         // Pixels deep inside white or black share one context, usually a very
         // skewed one: take 64 or 8 at once.
-        if !last && c | next == 0 {
+        if c | next == 0 {
             let from = i;
             while words(r2, r1, i + 1).is_some_and(|(p, q)| p | q == 0) && a.run(cx[0], 0, 64) {
                 i += 8;
@@ -468,7 +461,7 @@ fn row_nominal<'d, S: Shape, const N: usize>(
                 continue;
             }
         }
-        if !last && c == S::BLACK as u32 && next == S::ENTER_BLACK {
+        if c == S::BLACK as u32 && next == S::ENTER_BLACK {
             let from = i;
             while words(r2, r1, i + 1).is_some_and(|(p, q)| p & q == u64::MAX)
                 && a.run(cx[S::BLACK & (N - 1)], 1, 64)
@@ -487,14 +480,26 @@ fn row_nominal<'d, S: Shape, const N: usize>(
             }
         }
         let mut byte = 0;
-        for _ in 0..n {
+        for _ in 0..8 {
             let d = a.bit(&mut cx[c as usize & (N - 1)]);
             byte = (byte << 1) | d;
             c = advance::<S>(c, d, next);
             next <<= 1;
         }
-        cur[i] = (byte << (8 - n)) as u8;
+        cur[i] = byte as u8;
         i += 1;
+    }
+    let mut next = entering::<S>(w2 << 8, w1 << 8);
+    let mut byte = 0;
+    let n = (w - 1) % 8 + 1;
+    for _ in 0..n {
+        let d = a.bit(&mut cx[c as usize & (N - 1)]);
+        byte = (byte << 1) | d;
+        c = advance::<S>(c, d, next);
+        next <<= 1;
+    }
+    if let Some(b) = cur.last_mut() {
+        *b = (byte << (8 - n)) as u8;
     }
     a
 }
