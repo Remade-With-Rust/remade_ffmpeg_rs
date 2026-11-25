@@ -1,0 +1,44 @@
+# cargo-fuzz harness for rusty_jbig2's untrusted-input entry points.
+# Detached from the parent workspace (its own empty [workspace] table) so
+# libfuzzer-sys never enters the normal build or the cargo-deny graph.
+# libFuzzer needs clang's sanitizer runtime, so run on Linux/macOS (WSL works):
+#
+#   cargo +nightly fuzz run decode -- -max_total_time=600
+#   cargo +nightly fuzz run embedded -- -max_total_time=600
+#
+# Seeds: the streams of ../tests/data (pass ../tests/data/hayro and
+# ../tests/data/serenity as extra corpus directories for `decode`).
+[package]
+name = "rusty_jbig2-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rusty_jbig2 = { path = ".." }
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "embedded"
+path = "fuzz_targets/embedded.rs"
+test = false
+doc = false
+bench = false
+
+# Overflow checks on: an arithmetic overflow on hostile input is a finding too.
+[profile.release]
+overflow-checks = true
+debug-assertions = true
+
+# Detach from the parent workspace.
+[workspace]
