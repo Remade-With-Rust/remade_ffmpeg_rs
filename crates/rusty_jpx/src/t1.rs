@@ -155,8 +155,7 @@ impl Source for Raw<'_> {
 pub(crate) struct Segment {
     /// Coding passes in the segment.
     pub passes: u32,
-    /// Its bytes in the block's data buffer, the two `FF` sentinel bytes
-    /// included.
+    /// Its bytes in the data.
     pub start: usize,
     pub end: usize,
 }

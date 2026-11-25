@@ -677,35 +677,40 @@ impl TileComp {
         if planes > MAX_PLANES {
             return Err(JpxError::Unsupported("more than 30 magnitude bit-planes"));
         }
-        s.bytes.clear();
-        s.segments.clear();
+        // Segments in one piece are read where they are; a segment spread over
+        // several packets has to be put together, and the others with it.
+        let mut whole = true;
         let mut pass = 0;
         for chunk in &block.chunks {
-            if starts_segment(self.style, pass) {
-                s.bytes.extend_from_slice(&[0xFF, 0xFF]);
+            whole &= starts_segment(self.style, pass);
+            pass += u32::from(chunk.passes);
+        }
+        s.bytes.clear();
+        s.segments.clear();
+        pass = 0;
+        for chunk in &block.chunks {
+            let mut range = chunk.start..chunk.start + chunk.len;
+            if !whole {
                 let start = s.bytes.len();
-                if let Some(last) = s.segments.last_mut() {
-                    last.end = start;
-                }
-                s.segments.push(Segment {
-                    passes: 0,
-                    start,
-                    end: start,
-                });
+                s.bytes.extend_from_slice(&body[range]);
+                range = start..s.bytes.len();
             }
-            s.bytes
-                .extend_from_slice(&body[chunk.start..chunk.start + chunk.len]);
-            if let Some(last) = s.segments.last_mut() {
-                last.passes += u32::from(chunk.passes);
+            match s.segments.last_mut() {
+                Some(last) if !starts_segment(self.style, pass) => {
+                    last.passes += u32::from(chunk.passes);
+                    last.end = range.end;
+                }
+                _ => s.segments.push(Segment {
+                    passes: u32::from(chunk.passes),
+                    start: range.start,
+                    end: range.end,
+                }),
             }
             pass += u32::from(chunk.passes);
         }
-        s.bytes.extend_from_slice(&[0xFF, 0xFF]);
-        if let Some(last) = s.segments.last_mut() {
-            last.end = s.bytes.len();
-        }
+        let bytes = if whole { body } else { &s.bytes };
         let (w, h) = (usize::from(block.w), usize::from(block.h));
-        s.t1.decode(w, h, planes, band.class, self.style, &s.bytes, &s.segments);
+        s.t1.decode(w, h, planes, band.class, self.style, bytes, &s.segments);
         if (1..MAX_PLANES).contains(&u32::from(self.roi)) {
             // Maxshift (H.1): anything at or above 2^s belongs to the region.
             let shift = u32::from(self.roi);
