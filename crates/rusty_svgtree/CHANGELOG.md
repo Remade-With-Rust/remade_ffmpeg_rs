@@ -12,11 +12,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - *(rusty_svgtree)* text, a usvg-style tree and Tree::to_svg_string
+- *(rusty_svgtree)* GIF, WebP and nested SVG images, svgz input, gradient and pattern context paints, `Tree::skipped()`
 - *(rusty_svgtree)* SVG filters, pixel-identical to resvg on its test suite
+
+### Changed (breaking)
+
+- `Options` gains fields (`fonts`, `font_family`, `max_svgz_bytes`, `max_filter_work`) and is no longer `UnwindSafe`; build it with `..Default::default()`
+- `Node`, `ImageKind` and `Error` are `#[non_exhaustive]`: matches need a `_` arm
+- defaults: `max_depth` is 1024 and `max_canvas_pixels` is unlimited
 
 ### Other
 
-- *(rusty_svgtree)* image formats, context paints, nested documents, svgz
 - Merge branch 'feat/svg-filters-text' into feat/svg-images-fixes
 - *(rusty_svgtree)* shorter filter chain in debug builds
 
