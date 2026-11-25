@@ -104,6 +104,9 @@ pub(crate) struct PacketData<'a> {
     pub body: &'a [u8],
     pub pos: usize,
     pub packed: Option<(&'a [u8], usize)>,
+    /// Code-block contributions of the packet being read: band, block, bytes,
+    /// passes.
+    pub pending: Vec<(u8, u32, u32, u8)>,
     /// Keep what a short body still has instead of failing.
     pub lenient: bool,
     /// Set when the data ended at a packet boundary.
@@ -419,7 +422,8 @@ impl Tile {
             None => (data.body, data.pos),
         };
         let mut bits = Bits::new(header, start);
-        let mut pending: Vec<(u8, u32, u32, u8)> = Vec::new();
+        let mut pending = std::mem::take(&mut data.pending);
+        pending.clear();
         if bits.bit()? != 0 {
             for (bi, band) in precinct.bands.iter_mut().enumerate() {
                 read_band_header(band, bi as u8, layer, style, &mut bits, &mut pending)?;
@@ -433,7 +437,7 @@ impl Tile {
             Some((_, p)) => *p = pos,
             None => data.pos = pos,
         }
-        for (bi, block, len, passes) in pending {
+        for &(bi, block, len, passes) in &pending {
             let left = data.body.len() - data.pos;
             let mut len = len as usize;
             if len > left {
@@ -453,6 +457,7 @@ impl Tile {
             }
             data.pos += len;
         }
+        data.pending = pending;
         Ok(())
     }
 }

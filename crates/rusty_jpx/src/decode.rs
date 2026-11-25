@@ -110,13 +110,17 @@ fn decode_tile(
     let body: Cow<[u8]> = match parts.bodies.as_slice() {
         [] => Cow::Borrowed(&[]),
         [one] => Cow::Borrowed(&cs[one.clone()]),
-        many => Cow::Owned(many.iter().flat_map(|r| &cs[r.clone()]).copied().collect()),
+        many => {
+            let parts: Vec<&[u8]> = many.iter().map(|r| &cs[r.clone()]).collect();
+            Cow::Owned(parts.concat())
+        }
     };
     let packed = parts.packed_headers(cs);
     let mut data = PacketData {
         body: &body,
         pos: 0,
         packed: packed.as_deref().map(|h| (h, 0)),
+        pending: Vec::new(),
         lenient: options.allow_truncated,
         clean_end: false,
         cut: false,
