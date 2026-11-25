@@ -1106,7 +1106,23 @@ impl Offsets {
     /// Share one reduction between the two channels of a pair coded at a common
     /// level: ratios against the louder channel's loudest band, and the later of
     /// the two mask bases, so the uniform region (and its output) is unchanged.
+    ///
+    /// A silent channel (the side of two identical ones) has no masks to share.
+    /// Under the surplus policy it follows the other, whose offsets stay as
+    /// they are; its lines are zero at any scalefactor. Otherwise both fall
+    /// back to the uniform step.
     pub(crate) fn join(a: &mut Self, b: &mut Self) {
+        match (&a.surplus, &b.surplus) {
+            (Some(_), None) => {
+                *b = a.clone();
+                return;
+            }
+            (None, Some(_)) => {
+                *a = b.clone();
+                return;
+            }
+            _ => {}
+        }
         if a.ratio.is_empty() || b.ratio.is_empty() {
             *a = Self::flat(std::mem::take(&mut a.off));
             *b = Self::flat(std::mem::take(&mut b.off));
@@ -8380,6 +8396,10 @@ mod fidelity_129 {
                 assert!(snr > want, "{kbps} kbps channel {c}: {snr:.1} dB");
             }
         }
+        // Two identical channels: the side is silent.
+        let dual: Vec<f32> = pcm.chunks(2).flat_map(|c| [c[0] + c[1]; 2]).collect();
+        let (_, snr, _) = gain_snr(&dual, 2, 0, sr, 320);
+        assert!(snr > 78.0, "identical channels: {snr:.1} dB");
         let mono = tone(sr as usize * 2, 1, 0, sr);
         // Past what a 6144-bit frame holds: every band is at its no-clamp floor.
         let (_, snr, _) = gain_snr(&mono, 1, 0, sr, 512);
@@ -8428,10 +8448,13 @@ mod fidelity_129 {
     fn surplus_shaping_leaves_low_rates_and_multichannel_alone() {
         let n = 48_000;
         let stereo = tone_pair(n, 48_000);
+        let dual: Vec<f32> = stereo.chunks(2).flat_map(|c| [c[0] + c[1]; 2]).collect();
         let six = tone(n, 6, 2, 48_000);
         for (pcm, ch, kbps, same) in [
             (&stereo, 2, 190, true),
             (&stereo, 2, 320, false),
+            (&dual, 2, 190, true),
+            (&dual, 2, 320, false),
             (&six, 6, 320, true),
             (&six, 6, 640, true),
         ] {
