@@ -186,9 +186,9 @@ fn store(
     if tw == 0 || th == 0 {
         return Ok(());
     }
-    if !plane.reals && out.is_empty() && (tw, th) == (w, h) {
+    if out.is_empty() && (tw, th) == (w, h) {
         *out = plane.data;
-        kernels::level_in_place(out, level, false);
+        kernels::level_in_place(out, level, plane.reals);
         return Ok(());
     }
     if out.is_empty() {
