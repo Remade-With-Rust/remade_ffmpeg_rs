@@ -1,7 +1,9 @@
 # rusty_jbig2
 
 Pure-Rust JBIG2 (ITU-T T.88 | ISO/IEC 14492) decoder, for PDF `JBIG2Decode`
-streams and standalone `.jbig2` files. No dependencies, `forbid(unsafe_code)`.
+streams and standalone `.jbig2` files. No dependencies. Safe API; the one
+`unsafe` block is in `src/kernels.rs`, next to the safe code it is tested
+against, and denied elsewhere.
 
 ```rust
 // A PDF JBIG2Decode stream and its JBIG2Globals stream, if any.
