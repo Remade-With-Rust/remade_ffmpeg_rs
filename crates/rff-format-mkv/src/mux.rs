@@ -13,7 +13,8 @@
 //!   fixed 8-byte position encodings so its own size never shifts the offsets
 //!   it points at.
 //!
-//! Both write SeekHead + Info + Tracks + Clusters + Cues, in that order.
+//! Both write SeekHead + Info + Tracks (+ Chapters + Tags) + Clusters + Cues,
+//! in that order.
 //!
 //! Codec packet contracts follow the rest of rff:
 //! * H.264 arrives Annex-B (SPS/PPS in-band on keyframes) and is stored AVCC
@@ -70,19 +71,19 @@ use rff_core::{
 use rff_format::avc::build_avcc_record;
 use rff_format::hvc::build_hvcc_record;
 use rff_format::nal::{NalFraming, NalSampleWriter, ParamSets, Stored};
-use rff_format::{Muxer, Output, SeekOutput, Stream};
+use rff_format::{Chapter, Muxer, Output, SeekOutput, Stream};
 
 use crate::{
     ID_ALPHA_MODE, ID_AUDIO, ID_BIT_DEPTH, ID_BLOCK, ID_BLOCK_ADDITIONAL, ID_BLOCK_ADDITIONS,
-    ID_BLOCK_ADD_ID, ID_BLOCK_DURATION, ID_BLOCK_GROUP, ID_BLOCK_MORE, ID_CHANNELS, ID_CLUSTER,
-    ID_CODEC_DELAY, ID_CODEC_ID, ID_CODEC_PRIVATE, ID_COLOUR, ID_CUES, ID_DISCARD_PADDING,
-    ID_DURATION, ID_INFO, ID_LUMINANCE_MAX, ID_LUMINANCE_MIN, ID_MASTERING_METADATA,
-    ID_MATRIX_COEFFICIENTS, ID_MAX_BLOCK_ADDITION_ID, ID_MAX_CLL, ID_MAX_FALL, ID_PIXEL_HEIGHT,
-    ID_PIXEL_WIDTH, ID_PRIMARIES, ID_PRIMARY_B_X, ID_PRIMARY_B_Y, ID_PRIMARY_G_X, ID_PRIMARY_G_Y,
-    ID_PRIMARY_R_X, ID_PRIMARY_R_Y, ID_RANGE, ID_REFERENCE_BLOCK, ID_SAMPLING_FREQUENCY,
-    ID_SEEK_PREROLL, ID_SEGMENT, ID_SIMPLE_BLOCK, ID_TIMESTAMP, ID_TIMESTAMP_SCALE, ID_TRACKS,
-    ID_TRACK_ENTRY, ID_TRACK_NUMBER, ID_TRACK_TYPE, ID_TRANSFER_CHARACTERISTICS, ID_VIDEO,
-    ID_WHITE_POINT_X, ID_WHITE_POINT_Y,
+    ID_BLOCK_ADD_ID, ID_BLOCK_DURATION, ID_BLOCK_GROUP, ID_BLOCK_MORE, ID_CHANNELS, ID_CHAPTERS,
+    ID_CLUSTER, ID_CODEC_DELAY, ID_CODEC_ID, ID_CODEC_PRIVATE, ID_COLOUR, ID_CUES,
+    ID_DISCARD_PADDING, ID_DURATION, ID_INFO, ID_LUMINANCE_MAX, ID_LUMINANCE_MIN,
+    ID_MASTERING_METADATA, ID_MATRIX_COEFFICIENTS, ID_MAX_BLOCK_ADDITION_ID, ID_MAX_CLL,
+    ID_MAX_FALL, ID_PIXEL_HEIGHT, ID_PIXEL_WIDTH, ID_PRIMARIES, ID_PRIMARY_B_X, ID_PRIMARY_B_Y,
+    ID_PRIMARY_G_X, ID_PRIMARY_G_Y, ID_PRIMARY_R_X, ID_PRIMARY_R_Y, ID_RANGE, ID_REFERENCE_BLOCK,
+    ID_SAMPLING_FREQUENCY, ID_SEEK_PREROLL, ID_SEGMENT, ID_SIMPLE_BLOCK, ID_TIMESTAMP,
+    ID_TIMESTAMP_SCALE, ID_TRACKS, ID_TRACK_ENTRY, ID_TRACK_NUMBER, ID_TRACK_TYPE,
+    ID_TRANSFER_CHARACTERISTICS, ID_VIDEO, ID_WHITE_POINT_X, ID_WHITE_POINT_Y,
 };
 
 // ---- EBML element IDs used only by the muxer ------------------------------
@@ -1122,6 +1123,8 @@ pub struct MkvMuxer {
     blocks: Vec<BufBlock>,
     /// `set_metadata`: Info (title, creation_time, encoder) and Tags.
     metadata: rff_core::Dictionary,
+    /// `set_chapters`, under the UIDs they are written with.
+    chapters: Vec<Chapter>,
 }
 
 impl MkvMuxer {
@@ -1132,6 +1135,7 @@ impl MkvMuxer {
             tracks: Vec::new(),
             blocks: Vec::new(),
             metadata: rff_core::Dictionary::new(),
+            chapters: Vec::new(),
         }
     }
 }
@@ -1139,6 +1143,11 @@ impl MkvMuxer {
 impl Muxer for MkvMuxer {
     fn set_metadata(&mut self, metadata: &rff_core::Dictionary) {
         self.metadata = metadata.clone();
+    }
+
+    fn set_chapters(&mut self, chapters: &[Chapter]) -> bool {
+        self.chapters = crate::chapters::to_write(chapters);
+        true
     }
 
     fn write_header(&mut self, streams: &[Stream]) -> Result<()> {
@@ -1179,12 +1188,14 @@ impl Muxer for MkvMuxer {
             &self.metadata,
         );
 
-        // --- Tracks (and Tags, right after) ---
+        // --- Tracks (Chapters and Tags right after) ---
         for plan in &mut self.tracks {
             finalize_private(plan);
         }
         let mut tracks_elem = tracks_element(&self.tracks);
-        tracks_elem.extend_from_slice(&crate::props::tags_element(&self.metadata));
+        let chapters_at = tracks_elem.len() as u64;
+        tracks_elem.extend_from_slice(&crate::chapters::element(&self.chapters));
+        tracks_elem.extend_from_slice(&crate::props::tags_element(&self.metadata, &self.chapters));
 
         // A missing H.264 config means no SPS/PPS ever appeared — the file
         // would be undecodable; refuse rather than write it silently broken.
@@ -1246,7 +1257,8 @@ impl Muxer for MkvMuxer {
         // Positions are relative to the start of the Segment's data. The
         // SeekHead's size is invariant (fixed-8-byte positions), so measure it
         // with placeholders first.
-        let seekhead_len = build_seekhead(0, 0, 0).len();
+        let chapters = |at: u64| (!self.chapters.is_empty()).then_some(at);
+        let seekhead_len = build_seekhead(0, 0, chapters(0), 0).len();
         let info_pos = seekhead_len as u64;
         let tracks_pos = info_pos + info_elem.len() as u64;
         let mut cluster_pos = tracks_pos + tracks_elem.len() as u64;
@@ -1266,7 +1278,12 @@ impl Muxer for MkvMuxer {
         let mut cues_elem = Vec::new();
         put_elem(&mut cues_elem, ID_CUES, &cues_body);
 
-        let seekhead = build_seekhead(info_pos, tracks_pos, cues_pos);
+        let seekhead = build_seekhead(
+            info_pos,
+            tracks_pos,
+            chapters(tracks_pos + chapters_at),
+            cues_pos,
+        );
         debug_assert_eq!(seekhead.len(), seekhead_len);
 
         // --- Segment ---
@@ -1291,15 +1308,24 @@ impl Muxer for MkvMuxer {
     }
 }
 
-/// Build the SeekHead pointing at Info/Tracks/Cues. Positions are encoded as
+/// Build the SeekHead pointing at Info/Tracks/Cues, and Chapters when there
+/// are some. Positions are encoded as
 /// fixed 8-byte uints so the element's size is independent of their values.
-fn build_seekhead(info_pos: u64, tracks_pos: u64, cues_pos: u64) -> Vec<u8> {
+fn build_seekhead(
+    info_pos: u64,
+    tracks_pos: u64,
+    chapters_pos: Option<u64>,
+    cues_pos: u64,
+) -> Vec<u8> {
     let mut body = Vec::new();
-    for (target, pos) in [
-        (ID_INFO, info_pos),
-        (ID_TRACKS, tracks_pos),
-        (ID_CUES, cues_pos),
-    ] {
+    let entries = [
+        (ID_INFO, Some(info_pos)),
+        (ID_TRACKS, Some(tracks_pos)),
+        (ID_CHAPTERS, chapters_pos),
+        (ID_CUES, Some(cues_pos)),
+    ];
+    for (target, pos) in entries {
+        let Some(pos) = pos else { continue };
         let mut id_bytes = Vec::new();
         put_id(&mut id_bytes, target);
         let mut seek = Vec::new();
@@ -1375,6 +1401,8 @@ pub struct MkvStreamingMuxer {
     webm: bool,
     tracks: Vec<TrackPlan>,
     metadata: rff_core::Dictionary,
+    /// `set_chapters`, under the UIDs they are written with.
+    chapters: Vec<Chapter>,
     is_video: Vec<bool>,
     is_sub: Vec<bool>,
     /// Per-track queues, each in arrival (= decode) order.
@@ -1411,6 +1439,7 @@ impl MkvStreamingMuxer {
             webm,
             tracks: Vec::new(),
             metadata: rff_core::Dictionary::new(),
+            chapters: Vec::new(),
             is_video: Vec::new(),
             is_sub: Vec::new(),
             queues: Vec::new(),
@@ -1497,12 +1526,15 @@ impl MkvStreamingMuxer {
             }
         }
         let mut tracks = tracks_element(&self.tracks);
-        tracks.extend_from_slice(&crate::props::tags_element(&self.metadata));
-        let seekhead_len = build_seekhead(0, 0, 0).len() as u64;
+        let chapters_at = tracks.len() as u64;
+        tracks.extend_from_slice(&crate::chapters::element(&self.chapters));
+        tracks.extend_from_slice(&crate::props::tags_element(&self.metadata, &self.chapters));
+        let chapters = |at: u64| (!self.chapters.is_empty()).then_some(at);
+        let seekhead_len = build_seekhead(0, 0, chapters(0), 0).len() as u64;
         let info_pos = seekhead_len;
         let tracks_pos = info_pos + info.len() as u64;
         // The Cues position is the SeekHead's last 8 bytes; patched at the end.
-        let seekhead = build_seekhead(info_pos, tracks_pos, 0);
+        let seekhead = build_seekhead(info_pos, tracks_pos, chapters(tracks_pos + chapters_at), 0);
         self.seekhead_cues_at = self.segment_data + seekhead_len - 8;
         self.duration_at =
             self.segment_data + info_pos + duration_at.expect("duration written") as u64;
@@ -1616,6 +1648,11 @@ impl MkvStreamingMuxer {
 impl Muxer for MkvStreamingMuxer {
     fn set_metadata(&mut self, metadata: &rff_core::Dictionary) {
         self.metadata = metadata.clone();
+    }
+
+    fn set_chapters(&mut self, chapters: &[Chapter]) -> bool {
+        self.chapters = crate::chapters::to_write(chapters);
+        true
     }
 
     fn write_header(&mut self, streams: &[Stream]) -> Result<()> {
@@ -1745,8 +1782,8 @@ mod tests {
     #[test]
     fn seekhead_size_is_position_invariant() {
         assert_eq!(
-            build_seekhead(0, 0, 0).len(),
-            build_seekhead(u64::MAX / 2, 123, 456).len()
+            build_seekhead(0, 0, None, 0).len(),
+            build_seekhead(u64::MAX / 2, 123, None, 456).len()
         );
     }
 

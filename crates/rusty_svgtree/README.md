@@ -7,8 +7,8 @@
 simplified render tree (the shape of usvg's: styles resolved, lengths in user
 units, `use` expanded, paint servers in user space); `render` draws it with
 the house [`rusty_raster`](https://crates.io/crates/rusty_raster) rasteriser. XML comes from the
-house [`rusty_xml`](https://crates.io/crates/rusty_xml) parser, embedded PNG
-and JPEG from `rusty_png` and `rusty_jpeg`. `#![forbid(unsafe_code)]`, no C.
+house [`rusty_xml`](https://crates.io/crates/rusty_xml) parser, embedded PNG,
+JPEG, GIF and WebP from the house codecs, embedded SVG and svgz from this crate. `#![forbid(unsafe_code)]`, no C.
 
 Part of **[remade_ffmpeg_rs](https://github.com/Remade-With-Rust/remade_ffmpeg_rs)**
 by **[Mata Network](https://www.mata.network/)**.
@@ -20,7 +20,7 @@ by **[Mata Network](https://www.mata.network/)**.
 
 - **Pixels:**
   - 98 of the 105 files are identical to resvg; the other 7 are 36-55 dB.
-  - 7 files use `<filter>` or `<text>`, which are not implemented (the filter is skipped and the content drawn).
+  - 7 files use `<filter>` or `<text>`, which were not implemented when this was measured.
   - 1 file differs only by JPEG decoder rounding.
 - **nanosvg:** its median PSNR against both this crate and resvg is 27 dB. It has no CSS, clip paths, masks or `preserveAspectRatio`, so it serves only as a speed reference.
 - **Speed:** measured over the 98 files where this crate and resvg produce identical pixels, so both do the same work. Parse and render the whole set, minimum of 11 pinned, ABBA-interleaved rounds.
@@ -93,6 +93,62 @@ tests pass.
 
 No speed numbers are claimed yet.
 
+## Filters
+
+Every SVG 1.1 filter primitive plus `feDropShadow` and the CSS filter
+functions (`blur()`, `drop-shadow()`, `grayscale()`, ...), with filter and
+primitive regions, `filterUnits` / `primitiveUnits`,
+`color-interpolation-filters`, `href` inheritance and filter lists. The
+filters are in the tree (`Group::filters`, types in the `filter` module) and
+`render` applies them. Pixel-identical to resvg 0.48.1 on the resvg test
+suite's `filters` files (the 7 that differ there draw text labels).
+
+Two things are deliberately not as in resvg: `feDisplacementMap` applies
+`scale` once and reads the map unpremultiplied (resvg applies it twice), and a
+huge `feMorphology` radius costs no more than a small one.
+`BackgroundImage`, `BackgroundAlpha`, `FillPaint` and `StrokePaint` inputs
+read as `SourceGraphic`, as in resvg.
+
+## Text
+
+Text is always in the tree: `Node::Text` keeps the chunks, spans, fonts,
+paints and positions. To draw it, turn on the `text` feature and give
+`Options::fonts` a `text::FontProvider`, a trait with five methods (select a
+font, a fallback, metrics, shape a run, draw a glyph). The layout on top of it
+(bidi, fallback, `textPath`, `textLength`, spacing, baselines, decorations,
+vertical writing, SVG, bitmap and `COLR` glyphs) is this crate's, and the
+result is `Text::flattened`, ordinary paths. Documents cannot load fonts.
+
+| feature | default | adds |
+|---|---|---|
+| (none) | yes | text nodes in the tree, not drawn (`Tree::skipped().text` counts them) |
+| `text` | no | layout through a font callback: `kurbo`, `unicode-bidi`, `unicode-script`, `unicode-vo` |
+| `fonts` | no | `Fonts`, a provider over font files: `fontdb`, `harfrust`, `skrifa` |
+
+There is no house font stack yet
+([thoth#6](https://github.com/Remade-With-Rust/thoth/issues/6)), which is why
+the third-party one is behind a feature that is never on by default.
+
+With `fonts` and the same font files as resvg 0.48.1, all 379 files of the
+resvg suite's `text` category are pixel-identical, and so is every other file
+of the suite except four (JPEG rounding, at most 3 levels).
+
+```rust,ignore
+let mut fonts = rusty_svgtree::Fonts::new();
+fonts.load_system_fonts();
+let opt = rusty_svgtree::Options {
+    fonts: Some(std::sync::Arc::new(fonts)),
+    ..Default::default()
+};
+```
+
+## Writing SVG
+
+`Tree::to_svg_string` writes the tree back with every style resolved. All 1718
+files of the resvg suite that parse draw the same pixels after a round trip,
+with text as paths; with `WriteOptions { preserve_text: true }` so do the 379
+text files.
+
 ## Usage
 
 ```rust
@@ -112,26 +168,24 @@ rusty_svgtree::render(&tree, Transform::identity(), &mut pixmap.as_mut());
 ## Limits
 
 All in `Options`, all with safe defaults: `max_nodes` (500,000 elements after
-`use` expansion), `max_depth` (256), `max_image_pixels` (64 Mi),
-`max_canvas_pixels` (2^28; larger documents are `Error::InvalidSize`, not an
-allocation) and `max_layer_bytes` (1 GiB held at once by group layers and
-clip/mask scratch; a group past it is skipped). Fixed internal work budgets
+`use` expansion), `max_depth` (1024), `max_image_pixels` (64 Mi),
+`max_canvas_pixels` (none: a document's size allocates nothing, and `render`
+draws at the size of the caller's pixmap), `max_svgz_bytes` (256 MiB
+decompressed), `max_layer_bytes` (1 GiB held at once by group layers and
+clip/mask/filter scratch; a group past it is skipped) and `max_filter_work`
+(2^33 pixel operations per `render`; an element whose filter would exceed it
+is not drawn). Fixed internal work budgets
 bound style-sheet matching, `use` cycle checks and the re-conversion of shared
 clip paths, patterns and markers. `use` reference cycles are
 skipped (resvg instead fails the whole document); clip-path, mask and pattern
-cycles are broken. Only `data:` image URIs are loaded: no file or network
-access.
+cycles are broken. Embedded documents share the limits of the one around them
+and nest 8 deep. Only `data:` image URIs are loaded: no file or network
+access. `Tree::skipped` says what was left out.
 
 ## Not done yet
 
-- **Text** (`<text>` is skipped; resvg was measured with its `text` feature
-  off, so the oracle compares like with like). Needs the house font stack.
-- **Filters**: a `filter` that references a valid element is ignored and the
-  content drawn unfiltered; a dangling reference hides the element, as the
-  spec requires.
-- Context paints (`context-fill`/`context-stroke`) carry solid colours only.
-- No GIF/WebP/nested-SVG images, no external `href`s, no `Tree::to_svg_string`
-  export, no animation.
+- No external `href`s (by design), no animation.
+- A house font stack: see Text.
 
 ## License
 

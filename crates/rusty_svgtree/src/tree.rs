@@ -9,46 +9,78 @@ use rusty_raster::{
     SpreadMode, Transform,
 };
 
+use crate::filter::Filter;
+use crate::text::Text;
+
 /// A node of the render tree.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Node {
     /// A group (possibly isolated: opacity, clip, mask, blend).
     Group(Box<Group>),
     /// A filled and/or stroked path.
     Path(Box<Path>),
-    /// An embedded raster image.
+    /// An embedded image.
     Image(Box<Image>),
+    /// Text.
+    Text(Box<Text>),
 }
 
 impl Node {
     /// The fill bounding box in the parent's coordinates (group transforms
     /// are not applied).
-    pub(crate) fn bounding_box(&self) -> Option<Rect> {
+    pub fn bounding_box(&self) -> Option<Rect> {
         match self {
             Node::Group(g) => g.bounding_box,
             Node::Path(p) => Some(p.bounding_box),
             Node::Image(i) => i.size.to_rect(0.0, 0.0),
+            Node::Text(t) => t.bounding_box,
         }
     }
 
-    pub(crate) fn stroke_bounding_box(&self) -> Option<Rect> {
+    /// The same with strokes.
+    pub fn stroke_bounding_box(&self) -> Option<Rect> {
         match self {
             Node::Group(g) => g.stroke_bounding_box,
             Node::Path(p) => Some(p.stroke_bounding_box),
             Node::Image(i) => i.size.to_rect(0.0, 0.0),
+            Node::Text(t) => t.stroke_bounding_box,
         }
+    }
+
+    /// The element id, empty if it has none (and for content made by a
+    /// marker).
+    pub fn id(&self) -> &str {
+        match self {
+            Node::Group(g) => &g.id,
+            Node::Path(p) => &p.id,
+            Node::Image(i) => &i.id,
+            Node::Text(t) => &t.id,
+        }
+    }
+
+    /// Whether the node is in the tree but has nothing to draw (text that
+    /// was not laid out).
+    pub(crate) fn is_inert(&self) -> bool {
+        matches!(self, Node::Text(t) if t.flattened.is_none())
     }
 }
 
 /// A group of nodes.
 #[derive(Clone, Debug)]
 pub struct Group {
+    pub(crate) id: String,
     pub(crate) transform: Transform,
+    pub(crate) abs_transform: Transform,
+    /// Content painted with `context-fill` / `context-stroke` takes this
+    /// group's box and coordinates (a `use`).
+    pub(crate) is_context: bool,
     pub(crate) opacity: f32,
     pub(crate) blend_mode: BlendMode,
     pub(crate) isolate: bool,
     pub(crate) clip_path: Option<Arc<ClipPath>>,
     pub(crate) mask: Option<Arc<Mask>>,
+    pub(crate) filters: Vec<Arc<Filter>>,
     pub(crate) children: Vec<Node>,
     pub(crate) bounding_box: Option<Rect>,
     pub(crate) stroke_bounding_box: Option<Rect>,
@@ -58,12 +90,16 @@ pub struct Group {
 impl Default for Group {
     fn default() -> Self {
         Group {
+            id: String::new(),
             transform: Transform::identity(),
+            abs_transform: Transform::identity(),
+            is_context: false,
             opacity: 1.0,
             blend_mode: BlendMode::SourceOver,
             isolate: false,
             clip_path: None,
             mask: None,
+            filters: Vec::new(),
             children: Vec::new(),
             bounding_box: None,
             stroke_bounding_box: None,
@@ -92,9 +128,47 @@ fn expand(a: Option<Rect>, b: Option<Rect>) -> Option<Rect> {
 }
 
 impl Group {
+    /// The element id, of a `g`, `use`, `svg` or an image's group; else
+    /// empty.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Whether there is anything to draw.
+    pub(crate) fn has_content(&self) -> bool {
+        self.children.iter().any(|c| !c.is_inert())
+    }
+
+    /// The fill box of the children, in the group's coordinates.
+    pub fn bounding_box(&self) -> Option<Rect> {
+        self.bounding_box
+    }
+
+    /// The stroke box of the children, in the group's coordinates.
+    pub fn stroke_bounding_box(&self) -> Option<Rect> {
+        self.stroke_bounding_box
+    }
+
+    /// The box of what the group draws, filters included, in the group's
+    /// coordinates.
+    pub fn layer_bounding_box(&self) -> NonZeroRect {
+        self.layer_bounding_box
+    }
+
+    /// Whether the group is isolated of itself (`isolation: isolate`).
+    pub fn isolate(&self) -> bool {
+        self.isolate
+    }
+
     /// The group's transform relative to its parent.
     pub fn transform(&self) -> Transform {
         self.transform
+    }
+
+    /// The group's transform relative to the root (of the tree, or of the
+    /// clip path, mask, pattern or `feImage` the group is in).
+    pub fn abs_transform(&self) -> Transform {
+        self.abs_transform
     }
 
     /// Group opacity, `0..=1`.
@@ -117,6 +191,11 @@ impl Group {
         self.mask.as_deref()
     }
 
+    /// The filters, applied in order before the clip path and mask.
+    pub fn filters(&self) -> &[Arc<Filter>] {
+        &self.filters
+    }
+
     /// Child nodes, in paint order.
     pub fn children(&self) -> &[Node] {
         &self.children
@@ -128,6 +207,7 @@ impl Group {
             || self.opacity != 1.0
             || self.clip_path.is_some()
             || self.mask.is_some()
+            || !self.filters.is_empty()
             || self.blend_mode != BlendMode::SourceOver
     }
 
@@ -172,7 +252,15 @@ impl Group {
             self.bounding_box = bbox;
             self.stroke_bounding_box = stroke_bbox;
         }
-        if let Some(r) = layer_bbox.and_then(|r| r.to_non_zero_rect()) {
+        // The filter regions take the place of the content's box.
+        let filter_bbox = self
+            .filters
+            .iter()
+            .fold(None, |b, f| expand(b, Some(f.rect.to_rect())));
+        if let Some(r) = filter_bbox
+            .or(layer_bbox)
+            .and_then(|r| r.to_non_zero_rect())
+        {
             self.layer_bounding_box = r;
         }
     }
@@ -191,6 +279,8 @@ pub enum PaintOrder {
 /// A path with resolved paint.
 #[derive(Clone, Debug)]
 pub struct Path {
+    pub(crate) id: String,
+    pub(crate) abs_transform: Transform,
     pub(crate) visible: bool,
     pub(crate) fill: Option<Fill>,
     pub(crate) stroke: Option<Stroke>,
@@ -202,6 +292,27 @@ pub struct Path {
 }
 
 impl Path {
+    /// The element id, or empty.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The box of the path, in its group's coordinates.
+    pub fn bounding_box(&self) -> Rect {
+        self.bounding_box
+    }
+
+    /// The box of the path with its stroke.
+    pub fn stroke_bounding_box(&self) -> Rect {
+        self.stroke_bounding_box
+    }
+
+    /// The path's transform relative to the root (see
+    /// [`Group::abs_transform`]).
+    pub fn abs_transform(&self) -> Transform {
+        self.abs_transform
+    }
+
     /// Whether the path is drawn (`visibility`).
     pub fn is_visible(&self) -> bool {
         self.visible
@@ -257,12 +368,25 @@ pub enum Paint {
     Pattern(Arc<Pattern>),
 }
 
+impl Paint {
+    /// Whether it is still in units of the painted shape's box.
+    pub(crate) fn needs_box(&self) -> bool {
+        match self {
+            Paint::Color(_) => false,
+            Paint::LinearGradient(g) => g.base.obb,
+            Paint::RadialGradient(g) => g.base.obb,
+            Paint::Pattern(p) => p.pending.is_some(),
+        }
+    }
+}
+
 /// A fill.
 #[derive(Clone, Debug)]
 pub struct Fill {
     pub(crate) paint: Paint,
     pub(crate) opacity: f32,
     pub(crate) rule: FillRule,
+    pub(crate) context: Option<Box<ContextElement>>,
 }
 
 impl Fill {
@@ -293,9 +417,45 @@ pub struct Stroke {
     pub(crate) linejoin: LineJoin,
     pub(crate) dasharray: Option<Vec<f32>>,
     pub(crate) dashoffset: f32,
+    pub(crate) context: Option<Box<ContextElement>>,
+}
+
+/// What a paint taken over from a context element is resolved against
+/// (only during conversion).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ContextElement {
+    /// The `use` element around it, once its box is known.
+    Use,
+    /// The path a marker is drawn on: its coordinates and box.
+    Path(Transform, Option<NonZeroRect>),
 }
 
 impl Stroke {
+    /// `stroke-miterlimit`.
+    pub fn miterlimit(&self) -> f32 {
+        self.miterlimit
+    }
+
+    /// `stroke-linecap`.
+    pub fn linecap(&self) -> LineCap {
+        self.linecap
+    }
+
+    /// `stroke-linejoin`.
+    pub fn linejoin(&self) -> LineJoin {
+        self.linejoin
+    }
+
+    /// `stroke-dasharray`, an even number of lengths.
+    pub fn dasharray(&self) -> Option<&[f32]> {
+        self.dasharray.as_deref()
+    }
+
+    /// `stroke-dashoffset`.
+    pub fn dashoffset(&self) -> f32 {
+        self.dashoffset
+    }
+
     /// The paint.
     pub fn paint(&self) -> &Paint {
         &self.paint
@@ -521,19 +681,28 @@ impl Mask {
     }
 }
 
-/// Encoded image data; decoded at render time with a pixel-count limit.
+/// Image data. Raster images stay encoded, and are decoded at render time
+/// with a pixel-count limit.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum ImageKind {
     /// PNG bytes.
     Png(Arc<Vec<u8>>),
     /// JPEG bytes.
     Jpeg(Arc<Vec<u8>>),
+    /// GIF bytes; the first frame is drawn.
+    Gif(Arc<Vec<u8>>),
+    /// WebP bytes.
+    WebP(Arc<Vec<u8>>),
+    /// An SVG document.
+    Svg(Arc<crate::Tree>),
 }
 
-/// An embedded raster image, drawn at `0,0` with its intrinsic size (the
+/// An embedded image, drawn at `0,0` with its intrinsic size (the
 /// parent group carries the placement transform).
 #[derive(Clone, Debug)]
 pub struct Image {
+    pub(crate) id: String,
     pub(crate) visible: bool,
     pub(crate) size: Size,
     pub(crate) quality: FilterQuality,
@@ -541,12 +710,17 @@ pub struct Image {
 }
 
 impl Image {
-    /// Intrinsic size in pixels.
+    /// How the image is sampled (`image-rendering`).
+    pub fn quality(&self) -> FilterQuality {
+        self.quality
+    }
+
+    /// Intrinsic size (pixels, or user units of an SVG).
     pub fn size(&self) -> Size {
         self.size
     }
 
-    /// The encoded data.
+    /// The image data.
     pub fn kind(&self) -> &ImageKind {
         &self.kind
     }

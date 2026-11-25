@@ -22,7 +22,7 @@
 //!   `encoder` / the other keys (upper-cased when written, as matroskaenc).
 
 use rff_core::{CleanAperture, Dictionary};
-use rff_format::Stream;
+use rff_format::{Chapter, Stream};
 
 use crate::{children, float_of, uint_of};
 
@@ -66,7 +66,7 @@ pub(crate) const ID_SIMPLE_TAG: u32 = 0x67C8;
 pub(crate) const ID_TAG_NAME: u32 = 0x45A3;
 pub(crate) const ID_TAG_STRING: u32 = 0x4487;
 
-fn text(body: &[u8]) -> String {
+pub(crate) fn text(body: &[u8]) -> String {
     // EBML strings may be NUL-padded.
     let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
     String::from_utf8_lossy(&body[..end]).into_owned()
@@ -353,33 +353,72 @@ fn in_info(key: &str) -> bool {
     matches!(key, "title" | "creation_time" | "encoder")
 }
 
-/// A `Tags` element holding `md`'s other keys as global SimpleTags (empty
-/// when there are none).
-pub(crate) fn tags_element(md: &Dictionary) -> Vec<u8> {
+/// A `Tags` element holding `md`'s other keys as global SimpleTags, and each
+/// chapter's metadata but its title targeting the chapter (empty when there
+/// is nothing to tag).
+pub(crate) fn tags_element(md: &Dictionary, chapters: &[Chapter]) -> Vec<u8> {
     use crate::mux::{put_elem, put_string, put_uint};
-    let mut tag = Vec::new();
-    let mut targets = Vec::new();
-    put_uint(&mut targets, ID_TARGET_TYPE_VALUE, 50);
-    put_elem(&mut tag, ID_TARGETS, &targets);
-    let mut any = false;
-    for (k, v) in md.iter() {
-        if in_info(k) || k.is_empty() {
-            continue;
+    let mut tags = Vec::new();
+    let mut add = |target: (u32, u64), md: &Dictionary, skip: fn(&str) -> bool| {
+        let mut tag = Vec::new();
+        let mut targets = Vec::new();
+        put_uint(&mut targets, target.0, target.1);
+        put_elem(&mut tag, ID_TARGETS, &targets);
+        let mut any = false;
+        for (k, v) in md.iter() {
+            if skip(k) || k.is_empty() {
+                continue;
+            }
+            let mut st = Vec::new();
+            put_string(&mut st, ID_TAG_NAME, &k.to_ascii_uppercase());
+            put_string(&mut st, ID_TAG_STRING, v);
+            put_elem(&mut tag, ID_SIMPLE_TAG, &st);
+            any = true;
         }
-        let mut st = Vec::new();
-        put_string(&mut st, ID_TAG_NAME, &k.to_ascii_uppercase());
-        put_string(&mut st, ID_TAG_STRING, v);
-        put_elem(&mut tag, ID_SIMPLE_TAG, &st);
-        any = true;
+        if any {
+            put_elem(&mut tags, ID_TAG, &tag);
+        }
+    };
+    add((ID_TARGET_TYPE_VALUE, 50), md, in_info);
+    for c in chapters {
+        add((ID_TAG_CHAPTER_UID, c.id), &c.metadata, |k| k == "title");
     }
-    if !any {
+    if tags.is_empty() {
         return Vec::new();
     }
-    let mut tags = Vec::new();
-    put_elem(&mut tags, ID_TAG, &tag);
     let mut out = Vec::new();
     put_elem(&mut out, crate::ID_TAGS, &tags);
     out
+}
+
+/// A `(chapter UID, name, value)` tag.
+pub(crate) type ChapterTag = (u64, String, String);
+
+/// The tags of a `Tags` body that target chapters, names lower-cased.
+pub(crate) fn read_chapter_tags(out: &mut Vec<ChapterTag>, body: &[u8]) {
+    for (_, tag) in children(body).filter(|&(id, _)| id == ID_TAG) {
+        let uid = children(tag)
+            .filter(|&(id, _)| id == ID_TARGETS)
+            .flat_map(|(_, t)| children(t))
+            .find(|&(id, _)| id == ID_TAG_CHAPTER_UID)
+            .map(|(_, b)| uint_of(b));
+        let Some(uid) = uid else { continue };
+        for (_, st) in children(tag).filter(|&(id, _)| id == ID_SIMPLE_TAG) {
+            let (mut name, mut value) = (None, None);
+            for (id, b) in children(st) {
+                match id {
+                    ID_TAG_NAME => name = Some(text(b).to_ascii_lowercase()),
+                    ID_TAG_STRING => value = Some(text(b)),
+                    _ => {}
+                }
+            }
+            if let (Some(n), Some(v)) = (name, value) {
+                if !n.is_empty() {
+                    out.push((uid, n, v));
+                }
+            }
+        }
+    }
 }
 
 /// Read a `Tags` body's global tags (no track/edition/chapter/attachment

@@ -28,7 +28,7 @@ use rff_core::{
 };
 use rff_filter::{FilterChain, FilterComplex};
 
-use rff_format::{Muxer, Stream};
+use rff_format::{Chapter, Muxer, Stream, TrackReference};
 use rff_resample::Resampler;
 
 use crate::Engine;
@@ -1062,12 +1062,22 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
     // stream packets after; MP4 from a pipe, which must buffer to reach a
     // trailing `moov`, is the one that still does all of its I/O at open.)
     let t_start = phases::on().then(std::time::Instant::now);
+    // Timecode tracks are streams only when data streams are asked for by
+    // kind (`-map 0:d`): otherwise stream numbers, and what `-map 0` selects,
+    // stay as they are and the timecode travels as `Stream::timecode`.
+    let timecode_streams = output
+        .maps
+        .iter()
+        .any(|m| matches!(m.selector, MapSelector::Kind(MediaType::Data)));
     let mut demuxers: Vec<Box<dyn rff_format::Demuxer>> = Vec::new();
     let mut input_streams: Vec<Vec<Stream>> = Vec::new();
     for input in &spec.inputs {
         let (demuxer, streams) = phases::time(&phases::OPEN, || -> Result<_> {
             let (in_format, source) = open_input(engine, input)?;
             let mut demuxer = source.open_demuxer(engine, &in_format)?;
+            if timecode_streams {
+                demuxer.set_timecode_streams(true);
+            }
             let streams = demuxer.read_header()?;
             Ok((demuxer, streams))
         })?;
@@ -1077,6 +1087,16 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
 
     // --- select which (input, stream) pairs go to the output, in order ---
     let mut selection = select_streams(&input_streams, output)?;
+    // An MP4 chapter track is a data stream no muxer takes; its chapters are
+    // carried as chapters, so `-map 0` and `-map 0:d` pass over it.
+    selection.retain(|&(inp, i)| {
+        input_streams[inp][i].media_type != MediaType::Data
+            || !is_chapter_track(&*demuxers[inp], input_streams[inp].len(), i)
+            || output
+                .maps
+                .iter()
+                .any(|m| m.input == inp && matches!(m.selector, MapSelector::Index(n) if n == i))
+    });
     // The overlay input is consumed by the filter, not muxed as its own stream.
     if let Some(oin) = overlay_input {
         selection.retain(|(inp, _)| *inp != oin);
@@ -1237,6 +1257,29 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
             muxer.set_stream_metadata(out_index, md);
         }
     }
+    // What a stream refers to (its timecode track) follows it, as far as the
+    // targets are in the output too.
+    for (out_index, &(inp, local)) in selection.iter().enumerate() {
+        let refs: Vec<TrackReference> = demuxers[inp]
+            .track_references(local)
+            .iter()
+            .filter_map(|r| {
+                let to: Vec<usize> = r
+                    .streams
+                    .iter()
+                    .filter_map(|&t| selection.iter().position(|&s| s == (inp, t)))
+                    .collect();
+                (!to.is_empty()).then(|| TrackReference::new(r.kind, to))
+            })
+            .collect();
+        if !refs.is_empty() {
+            muxer.set_track_references(out_index, &refs);
+        }
+    }
+    let chapters = output_chapters(&demuxers, output)?;
+    if !chapters.is_empty() {
+        muxer.set_chapters(&chapters);
+    }
     muxer.write_header(&out_streams)?;
 
     let mut report = TranscodeReport::default();
@@ -1268,6 +1311,50 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
     }
 
     Ok(report)
+}
+
+/// The chapters of the output: those of the first input that has any, as
+/// FFmpeg takes them by default, or of the input `map_chapters` names in the
+/// format options (`-map_chapters N`; a negative number takes none), cut to
+/// the trim window.
+fn output_chapters(
+    demuxers: &[Box<dyn rff_format::Demuxer>],
+    output: &OutputSpec,
+) -> Result<Vec<Chapter>> {
+    let chapters = match output.format_options.get("map_chapters") {
+        Some(v) => {
+            let n: i64 = v
+                .trim()
+                .parse()
+                .map_err(|_| Error::Option(format!("-map_chapters: not an input number: {v}")))?;
+            match usize::try_from(n) {
+                Ok(n) => demuxers
+                    .get(n)
+                    .ok_or_else(|| Error::Option(format!("-map_chapters: no input #{n}")))?
+                    .chapters(),
+                Err(_) => &[],
+            }
+        }
+        None => demuxers
+            .iter()
+            .map(|d| d.chapters())
+            .find(|c| !c.is_empty())
+            .unwrap_or(&[]),
+    };
+    Ok(match Trim::from_spec(output) {
+        Some(t) => rff_format::chapter::trim(chapters, t.start, t.end),
+        None => chapters.to_vec(),
+    })
+}
+
+/// Whether another of the `n` streams refers to `stream` as its chapters.
+fn is_chapter_track(demuxer: &dyn rff_format::Demuxer, n: usize, stream: usize) -> bool {
+    (0..n).any(|i| {
+        demuxer
+            .track_references(i)
+            .iter()
+            .any(|r| &r.kind == b"chap" && r.streams.contains(&stream))
+    })
 }
 
 /// Resolve which `(input_index, stream_index)` pairs go to the output, in

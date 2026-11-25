@@ -13,10 +13,15 @@
 pub mod aac;
 pub mod av1;
 pub mod avc;
+pub mod chapter;
 pub mod flac;
+mod group;
 pub mod hvc;
 pub mod nal;
 pub mod time;
+
+pub use chapter::Chapter;
+pub use group::{SampleGroupRun, SampleGrouping, TrackReference};
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, Write};
@@ -332,6 +337,35 @@ pub trait Demuxer: Send {
     fn stream_metadata(&self, _index: usize) -> Option<&Dictionary> {
         None
     }
+
+    /// The file's chapters, in stored order: the QuickTime chapter text track
+    /// or Nero `chpl` of MP4/MOV, the default edition of Matroska
+    /// `Chapters`. Available after [`read_header`](Demuxer::read_header);
+    /// empty when the file has none, and from demuxers that read none (the
+    /// default).
+    fn chapters(&self) -> &[Chapter] {
+        &[]
+    }
+
+    /// Also hand out the container's timecode tracks (MP4/MOV `tmcd`) as
+    /// data streams of their own: codec [`CodecId::None`], `codec_tag`
+    /// `tmcd`, the sample description as `extradata`, the stored timecode
+    /// samples as packets, and the streams they time naming them in
+    /// [`track_references`](Demuxer::track_references). They come **after**
+    /// every other stream, so no other stream's index changes, and
+    /// [`Stream::timecode`] stays as it is without this. Call it before
+    /// [`read_header`](Demuxer::read_header). Off unless asked for; returns
+    /// whether the demuxer can (the default cannot).
+    fn set_timecode_streams(&mut self, _on: bool) -> bool {
+        false
+    }
+
+    /// What stream `index` refers to (MP4 `tref`), as far as the targets are
+    /// streams this demuxer gives. Available after
+    /// [`read_header`](Demuxer::read_header); empty by default.
+    fn track_references(&self, _index: usize) -> &[TrackReference] {
+        &[]
+    }
 }
 
 /// One sample (packet) of a stream as the container's index records it.
@@ -428,6 +462,14 @@ pub trait SampleIndex {
         self.read_sample(stream, index)
     }
 
+    /// The stream's sample groups (MP4 `sbgp`/`sgpd`, in the movie and in
+    /// fragments), numbered as
+    /// [`raw_sample_info`](SampleIndex::raw_sample_info) numbers samples.
+    /// Empty when it has none, or the container has no such thing.
+    fn sample_groups(&self, _stream: usize) -> &[SampleGrouping] {
+        &[]
+    }
+
     /// A shareable, `&self` view of this index for reading samples from
     /// several places at once (an editor's media pool): cheap to clone (an
     /// `Arc`), `Send + Sync`, and independent of this demuxer's
@@ -463,6 +505,9 @@ pub trait SampleSource: Send + Sync {
     }
     fn read_raw_sample(&self, stream: usize, index: u64) -> Result<Packet> {
         self.read_sample(stream, index)
+    }
+    fn sample_groups(&self, _stream: usize) -> &[SampleGrouping] {
+        &[]
     }
 }
 
@@ -561,6 +606,23 @@ pub trait Muxer: Send {
     /// [`write_trailer`](Muxer::write_trailer). Returns whether the container
     /// has edit lists; the default has none.
     fn set_edit_list(&mut self, _stream: usize, _edits: &[EditEntry]) -> bool {
+        false
+    }
+
+    /// Write `chapters` into the container. Called before
+    /// [`write_header`](Muxer::write_header). Returns whether the container
+    /// carries chapters; the default does not.
+    fn set_chapters(&mut self, _chapters: &[Chapter]) -> bool {
+        false
+    }
+
+    /// Write `references` as what output stream `stream` refers to (MP4
+    /// `tref`), replacing any set before. A `tmcd` reference to a timecode
+    /// stream is written instead of the timecode track the muxer would make
+    /// from [`Stream::timecode`]. Called before
+    /// [`write_trailer`](Muxer::write_trailer). Returns whether the container
+    /// has track references; the default does not.
+    fn set_track_references(&mut self, _stream: usize, _references: &[TrackReference]) -> bool {
         false
     }
 

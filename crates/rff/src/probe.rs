@@ -8,6 +8,7 @@ use std::io::Read;
 use std::path::Path;
 
 use rff_core::{CodecId, Dictionary, Error, MediaType, Rational, Result};
+use rff_format::Chapter;
 
 use crate::Engine;
 
@@ -53,6 +54,15 @@ pub fn probe_with_metadata(
     engine: &Engine,
     path: impl AsRef<Path>,
 ) -> Result<(MediaInfo, Vec<Dictionary>)> {
+    probe_with_chapters(engine, path).map(|(info, tags, _)| (info, tags))
+}
+
+/// [`probe_with_metadata`], plus the file's chapters
+/// ([`Demuxer::chapters`](rff_format::Demuxer::chapters)).
+pub fn probe_with_chapters(
+    engine: &Engine,
+    path: impl AsRef<Path>,
+) -> Result<(MediaInfo, Vec<Dictionary>, Vec<Chapter>)> {
     let path = path.as_ref();
     let path_str = path
         .to_str()
@@ -84,6 +94,7 @@ pub fn probe_with_metadata(
             streams,
         },
         metadata,
+        demuxer.chapters().to_vec(),
     ))
 }
 
