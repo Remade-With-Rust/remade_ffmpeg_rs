@@ -469,7 +469,7 @@ fn convert_image(
             return None;
         }
     } else {
-        let (kind, size) = crate::image::load_href(fe.attribute(AId::Href)?, state.opt)?;
+        let (kind, size) = cache.load_image(fe.attribute(AId::Href)?, state.opt)?;
         place_image(
             kind,
             true,

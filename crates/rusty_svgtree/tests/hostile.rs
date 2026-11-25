@@ -128,7 +128,14 @@ fn pattern_self_reference() {
 #[test]
 fn huge_dimensions_error() {
     let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1000000000" height="1000000000"><rect width="10" height="10"/></svg>"#;
-    assert_eq!(run(svg).err(), Some(Error::InvalidSize));
+    // Nothing is allocated for a document's size: it is an error only past a
+    // limit the caller sets.
+    assert!(run(svg).is_ok());
+    let opt = Options {
+        max_canvas_pixels: 1 << 28,
+        ..Options::default()
+    };
+    assert_eq!(run_with(svg, &opt).err(), Some(Error::InvalidSize));
     let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1e40" height="10"/>"#;
     assert!(run(svg).is_err());
     let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="-5" height="10"/>"#;
@@ -697,4 +704,243 @@ fn filter_external_references_are_not_followed() {
         assert!(p.data().chunks_exact(4).all(|c| c[0] == 0), "{href}");
     }
     let _ = std::fs::remove_file(&dir);
+}
+
+// ------------------------------------------------------------- nesting --
+
+/// Runs `f` on a thread with a 1 MiB stack (a Windows main thread's) in
+/// release; debug frames are several times as large.
+fn on_small_stack(f: impl FnOnce() + Send + 'static) {
+    let size = if cfg!(debug_assertions) { 8 } else { 1 } << 20;
+    std::thread::Builder::new()
+        .stack_size(size)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn wrap(open: &str, close: &str, n: usize, inner: &str) -> String {
+    format!("{}{inner}{}", open.repeat(n), close.repeat(n))
+}
+
+#[test]
+fn deep_legal_nesting_renders() {
+    on_small_stack(|| {
+        for open in [
+            "<g>",
+            r#"<g opacity=".999">"#,
+            r#"<g transform="translate(0 .01)">"#,
+        ] {
+            let svg = doc(&wrap(
+                open,
+                "</g>",
+                1000,
+                r#"<rect width="90" height="90"/>"#,
+            ));
+            let r = run(&svg);
+            assert!(r.is_ok(), "{open}: {:?}", r.err());
+        }
+        for open in ["<svg>", r#"<a><switch>"#] {
+            let close = if open == "<svg>" {
+                "</svg>"
+            } else {
+                "</switch></a>"
+            };
+            for n in [200, 250, 1000, 100_000] {
+                let _ = run(&doc(&wrap(
+                    open,
+                    close,
+                    n,
+                    r#"<rect width="9" height="9"/>"#,
+                )));
+            }
+        }
+    });
+}
+
+#[test]
+fn deep_content_behind_every_reference() {
+    // Each of 40 masks (clip paths, patterns, filters) holds 1000 nested
+    // groups with the reference to the next at the bottom.
+    on_small_stack(|| {
+        for kind in ["mask", "clipPath", "pattern", "marker", "filter"] {
+            let mut body = String::new();
+            for i in 0..40 {
+                let reference = match kind {
+                    "mask" => format!(r#"mask="url(#m{})""#, i + 1),
+                    "clipPath" => format!(r#"clip-path="url(#m{})""#, i + 1),
+                    "pattern" => format!(r#"fill="url(#m{})""#, i + 1),
+                    "marker" => format!(r#"marker-end="url(#m{})""#, i + 1),
+                    _ => format!(r#"filter="url(#m{})""#, i + 1),
+                };
+                let content = wrap(
+                    "<g>",
+                    "</g>",
+                    1000,
+                    &format!(r#"<path d="M0 0L9 0 9 9z" {reference}/>"#),
+                );
+                body.push_str(&if kind == "filter" {
+                    format!(
+                        r##"<filter id="m{i}" filterUnits="userSpaceOnUse" x="0" y="0" width="9" height="9"><feImage href="#e{i}"/></filter><g id="e{i}">{content}</g>"##
+                    )
+                } else if kind == "pattern" {
+                    format!(
+                        r#"<pattern id="m{i}" patternUnits="userSpaceOnUse" width="9" height="9">{content}</pattern>"#
+                    )
+                } else {
+                    format!(r#"<{kind} id="m{i}">{content}</{kind}>"#)
+                });
+            }
+            body.push_str(r##"<path d="M0 0L9 0 9 9z" @/>"##);
+            let first = match kind {
+                "mask" => r#"mask="url(#m0)""#,
+                "clipPath" => r#"clip-path="url(#m0)""#,
+                "pattern" => r#"fill="url(#m0)""#,
+                "marker" => r#"marker-end="url(#m0)""#,
+                _ => r#"filter="url(#m0)""#,
+            };
+            let body = body.replace('@', first);
+            let opt = Options {
+                max_nodes: 100_000,
+                max_filter_work: 1 << 28,
+                ..Options::default()
+            };
+            let _ = run_with(&doc(&body), &opt);
+        }
+    });
+}
+
+// ------------------------------------------------------- nested images --
+
+fn data_svg(svg: &str) -> String {
+    // Percent-encoded, so that a level costs little more than its content.
+    let mut out = String::from("data:image/svg+xml,");
+    for c in svg.bytes() {
+        match c {
+            b'%' | b'"' | b'<' | b'&' | b'#' => out.push_str(&format!("%{c:02x}")),
+            _ => out.push(c as char),
+        }
+    }
+    out
+}
+
+const NS: &str = r#"xmlns="http://www.w3.org/2000/svg" width="20" height="20""#;
+
+#[test]
+fn nested_documents_stop_at_a_depth() {
+    let mut svg = format!(r#"<svg {NS}><rect width="9" height="9"/></svg>"#);
+    for _ in 0..11 {
+        svg = format!(
+            r#"<svg {NS}><image width="20" height="20" href="{}"/></svg>"#,
+            data_svg(&svg)
+        );
+        assert!(svg.len() < 10 << 20);
+    }
+    let tree = run(svg.as_bytes()).unwrap();
+    assert_eq!(tree.skipped().images, 0);
+    // The innermost tree reports what it left out.
+    fn missing(tree: &Tree) -> bool {
+        fn group(g: &rusty_svgtree::Group) -> bool {
+            g.children().iter().any(|n| match n {
+                rusty_svgtree::Node::Group(g) => group(g),
+                rusty_svgtree::Node::Image(i) => match i.kind() {
+                    rusty_svgtree::ImageKind::Svg(t) => missing(t),
+                    _ => false,
+                },
+                _ => false,
+            })
+        }
+        tree.skipped().images > 0 || group(tree.root())
+    }
+    assert!(missing(&tree));
+}
+
+#[test]
+fn nested_documents_share_the_node_limit() {
+    // Each of 400 documents expands to some 40,000 elements.
+    let mut bomb = format!(r#"<svg {NS}><g id="a0"><rect width="9" height="9"/></g>"#);
+    for i in 1..13 {
+        bomb.push_str(&format!(
+            r##"<g id="a{i}"><use href="#a{p}"/><use href="#a{p}"/></g>"##,
+            p = i - 1
+        ));
+    }
+    bomb.push_str("</svg>");
+    let mut body = String::new();
+    for i in 0..400 {
+        // Different text each time: nothing is shared.
+        let svg = data_svg(&bomb.replace("<svg ", &format!(r#"<svg id="n{i}" "#)));
+        body.push_str(&format!(r#"<image width="9" height="9" href="{svg}"/>"#));
+    }
+    let start = std::time::Instant::now();
+    let tree = run(&doc(&body)).unwrap();
+    assert!(tree.skipped().images > 300, "{:?}", tree.skipped());
+    assert!(start.elapsed().as_secs() < 60, "{:?}", start.elapsed());
+}
+
+#[test]
+fn nested_document_used_many_times() {
+    let mut inner = format!(r#"<svg {NS}>"#);
+    for _ in 0..5000 {
+        inner.push_str(r#"<path d="M0 0h1"/>"#);
+    }
+    inner.push_str("</svg>");
+    let mut body = format!(
+        r#"<image id="i" width="9" height="9" href="{}"/>"#,
+        data_svg(&inner)
+    );
+    for _ in 0..20_000 {
+        body.push_str(r##"<use href="#i"/>"##);
+    }
+    let opt = Options {
+        max_nodes: 100_000,
+        ..Options::default()
+    };
+    let start = std::time::Instant::now();
+    let tree = run_with(&doc(&body), &opt).unwrap();
+    assert!(tree.skipped().images > 0);
+    assert!(start.elapsed().as_secs() < 60, "{:?}", start.elapsed());
+}
+
+#[test]
+fn nested_documents_have_no_access_either() {
+    let inner = format!(
+        r#"<svg {NS}><image width="20" height="20" href="/etc/hostname.png"/><image width="20" height="20" href="file:///C:/Windows/Web/Screen/img100.jpg"/></svg>"#
+    );
+    let svg = doc(&format!(
+        r#"<image width="9" height="9" href="{}"/>"#,
+        data_svg(&inner)
+    ));
+    let tree = run(&svg).unwrap();
+    let mut p = Pixmap::new(100, 100).unwrap();
+    rusty_svgtree::render(&tree, Transform::identity(), &mut p.as_mut());
+    assert!(p.data().iter().all(|b| *b == 0));
+}
+
+#[cfg(feature = "svgz")]
+#[test]
+fn svgz_bomb_is_an_error() {
+    let svg = format!(r#"<svg {NS}>{}</svg>"#, " ".repeat(8 << 20));
+    let mut gz = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
+    gz.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(svg.as_bytes(), 6));
+    gz.extend_from_slice(&[0; 8]);
+    let opt = Options {
+        max_svgz_bytes: 1 << 20,
+        ..Options::default()
+    };
+    assert_eq!(run_with(&gz, &opt).err(), Some(Error::MalformedGzip));
+    // A wrong checksum is an error as well.
+    assert_eq!(run(&gz).err(), Some(Error::MalformedGzip));
+}
+
+#[test]
+fn broken_images_are_reported() {
+    let svg = doc(
+        r#"<image href="data:image/gif;base64,R0lGODlh//8=" width="9" height="9"/><image href="data:image/webp;base64,UklGRg==" width="9" height="9"/><image href="x.png" width="9" height="9"/><text>a</text>"#,
+    );
+    let tree = run(&svg).unwrap();
+    assert_eq!(tree.skipped().images, 3);
+    assert_eq!(tree.skipped().text, 1);
+    assert!(run(&doc("<rect/>")).unwrap().skipped().is_empty());
 }
