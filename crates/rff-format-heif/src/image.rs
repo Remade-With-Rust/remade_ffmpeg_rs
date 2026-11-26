@@ -276,11 +276,16 @@ impl Image {
             }
             out
         } else {
-            let mut out = Vec::with_capacity(n * 2);
+            // Sized once and written in place: a two-byte `extend` per sample
+            // re-checked the capacity every time and never vectorised.
+            let mut out = vec![0u8; n * 2];
+            let mut rest = out.as_mut_slice();
             for p in &self.planes {
-                for &v in &p.data {
-                    out.extend_from_slice(&v.to_le_bytes());
+                let (dst, tail) = rest.split_at_mut(p.data.len() * 2);
+                for (o, &v) in dst.chunks_exact_mut(2).zip(&p.data) {
+                    o.copy_from_slice(&v.to_le_bytes());
                 }
+                rest = tail;
             }
             out
         }
@@ -504,6 +509,37 @@ mod tests {
                         rotate_quarter_naive(&p.data, w as usize, h as usize, q),
                         "{w}x{h} q{q} threads {threads}"
                     );
+                }
+            }
+        }
+    }
+
+    /// The packing against the per-sample loop it replaced, at every depth
+    /// it distinguishes, odd sizes, and full-range sample values.
+    #[test]
+    fn planar_bytes_match_per_sample_packing() {
+        let mut s = 0x7f4a_7c15u32;
+        for (w, h) in [(1, 1), (3, 5), (17, 9), (64, 33)] {
+            for chroma in [Chroma::Yuv420, Chroma::Yuv444, Chroma::Monochrome] {
+                for bd in [8u8, 10, 12] {
+                    let mut img = Image::blank(w, h, chroma, bd);
+                    for p in &mut img.planes {
+                        for v in &mut p.data {
+                            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                            *v = (s >> 16) as u16;
+                        }
+                    }
+                    let mut want = Vec::new();
+                    for p in &img.planes {
+                        for &v in &p.data {
+                            if bd <= 8 {
+                                want.push(v as u8);
+                            } else {
+                                want.extend_from_slice(&v.to_le_bytes());
+                            }
+                        }
+                    }
+                    assert_eq!(img.to_planar_bytes(), want, "{w}x{h} {chroma:?} {bd}");
                 }
             }
         }
