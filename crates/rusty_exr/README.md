@@ -51,14 +51,27 @@ smaller files, with different bytes.
 
 Measured against OpenEXR C++ 3.5.5 and `exr` 1.74.2 on x86-64 Linux, each
 single-threaded (pinned to one core) and with 24 threads, decoding into
-planes in memory. Single-thread decode: RLE 2.1x faster than OpenEXR, PIZ on
-64x64 tiles 1.3x faster, ZIP/PIZ 1.12-1.19x slower, PXR24 1.34-1.41x slower;
-1.1-4.5x faster than `exr` except ZIP (within ~1.2x). The remaining decode
-gap is inflate itself: OpenEXR uses libdeflate, this crate pure-Rust
-zlib-rs. Encode with the default (exr-compatible) deflate runs at `exr`'s
-speed and about 2x behind OpenEXR on ZIP/PXR24, PIZ 1.2x behind; RLE and
-uncompressed are faster than both. The PR that introduced the crate has
-the per-file tables and method.
+planes in memory; the medians below come from a shared machine whose
+same-binary noise floor was up to about 10% per row.
+
+- **Decode, one thread:** RLE about 2.1x faster than OpenEXR and PIZ on
+  64x64 tiles 1.3x faster; uncompressed at parity; ZIP and PIZ 1.12-1.29x
+  slower; PXR24 1.3-1.6x slower. Against `exr`: PIZ 1.7-4.5x faster, RLE,
+  PXR24 and uncompressed 1.1-1.2x faster, ZIP within about 1.2x.
+- **Decode, 24 threads:** tiled files 1.6-4.6x faster than OpenEXR, 4K
+  scanline RLE and uncompressed 3-4x faster, 4K ZIP/PIZ within 1.1x, 4K
+  PXR24 1.25x, multi-layer float 1.3-1.7x and the small image 1.8-1.9x
+  slower; faster than `exr` on all but uncompressed.
+- **Encode:** with the default exr-compatible deflate, ZIP and PXR24 run at
+  `exr`'s speed and about 2x behind OpenEXR; with `Deflate::Fast` they are
+  within 1.03-1.3x of OpenEXR single-threaded and 1.6-2x faster than
+  `exr`. PIZ is 1.2x behind OpenEXR single-threaded; RLE and uncompressed
+  are faster than OpenEXR.
+
+What remains is mostly deflate: OpenEXR links libdeflate, this crate uses
+pure-Rust zlib-rs (inflate, and `Deflate::Fast`) and miniz_oxide (the
+exr-compatible writer). The pull request that introduced the crate has the
+per-file tables and the method.
 
 ## Safety
 
