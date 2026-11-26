@@ -6,6 +6,12 @@ each release, under **Security**. The project follows
 decoder output is stable (gated against the ISO/IEC 14496-26 conformance suite);
 encoder output may change in minor releases when quality improves.
 
+## [2.3.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_aac-v2.2.0...rusty_aac-v2.3.0) - 2026-11-26
+
+### Added
+
+- *(aac)* 20 kHz Bandwidth::Auto cutoff from 192 kbps to under 160 kbps a channel ([#229](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/229))
+
 ## [2.2.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_aac-v2.1.6...rusty_aac-v2.2.0) - 2026-11-25
 
 ### Added
