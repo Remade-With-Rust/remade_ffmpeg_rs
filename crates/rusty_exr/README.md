@@ -29,17 +29,36 @@ dependencies (`flate2` on its pure-Rust zlib-rs backend, and `miniz_oxide`).
 Decoded samples are **bit-identical to OpenEXR C++ 3.5.5** on all 85
 non-deep files of the official
 [openexr-images](https://github.com/AcademySoftwareFoundation/openexr-images)
-set and on 460 more files OpenEXR wrote in all ten compressions, scanline
-and tiled. That includes the lossy codecs: DWA's inverse DCT reproduces the
-operation order of OpenEXR's AVX routine, and B44/DWA use OpenEXR's own
-transfer tables.
+set, on 460 more files OpenEXR wrote in all ten compressions (scanline,
+64x64 and 37x19 tiles; half, float and uint; subsampled), and on 48 files
+the `exr` crate wrote, its B44/B44A/DWAA/DWAB output included. That covers
+the lossy codecs: DWA's inverse DCT reproduces the operation order of
+OpenEXR's AVX routine, and B44/DWA use OpenEXR's own transfer tables.
 
 ## What it writes
 
 Single-part scanline files with None, RLE, ZIPS, ZIP, PIZ or PXR24
 compression; HALF, FLOAT and UINT channels; any channel names (sorted for
-you, as the format requires); your header attributes. Files are
-**byte-identical to the `exr` crate's** for the same image and settings.
+you, as the format requires); your header attributes. By default files are
+**byte-identical to the `exr` crate's** for the same image and settings
+(the one exception: for channel names longer than 31 bytes this crate sets
+the long-names flag the format requires and `exr` leaves clear).
+`EncodeOptions { deflate: Deflate::Fast, .. }` swaps miniz_oxide for
+zlib-rs on ZIP/ZIPS/PXR24: about twice the deflate speed and slightly
+smaller files, with different bytes.
+
+## Speed
+
+Measured against OpenEXR C++ 3.5.5 and `exr` 1.74.2 on x86-64 Linux, each
+single-threaded (pinned to one core) and with 24 threads, decoding into
+planes in memory. Single-thread decode: RLE 2.1x faster than OpenEXR, PIZ on
+64x64 tiles 1.3x faster, ZIP/PIZ 1.12-1.19x slower, PXR24 1.34-1.41x slower;
+1.1-4.5x faster than `exr` except ZIP (within ~1.2x). The remaining decode
+gap is inflate itself: OpenEXR uses libdeflate, this crate pure-Rust
+zlib-rs. Encode with the default (exr-compatible) deflate runs at `exr`'s
+speed and about 2x behind OpenEXR on ZIP/PXR24, PIZ 1.2x behind; RLE and
+uncompressed are faster than both. The PR that introduced the crate has
+the per-file tables and method.
 
 ## Safety
 

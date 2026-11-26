@@ -343,18 +343,7 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
         compression::compress(comp, &geom, raw, opts.deflate)
     };
 
-    // Below about 1 MiB of input per worker a thread costs more than it
-    // saves.
-    let image_bytes: usize = channels
-        .iter()
-        .map(|c| c.samples.len() * c.desc.sample_type.bytes())
-        .sum();
-    let nthreads = opts
-        .threads
-        .resolve()
-        .min(nchunks)
-        .min(image_bytes >> 20)
-        .max(1);
+    let nthreads = opts.threads.resolve().min(nchunks).max(1);
     let mut packed: Vec<Option<Vec<u8>>> = vec![None; nchunks];
     if nthreads == 1 {
         for (i, slot) in packed.iter_mut().enumerate() {

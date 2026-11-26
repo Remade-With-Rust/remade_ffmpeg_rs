@@ -788,14 +788,7 @@ impl<'a> Decoder<'a> {
             })
             .collect();
 
-        // A worker costs a thread spawn and its own scratch; below about
-        // 1 MiB of output per worker that costs more than it saves.
-        let nthreads = self
-            .threads
-            .resolve()
-            .min(tasks.len())
-            .min(usize::try_from(total >> 20).unwrap_or(usize::MAX))
-            .max(1);
+        let nthreads = self.threads.resolve().min(tasks.len()).max(1);
         let errors: std::sync::Mutex<Vec<(usize, Error)>> = std::sync::Mutex::new(Vec::new());
         let queue = std::sync::Mutex::new(tasks.into_iter());
         let work = || {
