@@ -159,6 +159,11 @@ fn rotate_quarter(src: &[u16], w: usize, h: usize, q: u8, threads: usize) -> Vec
     // Output rows `rows` x columns `cols` the sample at a time, into `out`
     // (whose first row is output row `y0`).
     let scalar = |y0: usize, out: &mut [u16], rows: (usize, usize), cols: (usize, usize)| {
+        // Most blocks have no ragged strip: an empty column range must not
+        // still walk (and bounds-check) every row.
+        if cols.0 == cols.1 {
+            return;
+        }
         for r in rows.0..rows.1 {
             let yn = y0 + r;
             let o = &mut out[r * nw + cols.0..r * nw + cols.1];
