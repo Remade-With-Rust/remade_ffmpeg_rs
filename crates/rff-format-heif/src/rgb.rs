@@ -7,8 +7,10 @@
 //!
 //! [`to_rgba8_scalar`] is the definition: one pixel at a time, in f32. On a
 //! CPU with AVX2, [`to_rgba8`] runs the same operations eight pixels at a
-//! time (`simd::rgba_row`) and finishes each row's last `width % 8` pixels
-//! with the scalar [`Conv::pixel`]; the output is byte-identical.
+//! time (`simd::rgba_row`; for 4:2:0, the chroma terms once per chroma row
+//! with `simd::chroma_terms`, shared by its two luma rows) and finishes each
+//! row's last `width % 8` pixels with the scalar [`Conv::pixel`]; the output
+//! is byte-identical.
 
 use crate::image::{Chroma, Image};
 use crate::simd::{self, RgbConsts, RgbMode};
@@ -137,6 +139,14 @@ pub(crate) fn to_rgba8(img: &Image, alpha: Option<&Alpha>, nclx: Option<Nclx>) -
     let (sx, sy) = img.chroma.shift();
     let n = w / 8 * 8;
     let mut out = vec![0u8; w * h * 4];
+    // When rows share a chroma row (4:2:0), its terms are computed once.
+    let share = sy == 1 && !conv.mono;
+    let (mut tr, mut tb) = if share {
+        (vec![0f32; n], vec![0f32; n])
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let mut terms_row = None;
     for (y, o) in out.chunks_exact_mut(w * 4).enumerate() {
         let yr = img.planes[0].row(y as u32);
         let (cbr, crr) = if conv.mono {
@@ -148,7 +158,15 @@ pub(crate) fn to_rgba8(img: &Image, alpha: Option<&Alpha>, nclx: Option<Nclx>) -
             )
         };
         let ar = alpha.map(|a| a.plane.row(y as u32));
-        simd::rgba_row(&consts, mode, sx, yr, cbr, crr, ar, o, n);
+        if share {
+            if terms_row != Some(y >> sy) {
+                simd::chroma_terms(&consts, mode, sx, cbr, crr, &mut tr, &mut tb, n);
+                terms_row = Some(y >> sy);
+            }
+            simd::rgba_row_terms(&consts, mode, yr, &tr, &tb, ar, o, n);
+        } else {
+            simd::rgba_row(&consts, mode, sx, yr, cbr, crr, ar, o, n);
+        }
         for x in n..w {
             let cx = x >> sx;
             o[x * 4..x * 4 + 4].copy_from_slice(&conv.pixel(
@@ -324,6 +342,41 @@ mod tests {
         // The default profile, the two commonest coded matrices at limited
         // range, and identity (GBR). 2^24 pixels each.
         for (matrix, full_range) in [(6u16, true), (1, false), (9, false), (0, true)] {
+            let nclx = Some(Nclx {
+                primaries: 1,
+                transfer: 1,
+                matrix,
+                full_range,
+            });
+            assert!(
+                to_rgba8(&img, None, nclx) == to_rgba8_scalar(&img, None, nclx),
+                "matrix {matrix} full {full_range}"
+            );
+        }
+    }
+
+    /// Every 8-bit triple again, through the 4:2:0 path (chroma terms
+    /// computed once per chroma row and shared by two luma rows), which the
+    /// 4:4:4 test above never enters. Chroma `(x, y)` holds `(Cb, Cr) =
+    /// (x & 255, y & 255)`, repeated in 64 tiles; the 2x2 luma quad over a
+    /// chroma sample in tile `t` holds `4t .. 4t + 3`, so the 64 tiles cover
+    /// all 256 luma values for every chroma pair.
+    #[test]
+    fn simd_matches_scalar_every_8bit_triple_420() {
+        if !simd::rgba_simd_available() {
+            return;
+        }
+        let mut img = Image::blank(4096, 4096, Chroma::Yuv420, 8);
+        let tile = |cx: usize, cy: usize| (cx >> 8) + 8 * (cy >> 8);
+        for (i, v) in img.planes[0].data.iter_mut().enumerate() {
+            let (x, y) = (i % 4096, i / 4096);
+            *v = (4 * tile(x >> 1, y >> 1) + (x & 1) + 2 * (y & 1)) as u16;
+        }
+        let (lo, hi) = img.planes.split_at_mut(2);
+        for (i, (cb, cr)) in lo[1].data.iter_mut().zip(hi[0].data.iter_mut()).enumerate() {
+            (*cb, *cr) = ((i % 2048 & 255) as u16, (i / 2048 & 255) as u16);
+        }
+        for (matrix, full_range) in [(6u16, true), (1, false), (0, true)] {
             let nclx = Some(Nclx {
                 primaries: 1,
                 transfer: 1,

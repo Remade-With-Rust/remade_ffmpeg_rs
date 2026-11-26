@@ -199,6 +199,98 @@ pub(crate) fn rgba_row(
     }
 }
 
+/// The chroma half of [`rgba_row`] for one chroma row, widened to `n`
+/// luma columns (`n` a multiple of 8): `tr[x]`/`tb[x]` are the terms the
+/// kernel adds to luma for red and blue -- `2(1-kr) cr'` and `2(1-kb) cb'`
+/// for [`RgbMode::Matrix`], `cr' + 0.5` and `cb' + 0.5` for
+/// [`RgbMode::Identity`], where `c' = (c - mid) * c_scale` -- each formed
+/// with the operations [`rgba_row`] uses. In 4:2:0 two luma rows share a
+/// chroma row, so computing these once per chroma row and handing them to
+/// [`rgba_row_terms`] does that work once instead of twice.
+///
+/// Call only when [`rgba_simd_available`] is true; not for mono.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn chroma_terms(
+    c: &RgbConsts,
+    mode: RgbMode,
+    sx: u32,
+    cb: &[u16],
+    cr: &[u16],
+    tr: &mut [f32],
+    tb: &mut [f32],
+    n: usize,
+) {
+    assert!(n % 8 == 0 && sx <= 1 && mode != RgbMode::Mono);
+    assert!(cb.len() >= n >> sx && cr.len() >= n >> sx && tr.len() >= n && tb.len() >= n);
+    assert!(rgba_simd_available());
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (cbp, crp, trp, tbp) = (cb.as_ptr(), cr.as_ptr(), tr.as_mut_ptr(), tb.as_mut_ptr());
+        // SAFETY: AVX2 is present (asserted). Group `g` reads chroma
+        // `[8g >> sx, (8g >> sx) + (8 >> sx))` and writes `tr`/`tb`
+        // `[8g, 8g+8)`; with `8g + 8 <= n` all inside the asserted lengths.
+        unsafe {
+            match (mode, sx) {
+                (RgbMode::Identity, 1) => x86::chroma_terms_avx2::<1, 1>(c, cbp, crp, trp, tbp, n),
+                (RgbMode::Identity, _) => x86::chroma_terms_avx2::<1, 0>(c, cbp, crp, trp, tbp, n),
+                (_, 1) => x86::chroma_terms_avx2::<0, 1>(c, cbp, crp, trp, tbp, n),
+                (_, _) => x86::chroma_terms_avx2::<0, 0>(c, cbp, crp, trp, tbp, n),
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (c, cb, cr, tr, tb);
+        unreachable!("rgba_simd_available() is false off x86_64");
+    }
+}
+
+/// [`rgba_row`] with the chroma terms already computed by
+/// [`chroma_terms`]; same output. Not for mono.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rgba_row_terms(
+    c: &RgbConsts,
+    mode: RgbMode,
+    y: &[u16],
+    tr: &[f32],
+    tb: &[f32],
+    alpha: Option<&[u16]>,
+    out: &mut [u8],
+    n: usize,
+) {
+    assert!(n % 8 == 0 && mode != RgbMode::Mono);
+    assert!(y.len() >= n && tr.len() >= n && tb.len() >= n && out.len() >= 4 * n);
+    if let Some(a) = alpha {
+        assert!(a.len() >= n);
+    }
+    assert!(rgba_simd_available());
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (yp, trp, tbp, op) = (y.as_ptr(), tr.as_ptr(), tb.as_ptr(), out.as_mut_ptr());
+        let ap = alpha.map(|a| a.as_ptr());
+        // SAFETY: AVX2 is present (asserted). Group `g` reads luma, alpha,
+        // `tr` and `tb` `[8g, 8g+8)` and writes `out[32g..32g+32]`; with
+        // `8g + 8 <= n` all inside the asserted lengths.
+        unsafe {
+            match (mode, ap) {
+                (RgbMode::Identity, None) => {
+                    x86::rgba_terms_avx2::<1, false>(c, yp, trp, tbp, yp, op, n)
+                }
+                (RgbMode::Identity, Some(a)) => {
+                    x86::rgba_terms_avx2::<1, true>(c, yp, trp, tbp, a, op, n)
+                }
+                (_, None) => x86::rgba_terms_avx2::<0, false>(c, yp, trp, tbp, yp, op, n),
+                (_, Some(a)) => x86::rgba_terms_avx2::<0, true>(c, yp, trp, tbp, a, op, n),
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (c, y, tr, tb, out);
+        unreachable!("rgba_simd_available() is false off x86_64");
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use std::arch::x86_64::*;
@@ -510,6 +602,107 @@ mod x86 {
                         );
                         (to8(r), to8(g), to8(b))
                     }
+                };
+                let av = if ALPHA {
+                    let v = _mm256_cvtepu16_epi32(_mm_loadu_si128(a.add(x) as *const __m128i));
+                    let num = _mm256_add_epi32(_mm256_mullo_epi32(v, a255), ahalf);
+                    let q = _mm256_cvttps_epi32(_mm256_div_ps(_mm256_cvtepi32_ps(num), amax));
+                    _mm256_slli_epi32(q, 24)
+                } else {
+                    opaque
+                };
+                let px = _mm256_or_si256(
+                    _mm256_or_si256(r, _mm256_slli_epi32(gg, 8)),
+                    _mm256_or_si256(_mm256_slli_epi32(b, 16), av),
+                );
+                _mm256_storeu_si256(out.add(x * 4) as *mut __m256i, px);
+            }
+        }
+    }
+
+    /// See [`super::chroma_terms`]. `MODE`: 0 matrix, 1 identity.
+    ///
+    /// # Safety
+    /// AVX2; the bounds documented at the call site in `chroma_terms`.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn chroma_terms_avx2<const MODE: u8, const SX: u32>(
+        c: &RgbConsts,
+        cb: *const u16,
+        cr: *const u16,
+        tr: *mut f32,
+        tb: *mut f32,
+        n: usize,
+    ) {
+        unsafe {
+            let c_scale = _mm256_set1_ps(c.c_scale);
+            let mid = _mm256_set1_ps(c.mid);
+            let kcr = _mm256_set1_ps(c.kcr);
+            let kcb = _mm256_set1_ps(c.kcb);
+            let half = _mm256_set1_ps(0.5);
+            for g in 0..n / 8 {
+                let x = g * 8;
+                let (cbv, crv) = if SX == 1 {
+                    (load4x2_f32(cb.add(x / 2)), load4x2_f32(cr.add(x / 2)))
+                } else {
+                    (load8_f32(cb.add(x)), load8_f32(cr.add(x)))
+                };
+                let cbv = _mm256_mul_ps(_mm256_sub_ps(cbv, mid), c_scale);
+                let crv = _mm256_mul_ps(_mm256_sub_ps(crv, mid), c_scale);
+                let (r, b) = if MODE == 1 {
+                    (_mm256_add_ps(crv, half), _mm256_add_ps(cbv, half))
+                } else {
+                    (_mm256_mul_ps(kcr, crv), _mm256_mul_ps(kcb, cbv))
+                };
+                _mm256_storeu_ps(tr.add(x), r);
+                _mm256_storeu_ps(tb.add(x), b);
+            }
+        }
+    }
+
+    /// See [`super::rgba_row_terms`]: [`rgba_avx2`] with the chroma terms
+    /// loaded instead of computed. `MODE`: 0 matrix, 1 identity.
+    ///
+    /// # Safety
+    /// AVX2; the bounds documented at the call site in `rgba_row_terms`.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn rgba_terms_avx2<const MODE: u8, const ALPHA: bool>(
+        c: &RgbConsts,
+        y: *const u16,
+        tr: *const f32,
+        tb: *const f32,
+        a: *const u16,
+        out: *mut u8,
+        n: usize,
+    ) {
+        unsafe {
+            let y_off = _mm256_set1_ps(c.y_off);
+            let y_scale = _mm256_set1_ps(c.y_scale);
+            let kr = _mm256_set1_ps(c.kr);
+            let kb = _mm256_set1_ps(c.kb);
+            let kd = _mm256_set1_ps(c.kd);
+            let a255 = _mm256_set1_epi32(255);
+            let ahalf = _mm256_set1_epi32((c.amax / 2) as i32);
+            let amax = _mm256_set1_ps(c.amax as f32);
+            let opaque = _mm256_set1_epi32(255 << 24);
+            for g in 0..n / 8 {
+                let x = g * 8;
+                let yv = _mm256_mul_ps(_mm256_sub_ps(load8_f32(y.add(x)), y_off), y_scale);
+                let trv = _mm256_loadu_ps(tr.add(x));
+                let tbv = _mm256_loadu_ps(tb.add(x));
+                let (r, gg, b) = if MODE == 1 {
+                    (to8(trv), to8(yv), to8(tbv))
+                } else {
+                    let r = _mm256_add_ps(yv, trv);
+                    let b = _mm256_add_ps(yv, tbv);
+                    let g = _mm256_div_ps(
+                        _mm256_sub_ps(
+                            _mm256_sub_ps(yv, _mm256_mul_ps(kr, r)),
+                            _mm256_mul_ps(kb, b),
+                        ),
+                        kd,
+                    );
+                    (to8(r), to8(g), to8(b))
                 };
                 let av = if ALPHA {
                     let v = _mm256_cvtepu16_epi32(_mm_loadu_si128(a.add(x) as *const __m128i));
