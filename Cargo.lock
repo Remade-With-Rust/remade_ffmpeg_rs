@@ -6031,7 +6031,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_h265"
-version = "0.7.1"
+version = "0.7.3"
 dependencies = [
  "rusty_alloc-api",
  "rusty_h265-accel",
@@ -6039,7 +6039,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_h265-accel"
-version = "0.7.1"
+version = "0.7.3"
 
 [[package]]
 name = "rusty_icc"
