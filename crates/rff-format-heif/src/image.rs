@@ -99,15 +99,13 @@ impl Plane {
         let src = &self.data;
         match quarters & 3 {
             0 => self.clone(),
-            2 => {
-                let mut data = src.clone();
-                data.reverse();
-                Plane {
-                    width: self.width,
-                    height: self.height,
-                    data,
-                }
-            }
+            // A half turn is the samples in reverse order: one pass, not a
+            // clone followed by an in-place reverse.
+            2 => Plane {
+                width: self.width,
+                height: self.height,
+                data: src.iter().rev().copied().collect(),
+            },
             q => Plane {
                 width: self.height,
                 height: self.width,
