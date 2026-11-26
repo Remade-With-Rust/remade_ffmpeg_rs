@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-avif-v0.9.1...rff-format-avif-v0.9.2) - 2026-11-26
+
+### Added
+
+- *(heif)* HEIF/HEIC still-image decode (rff-format-heif) ([#233](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/233))
+
 ## [0.9.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-avif-v0.8.4...rff-format-avif-v0.9.0) - 2026-11-24
 
 ### Fixed

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-heif-v0.9.1...rff-format-heif-v0.9.2) - 2026-11-26
+
+### Added
+
+- *(heif)* HEIF/HEIC still-image decode (rff-format-heif) ([#233](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/233))
+
 ### Added
 
 - HEIF/HEIC still-image decoding: `hvc1` primary images, `grid` (tiles decoded
