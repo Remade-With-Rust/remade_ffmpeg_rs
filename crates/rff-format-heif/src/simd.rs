@@ -8,7 +8,7 @@
 //!
 //! | kernel | scalar oracle | gate |
 //! |---|---|---|
-//! | [`rotate_tiles`] (SSE2) | `image::rotate_quarter_naive` | `assert_eq!` |
+//! | [`rotate_tiles`] (AVX2 runtime-detected, else SSE2) | `image::rotate_quarter_naive` | `assert_eq!` |
 //! | [`rgba_row`] (AVX2, runtime-detected) | `rgb::to_rgba8_scalar` | `assert_eq!` |
 //!
 //! Both are exact, not float-close: the rotation moves samples, and the
@@ -60,20 +60,14 @@ pub(crate) fn rotate_tiles(
         // `yn0 + 8 <= y0 + ty1 <= w`; so every load is inside
         // `src[..w * h]`. It writes rows `r0..r0+8 <= ty1` of `out`, columns
         // `xn0..xn0+8 <= nw`: inside `out[..ty1 * nw]`. All asserted above.
-        unsafe {
-            x86::rotate_tiles_sse2(
-                src.as_ptr(),
-                w,
-                h,
-                q,
-                out.as_mut_ptr(),
-                nw,
-                y0,
-                ty0,
-                ty1,
-                tx0,
-                tx1,
-            )
+        //
+        // With AVX2 the same tiles go two at a time (one per 128-bit lane);
+        // the extra feature changes nothing about which addresses are read.
+        let (sp, op) = (src.as_ptr(), out.as_mut_ptr());
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe { x86::rotate_tiles_avx2(sp, w, h, q, op, nw, y0, ty0, ty1, tx0, tx1) }
+        } else {
+            unsafe { x86::rotate_tiles_sse2(sp, w, h, q, op, nw, y0, ty0, ty1, tx0, tx1) }
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -241,6 +235,125 @@ mod x86 {
                 _mm_unpacklo_epi64(u3, u7),
                 _mm_unpackhi_epi64(u3, u7),
             ]
+        }
+    }
+
+    /// [`transpose8`] on two independent tiles at once: `vpunpck*` works
+    /// within each 128-bit lane, so tile A in the low lanes and tile B in the
+    /// high lanes transpose with the same 24 instructions.
+    #[inline(always)]
+    unsafe fn transpose8x2(a: [__m256i; 8]) -> [__m256i; 8] {
+        unsafe {
+            let t0 = _mm256_unpacklo_epi16(a[0], a[1]);
+            let t1 = _mm256_unpackhi_epi16(a[0], a[1]);
+            let t2 = _mm256_unpacklo_epi16(a[2], a[3]);
+            let t3 = _mm256_unpackhi_epi16(a[2], a[3]);
+            let t4 = _mm256_unpacklo_epi16(a[4], a[5]);
+            let t5 = _mm256_unpackhi_epi16(a[4], a[5]);
+            let t6 = _mm256_unpacklo_epi16(a[6], a[7]);
+            let t7 = _mm256_unpackhi_epi16(a[6], a[7]);
+            let u0 = _mm256_unpacklo_epi32(t0, t2);
+            let u1 = _mm256_unpackhi_epi32(t0, t2);
+            let u2 = _mm256_unpacklo_epi32(t1, t3);
+            let u3 = _mm256_unpackhi_epi32(t1, t3);
+            let u4 = _mm256_unpacklo_epi32(t4, t6);
+            let u5 = _mm256_unpackhi_epi32(t4, t6);
+            let u6 = _mm256_unpacklo_epi32(t5, t7);
+            let u7 = _mm256_unpackhi_epi32(t5, t7);
+            [
+                _mm256_unpacklo_epi64(u0, u4),
+                _mm256_unpackhi_epi64(u0, u4),
+                _mm256_unpacklo_epi64(u1, u5),
+                _mm256_unpackhi_epi64(u1, u5),
+                _mm256_unpacklo_epi64(u2, u6),
+                _mm256_unpackhi_epi64(u2, u6),
+                _mm256_unpacklo_epi64(u3, u7),
+                _mm256_unpackhi_epi64(u3, u7),
+            ]
+        }
+    }
+
+    /// [`rotate_tiles_sse2`] two vertically adjacent output tiles at a
+    /// time. Both tiles read the same eight source rows, at adjacent
+    /// 8-column spans, so one 32-byte load per row feeds both (one per
+    /// 128-bit lane) and the pair transposes in one pass of [`transpose8x2`].
+    ///
+    /// Why not leave it to SSE2: the SSE2 unpacks are destructive two-operand
+    /// forms, so the compiler adds a `movdqa` before 16 of every 24; the VEX
+    /// forms need none, and the pair halves the loads and unpacks per sample.
+    /// Why vertical and not horizontal pairs: a horizontal pair reads sixteen
+    /// source rows, and LLVM gave each row address its own induction variable
+    /// and spilled them (about 40 stack moves per pair, measured); the
+    /// vertical pair keeps the SSE2 kernel's eight. An odd last 8-row strip
+    /// goes through the SSE2 kernel.
+    ///
+    /// # Safety
+    /// AVX2, and the bounds documented at the call site in `rotate_tiles`
+    /// (a pair is two tiles that each satisfy them).
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn rotate_tiles_avx2(
+        src: *const u16,
+        w: usize,
+        h: usize,
+        q: u8,
+        out: *mut u16,
+        nw: usize,
+        y0: usize,
+        ty0: usize,
+        ty1: usize,
+        tx0: usize,
+        tx1: usize,
+    ) {
+        let pairs_end = ty0 + (ty1 - ty0) / 16 * 16;
+        let mut r0 = ty0;
+        while r0 < pairs_end {
+            let yn0 = y0 + r0;
+            let (oa, ob) = unsafe { (out.add(r0 * nw), out.add((r0 + 8) * nw)) };
+            let mut xn0 = tx0;
+            while xn0 < tx1 {
+                unsafe {
+                    let mut rows = [_mm256_setzero_si256(); 8];
+                    if q == 1 {
+                        // Columns w-16-yn0 .. w-yn0: the low lane is the
+                        // tile at r0+8, the high lane the tile at r0.
+                        let base = src.add(xn0 * w + (w - 16 - yn0));
+                        for (i, r) in rows.iter_mut().enumerate() {
+                            *r = _mm256_loadu_si256(base.add(i * w) as *const __m256i);
+                        }
+                        let t = transpose8x2(rows);
+                        for (k, v) in t.iter().rev().enumerate() {
+                            let o = k * nw + xn0;
+                            _mm_storeu_si128(ob.add(o) as *mut __m128i, _mm256_castsi256_si128(*v));
+                            _mm_storeu_si128(
+                                oa.add(o) as *mut __m128i,
+                                _mm256_extracti128_si256(*v, 1),
+                            );
+                        }
+                    } else {
+                        // Columns yn0 .. yn0+16: the low lane is the tile at
+                        // r0, the high lane the tile at r0+8.
+                        let base = src.add((h - 1 - xn0) * w + yn0);
+                        for (i, r) in rows.iter_mut().enumerate() {
+                            *r = _mm256_loadu_si256(base.sub(i * w) as *const __m256i);
+                        }
+                        let t = transpose8x2(rows);
+                        for (k, v) in t.iter().enumerate() {
+                            let o = k * nw + xn0;
+                            _mm_storeu_si128(oa.add(o) as *mut __m128i, _mm256_castsi256_si128(*v));
+                            _mm_storeu_si128(
+                                ob.add(o) as *mut __m128i,
+                                _mm256_extracti128_si256(*v, 1),
+                            );
+                        }
+                    }
+                }
+                xn0 += 8;
+            }
+            r0 += 16;
+        }
+        if pairs_end < ty1 {
+            unsafe { rotate_tiles_sse2(src, w, h, q, out, nw, y0, pairs_end, ty1, tx0, tx1) }
         }
     }
 
