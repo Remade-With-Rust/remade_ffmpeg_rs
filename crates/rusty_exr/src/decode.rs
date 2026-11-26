@@ -696,7 +696,7 @@ impl<'a> Decoder<'a> {
         let dw = info.data_window;
         // Row bands: disjoint row ranges of the output, each with the chunks
         // that fill it. A scanline block is one band; a row of tiles is one.
-        let (bands, lw, lh): (Vec<(i32, usize, Vec<usize>)>, usize, usize) = match &info.levels {
+        let (bands, lw, lh): (Vec<Band>, usize, usize) = match &info.levels {
             None => {
                 if lx != 0 || ly != 0 {
                     return Err(Error::usage("scanline parts have one level"));
@@ -859,6 +859,9 @@ impl<'a> Decoder<'a> {
         Ok(())
     }
 }
+
+/// A row band: first line, line count, chunk indices.
+type Band = (i32, usize, Vec<usize>);
 
 /// A mutable view of one channel plane (or a row range of it).
 enum PlaneMut<'a> {

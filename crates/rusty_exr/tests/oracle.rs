@@ -124,7 +124,7 @@ fn hostile_input_never_panics() {
         let mut d = src.clone();
         match rng.next() % 4 {
             0 => {
-                for _ in 0..1 + rng.next() % 8 {
+                for _ in 0..=(rng.next() % 8) {
                     let i = (rng.next() as usize) % d.len();
                     d[i] ^= 1 << (rng.next() % 8);
                 }

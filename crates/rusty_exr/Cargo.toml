@@ -51,3 +51,5 @@ too_many_arguments = "allow"
 excessive_precision = "allow"
 # Prose names (OpenEXR, DWAA, B44A) are not code.
 doc_markdown = "allow"
+# Tiny bit-reader and wavelet helpers inside the hottest decode loops.
+inline_always = "allow"
