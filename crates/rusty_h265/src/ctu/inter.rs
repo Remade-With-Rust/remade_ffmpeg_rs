@@ -357,7 +357,7 @@ impl<'a> SliceDecoder<'a> {
     }
 
     /// §6.4.2 prediction block availability + "not intra".
-    #[allow(clippy::too_many_arguments)]
+    ///
     /// §6.4.2 prediction-block availability, returning the neighbour's 4x4
     /// index when it is available.
     ///

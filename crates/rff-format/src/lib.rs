@@ -16,6 +16,7 @@ pub mod avc;
 pub mod chapter;
 pub mod flac;
 mod group;
+pub mod heif;
 pub mod hvc;
 pub mod nal;
 pub mod time;

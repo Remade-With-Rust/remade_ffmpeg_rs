@@ -67,7 +67,7 @@ Every backend is pure Rust with no C/C++ FFI, and every container (de)muxer is o
 | Codec | Decode | Encode | Backend |
 |---|:---:|:---:|---|
 | H.264 | ✅ | ✅ | [`rusty_h264`](https://crates.io/crates/rusty_h264) |
-| HEVC | ✅ | | [`rusty_h265`](https://crates.io/crates/rusty_h265) |
+| HEVC / HEIC | ✅ | | [`rusty_h265`](https://crates.io/crates/rusty_h265) |
 | VP9 | ✅ | ✅ | [`rusty_vp9`](https://crates.io/crates/rusty_vp9) |
 | AV1 / AVIF | ✅ | ✅ | [`rusty_av1d` / `rusty_av1e`](https://github.com/Remade-With-Rust/rusty-av1-toolkit) |
 | AV2 (research preview) | ✅ | | [`rusty_av2d`](https://crates.io/crates/rusty_av2d) |
@@ -83,7 +83,7 @@ Every backend is pure Rust with no C/C++ FFI, and every container (de)muxer is o
 
 **Containers:**
 - **Demux and mux:** MP4/MOV (including fragmented read), Matroska/WebM, Ogg, WAV (RF64/BW64), FLAC, AVI, IVF, AVIF and the image formats.
-- **Demux only:** AIFF/AIFF-C and CAF.
+- **Demux only:** AIFF/AIFF-C, CAF, and HEIF/HEIC still images (iPhone photos: grids, alpha, `clap`/`irot`/`imir`, Exif; [`rff-format-heif`](https://crates.io/crates/rff-format-heif)).
 
 ## Install
 

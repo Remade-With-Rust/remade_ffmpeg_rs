@@ -82,6 +82,7 @@ fn register_builtin_codecs(codecs: &mut CodecRegistry) {
 fn register_builtin_formats(formats: &mut FormatRegistry) {
     rff_format_avi::register(formats);
     rff_format_avif::register(formats);
+    rff_format_heif::register(formats);
     rff_format_png::register(formats);
     rff_format_exr::register(formats);
     rff_format_jpeg::register(formats);

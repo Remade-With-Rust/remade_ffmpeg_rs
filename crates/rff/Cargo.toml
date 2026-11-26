@@ -46,6 +46,7 @@ rff-codec-mp3.workspace = true
 rff-codec-rawvideo.workspace = true
 rff-format-avi.workspace = true
 rff-format-avif.workspace = true
+rff-format-heif.workspace = true
 rff-format-png.workspace = true
 rff-format-exr.workspace = true
 rff-format-jpeg.workspace = true
