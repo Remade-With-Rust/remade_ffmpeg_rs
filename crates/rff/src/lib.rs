@@ -57,6 +57,7 @@ fn register_builtin_codecs(codecs: &mut CodecRegistry) {
     rff_codec_opus::register(codecs);
     rff_codec_avif::register(codecs);
     rff_codec_png::register(codecs);
+    rff_codec_exr::register(codecs);
     rff_codec_jpeg::register(codecs);
     rff_codec_gif::register(codecs);
     rff_codec_webp::register(codecs);
@@ -82,6 +83,7 @@ fn register_builtin_formats(formats: &mut FormatRegistry) {
     rff_format_avi::register(formats);
     rff_format_avif::register(formats);
     rff_format_png::register(formats);
+    rff_format_exr::register(formats);
     rff_format_jpeg::register(formats);
     rff_format_gif::register(formats);
     rff_format_webp::register(formats);

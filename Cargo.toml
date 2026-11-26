@@ -17,6 +17,9 @@ default-members = [
     "crates/rff-format-avif",
     "crates/rff-codec-png",
     "crates/rff-format-png",
+    "crates/rff-codec-exr",
+    "crates/rff-format-exr",
+    "crates/rusty_exr",
     "crates/rff-codec-jpeg",
     "crates/rff-format-jpeg",
     "crates/rff-codec-gif",
@@ -95,6 +98,8 @@ rff-format-avi = { path = "crates/rff-format-avi", version = "0.9.1" }
 rff-format-avif = { path = "crates/rff-format-avif", version = "0.9.1" }
 rff-codec-png = { path = "crates/rff-codec-png", version = "0.9.1" }
 rff-format-png = { path = "crates/rff-format-png", version = "0.9.1" }
+rff-codec-exr = { path = "crates/rff-codec-exr", version = "0.9.1" }
+rff-format-exr = { path = "crates/rff-format-exr", version = "0.9.1" }
 rff-codec-jpeg = { path = "crates/rff-codec-jpeg", version = "0.9.1" }
 rff-format-jpeg = { path = "crates/rff-format-jpeg", version = "0.9.1" }
 rff-codec-gif = { path = "crates/rff-codec-gif", version = "0.9.1" }
@@ -119,6 +124,9 @@ rusty_h265-accel = { path = "crates/rusty_h265-accel", version = "0.7.1", defaul
 rusty_flac = { path = "crates/rusty_flac", version = "0.2.2" }
 rusty_mp3 = { path = "crates/rusty_mp3", version = "1.2.2" }
 rusty_aac = { path = "crates/rusty_aac", version = "2.3.0" }
+# exr: our own rusty_exr, pure-Rust OpenEXR decode + encode (wrapped by
+# rff-codec-exr / rff-format-exr).
+rusty_exr = { path = "crates/rusty_exr", version = "0.1.0" }
 rusty_vorbis = { path = "crates/rusty_vorbis", version = "0.1.5" }
 # jpeg: our own rusty_jpeg, from crates.io (the vendored copy is gone: one
 # repository publishes it — github.com/Remade-With-Rust/rusty_jpeg).

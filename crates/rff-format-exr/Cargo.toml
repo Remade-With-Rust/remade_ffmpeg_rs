@@ -1,0 +1,18 @@
+[package]
+name = "rff-format-exr"
+description = "Remade FFmpeg (Rust): OpenEXR single-image container (file = codec stream)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["exr", "openexr", "container", "image", "demuxer"]
+categories = ["multimedia", "multimedia::images", "parser-implementations"]
+
+[dependencies]
+rff-core.workspace = true
+rff-format.workspace = true
+rusty_exr.workspace = true

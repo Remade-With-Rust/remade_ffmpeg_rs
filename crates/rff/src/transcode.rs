@@ -102,7 +102,7 @@ mod phases {
 fn is_full_range_codec(codec: CodecId) -> bool {
     matches!(
         codec,
-        CodecId::Jpeg | CodecId::Png | CodecId::Gif | CodecId::Webp
+        CodecId::Jpeg | CodecId::Png | CodecId::Gif | CodecId::Webp | CodecId::Exr
     )
 }
 
@@ -110,7 +110,7 @@ fn is_full_range_codec(codec: CodecId) -> bool {
 fn decodes_to_rgb(codec: CodecId) -> bool {
     matches!(
         codec,
-        CodecId::Png | CodecId::Gif | CodecId::Webp | CodecId::Jxl
+        CodecId::Png | CodecId::Gif | CodecId::Webp | CodecId::Jxl | CodecId::Exr
     )
 }
 
@@ -1146,6 +1146,7 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
             Some("gif") => Some((CodecId::Gif, false)),
             Some("avif") => Some((CodecId::Avif, false)),
             Some("jpegxl") => Some((CodecId::Jxl, false)),
+            Some("exr_pipe") => Some((CodecId::Exr, false)),
             _ => None,
         };
         let apply = match required {

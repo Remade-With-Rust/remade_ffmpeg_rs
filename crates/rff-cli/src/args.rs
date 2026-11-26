@@ -358,7 +358,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             | "speed" | "lag" | "lag-in-frames" | "arnr-strength" | "dispatch-budget"
             | "jpeg_quality" | "sampling" | "jpeg_sampling" | "progressive"
             | "optimize_huffman" | "restart_interval" | "trellis" | "pred" | "png_auto_type"
-            | "png_auto_config" => {
+            | "png_auto_config" | "exr_compression" | "exr_format" => {
                 let value = take_value(args, &mut i, arg)?;
                 if base == "pass" && value != "1" {
                     warnings

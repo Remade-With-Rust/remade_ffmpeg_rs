@@ -118,6 +118,8 @@ pub enum CodecId {
     Dts,
     /// Dolby TrueHD audio. Identified (Matroska `A_TRUEHD`), no codec.
     TrueHd,
+    /// OpenEXR still image (half/float/uint channels, many compressions).
+    Exr,
 }
 
 impl CodecId {
@@ -163,6 +165,7 @@ impl CodecId {
             CodecId::Mpeg2Video => "mpeg2video",
             CodecId::Dts => "dts",
             CodecId::TrueHd => "truehd",
+            CodecId::Exr => "exr",
         }
     }
 
@@ -199,6 +202,7 @@ impl CodecId {
             CodecId::Mp2 | CodecId::Mp1 => MediaType::Audio,
             CodecId::Mpeg1Video | CodecId::Mpeg2Video => MediaType::Video,
             CodecId::Dts | CodecId::TrueHd => MediaType::Audio,
+            CodecId::Exr => MediaType::Video,
         }
     }
 
@@ -262,6 +266,7 @@ impl CodecId {
             "mpeg2video" | "mpeg2" => Some(CodecId::Mpeg2Video),
             "dts" | "dca" => Some(CodecId::Dts),
             "truehd" | "mlp" => Some(CodecId::TrueHd),
+            "exr" => Some(CodecId::Exr),
             _ => None,
         }
     }
