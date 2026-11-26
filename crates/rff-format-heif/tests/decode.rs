@@ -23,6 +23,15 @@ fn fnv(b: &[u8]) -> u64 {
     })
 }
 
+/// True when the linked rusty_h265 refuses a range-extensions profile that
+/// uses no RExt tool. The workspace copy admits it (the profile-4 fixture
+/// decodes, and the corpus gate requires it); rusty_h265 0.7.2 on crates.io
+/// predates that, so a test run of the published crate prints a skip
+/// instead. Delete this once the published decoder has the change.
+fn rext_profile_refused(r: &rff_core::Result<rff_format_heif::Decoded>) -> bool {
+    matches!(r, Err(rff_core::Error::Unsupported(m)) if m.contains("general_profile_idc 4"))
+}
+
 /// (file, width, height, bit depth, libheif's planar hash)
 const CASES: &[(&str, u32, u32, u8, u64)] = &[
     ("checker-1024.heic", 1024, 1024, 8, 0x8f84_08ea_284a_2325),
@@ -53,7 +62,12 @@ fn matches_libheif_exactly_single_and_multi_threaded() {
                 (w, h, bits),
                 "{name}"
             );
-            let d = heif.decode_primary().unwrap();
+            let r = heif.decode_primary();
+            if rext_profile_refused(&r) {
+                eprintln!("SKIP {name}: this rusty_h265 refuses general_profile_idc 4");
+                continue;
+            }
+            let d = r.unwrap();
             assert_eq!((d.image.width, d.image.height), (w, h), "{name}");
             assert_eq!(d.image.chroma, Chroma::Yuv420, "{name}");
             assert_eq!(d.image.bit_depth, bits, "{name}");
@@ -85,7 +99,12 @@ fn exif_xmp_and_colour() {
     // Full range said only in the HEVC VUI: no `colr`, so it comes from the
     // bitstream.
     let data = fixture("full-range-no-colr.heic");
-    let d = Heif::parse(&data).unwrap().decode_primary().unwrap();
+    let r = Heif::parse(&data).unwrap().decode_primary();
+    if rext_profile_refused(&r) {
+        eprintln!("SKIP full-range-no-colr: this rusty_h265 refuses general_profile_idc 4");
+        return;
+    }
+    let d = r.unwrap();
     let n = d.colour.nclx.expect("VUI colour");
     assert!(d.colour.nclx_from_bitstream);
     assert!(n.full_range);
