@@ -374,7 +374,7 @@ mod tests {
         }
         let (lo, hi) = img.planes.split_at_mut(2);
         for (i, (cb, cr)) in lo[1].data.iter_mut().zip(hi[0].data.iter_mut()).enumerate() {
-            (*cb, *cr) = ((i % 2048 & 255) as u16, (i / 2048 & 255) as u16);
+            (*cb, *cr) = (((i % 2048) & 255) as u16, ((i / 2048) & 255) as u16);
         }
         for (matrix, full_range) in [(6u16, true), (1, false), (0, true)] {
             let nclx = Some(Nclx {
