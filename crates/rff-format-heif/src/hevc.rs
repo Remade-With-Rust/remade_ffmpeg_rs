@@ -235,6 +235,11 @@ fn frame_layout(f: &Frame) -> Result<(Chroma, (usize, usize, usize, usize))> {
     Ok((chroma, pic.crop))
 }
 
+/// A decoded frame's size: its conformance window.
+pub(crate) fn frame_size(f: &Frame) -> (u32, u32) {
+    (f.picture.crop.2 as u32, f.picture.crop.3 as u32)
+}
+
 /// Copy a decoded frame (its conformance window) into a new [`Image`].
 pub(crate) fn frame_to_image(f: &Frame) -> Result<Image> {
     let (chroma, (_, _, cw, ch)) = frame_layout(f)?;

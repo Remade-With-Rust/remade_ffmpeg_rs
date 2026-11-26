@@ -264,6 +264,26 @@ impl Image {
         }
     }
 
+    /// A zeroed image (chroma too): a canvas for callers that overwrite
+    /// every sample. Unlike [`blank`](Self::blank) it writes nothing: a large
+    /// zeroed allocation is fresh pages, where filling chroma with the
+    /// midpoint is a pass over memory the caller is about to overwrite.
+    pub(crate) fn zeroed(width: u32, height: u32, chroma: Chroma, bit_depth: u8) -> Image {
+        let mut planes = vec![Plane::filled(width, height, 0)];
+        if chroma != Chroma::Monochrome {
+            let (cw, ch) = chroma.chroma_size(width, height);
+            planes.push(Plane::filled(cw, ch, 0));
+            planes.push(Plane::filled(cw, ch, 0));
+        }
+        Image {
+            width,
+            height,
+            chroma,
+            bit_depth,
+            planes,
+        }
+    }
+
     /// The planes back to back, tightly packed: one byte per sample at up to
     /// 8 bits, little-endian `u16` above (the `yuv420p` / `yuv420p10le`
     /// layouts).

@@ -540,6 +540,26 @@ impl<'a> Heif<'a> {
     }
 
     fn decode_grid(&self, id: u32, depth: u32) -> Result<Image> {
+        match self.compose_grid(id, depth, true)? {
+            Some(img) => Ok(img),
+            // A tile that does not exactly fill its cell (a malformed file):
+            // compose again on the neutral canvas, which is what shows
+            // through wherever no tile writes.
+            None => self
+                .compose_grid(id, depth, false)?
+                .ok_or_else(|| Error::invalid("heif: grid composition failed")),
+        }
+    }
+
+    /// Decode grid `id` and place its tiles. With `zeroed`, the canvas is
+    /// left unfilled and the composition gives up (`Ok(None)`) at the first
+    /// tile whose decoded size is not exactly its cell's: only when every
+    /// tile fills its cell exactly do the cells partition the canvas (luma
+    /// and chroma -- the cell size is a multiple of the subsampling), so that
+    /// every sample is written once and the fill would never be seen. Without
+    /// `zeroed` the canvas is the neutral [`Image::blank`] and it never gives
+    /// up.
+    fn compose_grid(&self, id: u32, depth: u32, zeroed: bool) -> Result<Option<Image>> {
         let g = self.file.grid(id)?;
         let tiles = self.file.refs_from(id, b"dimg");
         if tiles.len() as u64 != g.rows as u64 * g.columns as u64 {
@@ -571,7 +591,12 @@ impl<'a> Heif<'a> {
                 "heif: grid tiles not aligned to the chroma subsampling",
             ));
         }
-        let mut out = Image::blank(g.output_width, g.output_height, chroma, bit_depth);
+        let mut out = if zeroed {
+            Image::zeroed(g.output_width, g.output_height, chroma, bit_depth)
+        } else {
+            Image::blank(g.output_width, g.output_height, chroma, bit_depth)
+        };
+        let misfit = |tile: &Tile| zeroed && tile.size() != (tw, th);
         let place =
             |i: usize| -> (u32, u32) { ((i as u32 % g.columns) * tw, (i as u32 / g.columns) * th) };
 
@@ -601,13 +626,18 @@ impl<'a> Heif<'a> {
             let mut dec = hevc::ItemDecoder::new();
             for (i, &t) in tiles.iter().enumerate() {
                 let (x, y) = place(i);
-                decode_tile(&mut dec, t)?.blit(&mut out, x, y)?;
+                let tile = decode_tile(&mut dec, t)?;
+                if misfit(&tile) {
+                    return Ok(None);
+                }
+                tile.blit(&mut out, x, y)?;
             }
-            return Ok(out);
+            return Ok(Some(out));
         }
         // Workers decode, this thread places: tiles are independent pictures,
         // and the copy into the output is cheap next to the decode.
         let next = std::sync::atomic::AtomicUsize::new(0);
+        let mut gave_up = false;
         let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Result<Tile>)>(threads * 2);
         std::thread::scope(|s| -> Result<()> {
             for _ in 0..threads {
@@ -636,7 +666,12 @@ impl<'a> Heif<'a> {
             let mut first_err = None;
             for (i, r) in rx {
                 match r {
-                    Ok(tile) if first_err.is_none() => {
+                    Ok(tile) if first_err.is_none() && !gave_up => {
+                        if misfit(&tile) {
+                            gave_up = true;
+                            next.store(tiles.len(), std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        }
                         let (x, y) = place(i);
                         if let Err(e) = tile.blit(&mut out, x, y) {
                             first_err = Some(e);
@@ -651,7 +686,7 @@ impl<'a> Heif<'a> {
             }
             first_err.map_or(Ok(()), Err)
         })?;
-        Ok(out)
+        Ok((!gave_up).then_some(out))
     }
 }
 
@@ -663,6 +698,14 @@ enum Tile {
 }
 
 impl Tile {
+    /// The decoded size.
+    fn size(&self) -> (u32, u32) {
+        match self {
+            Tile::Frame(f) => hevc::frame_size(f),
+            Tile::Image(img) => (img.width, img.height),
+        }
+    }
+
     fn blit(self, out: &mut Image, x: u32, y: u32) -> Result<()> {
         match self {
             Tile::Frame(f) => hevc::blit_frame(&f, out, x, y),
