@@ -94,7 +94,7 @@ impl Plane {
     }
 
     /// Rotate anti-clockwise by `quarters` × 90 degrees.
-    fn rotate_ccw(&self, quarters: u8) -> Plane {
+    fn rotate_ccw(&self, quarters: u8, threads: usize) -> Plane {
         let (w, h) = (self.width as usize, self.height as usize);
         let src = &self.data;
         match quarters & 3 {
@@ -108,30 +108,11 @@ impl Plane {
                     data,
                 }
             }
-            q => {
-                // 90 ccw: new[y'][x'] = old[x'][w-1-y'];  270 ccw: new[y'][x'] = old[h-1-x'][y'].
-                let (nw, nh) = (h, w);
-                let mut data = vec![0u16; w * h];
-                for yn in 0..nh {
-                    let out = &mut data[yn * nw..(yn + 1) * nw];
-                    if q == 1 {
-                        let xo = w - 1 - yn;
-                        for (xn, d) in out.iter_mut().enumerate() {
-                            *d = src[xn * w + xo];
-                        }
-                    } else {
-                        let xo = yn;
-                        for (xn, d) in out.iter_mut().enumerate() {
-                            *d = src[(h - 1 - xn) * w + xo];
-                        }
-                    }
-                }
-                Plane {
-                    width: nw as u32,
-                    height: nh as u32,
-                    data,
-                }
-            }
+            q => Plane {
+                width: self.height,
+                height: self.width,
+                data: rotate_quarter(src, w, h, q, threads),
+            },
         }
     }
 
@@ -154,6 +135,83 @@ impl Plane {
             top[y * w..(y + 1) * w].swap_with_slice(&mut bottom[..w]);
         }
     }
+}
+
+/// Rotate a `w`x`h` plane a quarter turn anti-clockwise (`q` = 1) or
+/// clockwise (`q` = 3), in 64x64 blocks.
+///
+/// A quarter turn reads the source down its columns. Walking a whole output
+/// row at a time touches a new cache line for every sample (a 12 MP photo's
+/// plane is 8 KB a row), so the naive loop is bound by memory latency and
+/// ran ~70 ms, serially after the parallel tile decode. In 64x64 blocks the
+/// 64 source lines a block reads stay in L1 for all 64 of its output rows.
+/// Same samples in the same places: [`rotate_quarter_naive`] is the oracle.
+///
+/// With `threads` > 1 the output is split into bands of whole block rows, one
+/// thread per band: each thread writes only its own rows.
+fn rotate_quarter(src: &[u16], w: usize, h: usize, q: u8, threads: usize) -> Vec<u16> {
+    const B: usize = 64;
+    let (nw, nh) = (h, w);
+    let mut dst = vec![0u16; w * h];
+    if nw == 0 || nh == 0 {
+        return dst;
+    }
+    // `rows` output rows starting at row `y0`, into `out` (their samples).
+    let band = |y0: usize, out: &mut [u16]| {
+        let rows = out.len() / nw;
+        for by in (0..rows).step_by(B) {
+            for bx in (0..nw).step_by(B) {
+                let xe = (bx + B).min(nw);
+                for r in by..(by + B).min(rows) {
+                    let yn = y0 + r;
+                    let o = &mut out[r * nw + bx..r * nw + xe];
+                    if q == 1 {
+                        // new[yn][xn] = old[xn][w-1-yn]
+                        let xo = w - 1 - yn;
+                        for (d, xn) in o.iter_mut().zip(bx..) {
+                            *d = src[xn * w + xo];
+                        }
+                    } else {
+                        // new[yn][xn] = old[h-1-xn][yn]
+                        for (d, xn) in o.iter_mut().zip(bx..) {
+                            *d = src[(h - 1 - xn) * w + yn];
+                        }
+                    }
+                }
+            }
+        }
+    };
+    let blocks = nh.div_ceil(B);
+    let threads = threads.clamp(1, blocks);
+    if threads == 1 {
+        band(0, &mut dst);
+    } else {
+        let rows_per = blocks.div_ceil(threads) * B;
+        std::thread::scope(|s| {
+            for (i, chunk) in dst.chunks_mut(rows_per * nw).enumerate() {
+                let band = &band;
+                s.spawn(move || band(i * rows_per, chunk));
+            }
+        });
+    }
+    dst
+}
+
+/// The row-at-a-time quarter turn: the oracle for [`rotate_quarter`].
+#[cfg(test)]
+fn rotate_quarter_naive(src: &[u16], w: usize, h: usize, q: u8) -> Vec<u16> {
+    let (nw, nh) = (h, w);
+    let mut data = vec![0u16; w * h];
+    for yn in 0..nh {
+        for xn in 0..nw {
+            data[yn * nw + xn] = if q == 1 {
+                src[xn * w + (w - 1 - yn)]
+            } else {
+                src[(h - 1 - xn) * w + yn]
+            };
+        }
+    }
+    data
 }
 
 /// A decoded image: luma plus zero or two chroma planes.
@@ -281,14 +339,23 @@ impl Image {
 
     /// Rotate anti-clockwise by `quarters` × 90 degrees (`irot`).
     pub fn rotate_ccw(&self, quarters: u8) -> Image {
+        self.rotate_ccw_threads(quarters, 1)
+    }
+
+    /// [`rotate_ccw`](Self::rotate_ccw) on up to `threads` threads.
+    pub(crate) fn rotate_ccw_threads(&self, quarters: u8, threads: usize) -> Image {
         if quarters & 3 == 0 {
             return self.clone();
         }
         // Rotating 4:2:2 by a quarter turn would need 4:4:0; go via 4:4:4.
         if self.chroma == Chroma::Yuv422 && quarters & 1 == 1 {
-            return self.to_444().rotate_ccw(quarters);
+            return self.to_444().rotate_ccw_threads(quarters, threads);
         }
-        let planes: Vec<Plane> = self.planes.iter().map(|p| p.rotate_ccw(quarters)).collect();
+        let planes: Vec<Plane> = self
+            .planes
+            .iter()
+            .map(|p| p.rotate_ccw(quarters, threads))
+            .collect();
         Image {
             width: planes[0].width,
             height: planes[0].height,
@@ -367,16 +434,40 @@ mod tests {
     #[test]
     fn rotations_compose_to_identity() {
         let p = ramp(5, 3);
-        assert_eq!(p.rotate_ccw(1).rotate_ccw(3), p);
-        assert_eq!(p.rotate_ccw(2).rotate_ccw(2), p);
-        assert_eq!(p.rotate_ccw(1).rotate_ccw(1), p.rotate_ccw(2));
+        assert_eq!(p.rotate_ccw(1, 1).rotate_ccw(3, 1), p);
+        assert_eq!(p.rotate_ccw(2, 1).rotate_ccw(2, 1), p);
+        assert_eq!(p.rotate_ccw(1, 1).rotate_ccw(1, 1), p.rotate_ccw(2, 1));
         // 90 ccw moves the top-right corner to the top-left.
-        let r = p.rotate_ccw(1);
+        let r = p.rotate_ccw(1, 1);
         assert_eq!((r.width, r.height), (3, 5));
         assert_eq!(r.data[0], p.data[4]);
         // 270 ccw (90 cw) moves the bottom-left corner to the top-left.
-        let r = p.rotate_ccw(3);
+        let r = p.rotate_ccw(3, 1);
         assert_eq!(r.data[0], p.data[10]);
+    }
+
+    #[test]
+    fn blocked_rotation_matches_naive() {
+        for (w, h) in [
+            (1, 1),
+            (5, 3),
+            (64, 64),
+            (65, 63),
+            (130, 7),
+            (7, 200),
+            (257, 129),
+        ] {
+            let p = ramp(w, h);
+            for q in [1, 3] {
+                for threads in [1, 2, 3, 8] {
+                    assert_eq!(
+                        rotate_quarter(&p.data, w as usize, h as usize, q, threads),
+                        rotate_quarter_naive(&p.data, w as usize, h as usize, q),
+                        "{w}x{h} q{q} threads {threads}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

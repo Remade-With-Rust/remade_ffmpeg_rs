@@ -448,6 +448,14 @@ impl<'a> Heif<'a> {
         (w, h)
     }
 
+    /// Worker threads to use: [`DecodeOptions::threads`], 0 meaning all cores.
+    fn threads(&self) -> usize {
+        match self.opts.threads {
+            0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+            n => n,
+        }
+    }
+
     fn item(&self, id: u32) -> Result<&rff_format::heif::Item> {
         self.file
             .item(id)
@@ -514,7 +522,7 @@ impl<'a> Heif<'a> {
                     // `irot` 0 (which Apple writes on every image) is the
                     // identity: rotating would only copy the whole image.
                     Property::Irot(0) => {}
-                    Property::Irot(r) => img = img.rotate_ccw(*r),
+                    Property::Irot(r) => img = img.rotate_ccw_threads(*r, self.threads()),
                     Property::Imir(a) => img.mirror(*a),
                     Property::Clap(c) => {
                         let (x, y, w, h) = c
@@ -585,11 +593,7 @@ impl<'a> Heif<'a> {
                 Ok(Tile::Image(self.decode_at(t, depth + 1)?))
             }
         };
-        let threads = match self.opts.threads {
-            0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
-            n => n,
-        }
-        .min(tiles.len());
+        let threads = self.threads().min(tiles.len());
 
         if threads <= 1 {
             let mut dec = hevc::ItemDecoder::new();
