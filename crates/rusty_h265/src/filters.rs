@@ -689,10 +689,7 @@ fn sao_neighbour_usable(st: &PicState, pps: &Pps, cur_lf_across: bool, xc: usize
             return false;
         }
     }
-    if st.tile_id[cn] != st.tile_id[cc] && !pps.loop_filter_across_tiles_enabled {
-        return false;
-    }
-    true
+    st.tile_id[cn] == st.tile_id[cc] || pps.loop_filter_across_tiles_enabled
 }
 
 #[cfg(test)]
