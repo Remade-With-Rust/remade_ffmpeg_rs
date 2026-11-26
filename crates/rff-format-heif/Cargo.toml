@@ -1,0 +1,24 @@
+[package]
+name = "rff-format-heif"
+description = "Remade FFmpeg (Rust): HEIF/HEIC still-image decoding (grids, alpha, transforms, Exif) in pure Rust via rusty_h265."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+documentation = "https://docs.rs/rff-format-heif"
+readme = "README.md"
+keywords = ["heic", "heif", "hevc", "image", "decoder"]
+categories = ["multimedia", "multimedia::images", "parser-implementations"]
+
+[dependencies]
+rff-core.workspace = true
+rff-format.workspace = true
+rusty_h265.workspace = true
+
+[dev-dependencies]
+# The examples decode and benchmark: they run under the shipping allocator
+# (CLAUDE.md allocator rule). The library itself never sets one.
+rusty_alloc-api.workspace = true

@@ -6,7 +6,8 @@
 //! codec behind the `y4m` / `rawvideo` input path — it lets the CLI feed real
 //! uncompressed clips into an encoder (e.g. VP9) for RD measurement.
 //!
-//! Supported layouts: 8-bit planar `yuv420p` / `yuv422p` / `yuv444p`.
+//! Supported layouts: planar `yuv420p` / `yuv422p` / `yuv444p` at 8 bits, and
+//! at 10 and 12 bits (little-endian `u16` samples); packed `rgb24` and `rgba`.
 
 use rff_codec::{Codec, CodecParams, CodecRegistry, Decoder, Encoder};
 use rff_core::{Error, Frame, MediaType, Packet, PixelFormat, Result, VideoFrame};
@@ -16,26 +17,38 @@ pub fn register(registry: &mut CodecRegistry) {
     registry.register(Codec {
         id: rff_core::CodecId::RawVideo,
         name: "rawvideo",
-        long_name: "raw uncompressed video (planar YUV)",
+        long_name: "raw uncompressed video (planar YUV, packed RGB)",
         media_type: MediaType::Video,
         decoder: Some(|| Box::new(RawVideoDecoder::default())),
         encoder: Some(|| Box::new(RawVideoEncoder::default())),
     });
 }
 
-/// Per-plane (width, height) in samples for the supported 8-bit planar formats.
-/// Chroma dimensions use ceil-division so odd frame sizes round up (matching y4m).
-fn plane_dims(format: PixelFormat, w: usize, h: usize) -> Result<[(usize, usize); 3]> {
+/// Per-plane `(row bytes, rows)` for the supported layouts. Chroma dimensions
+/// use ceil-division so odd frame sizes round up (matching y4m); samples above
+/// 8 bits take two bytes.
+fn plane_dims(format: PixelFormat, w: usize, h: usize) -> Result<Vec<(usize, usize)>> {
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-    match format {
-        PixelFormat::Yuv420p => Ok([(w, h), (cw, ch), (cw, ch)]),
-        PixelFormat::Yuv422p => Ok([(w, h), (cw, h), (cw, h)]),
-        PixelFormat::Yuv444p => Ok([(w, h), (w, h), (w, h)]),
-        other => Err(Error::unsupported(format!(
-            "rawvideo: pixel format `{}` (only 8-bit planar yuv420p/yuv422p/yuv444p)",
-            other.name()
-        ))),
-    }
+    let b = format.bytes_per_sample();
+    Ok(match format {
+        PixelFormat::Yuv420p | PixelFormat::Yuv420p10 | PixelFormat::Yuv420p12 => {
+            vec![(w * b, h), (cw * b, ch), (cw * b, ch)]
+        }
+        PixelFormat::Yuv422p | PixelFormat::Yuv422p10 | PixelFormat::Yuv422p12 => {
+            vec![(w * b, h), (cw * b, h), (cw * b, h)]
+        }
+        PixelFormat::Yuv444p | PixelFormat::Yuv444p10 | PixelFormat::Yuv444p12 => {
+            vec![(w * b, h), (w * b, h), (w * b, h)]
+        }
+        PixelFormat::Rgb24 => vec![(w * 3, h)],
+        PixelFormat::Rgba => vec![(w * 4, h)],
+        other => {
+            return Err(Error::unsupported(format!(
+                "rawvideo: pixel format `{}`",
+                other.name()
+            )))
+        }
+    })
 }
 
 #[derive(Default)]
@@ -83,8 +96,8 @@ impl Decoder for RawVideoDecoder {
             )));
         }
         // Split the tightly-packed packet into planes; stride == plane width.
-        let mut planes = Vec::with_capacity(3);
-        let mut strides = Vec::with_capacity(3);
+        let mut planes = Vec::with_capacity(dims.len());
+        let mut strides = Vec::with_capacity(dims.len());
         let mut off = 0usize;
         for (pw, ph) in dims {
             let size = pw * ph;
@@ -198,6 +211,39 @@ mod tests {
         let mut enc = RawVideoEncoder::default();
         enc.send_frame(&Frame::Video(vf)).unwrap();
         assert_eq!(enc.receive_packet().unwrap().data, data);
+    }
+
+    #[test]
+    fn high_bit_depth_and_rgba_layouts() {
+        for (format, w, h, size, planes) in [
+            (
+                PixelFormat::Yuv420p10,
+                3usize,
+                3usize,
+                (9 + 2 * 4) * 2,
+                3usize,
+            ),
+            (PixelFormat::Rgba, 3, 2, 24, 1),
+        ] {
+            let data: Vec<u8> = (0..size as u32).map(|v| v as u8).collect();
+            let mut dec = RawVideoDecoder::default();
+            dec.configure(&CodecParams {
+                width: w as u32,
+                height: h as u32,
+                pixel_format: Some(format),
+                ..Default::default()
+            })
+            .unwrap();
+            dec.send_packet(&Packet::from_data(0, data.clone()))
+                .unwrap();
+            let Frame::Video(vf) = dec.receive_frame().unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(vf.planes.len(), planes);
+            let mut enc = RawVideoEncoder::default();
+            enc.send_frame(&Frame::Video(vf)).unwrap();
+            assert_eq!(enc.receive_packet().unwrap().data, data);
+        }
     }
 
     #[test]
