@@ -114,54 +114,109 @@ fn length_prefixed(data: &[u8], nal_len: usize) -> Result<Vec<&[u8]>> {
     Ok(out)
 }
 
-/// Decode `hvc1` item `id` (after the items it is predicted from, `pred`)
-/// and return the last picture in output order.
+/// Decode `hvc1` item `id` with a fresh decoder.
 pub(crate) fn decode_frame(file: &HeifFile, id: u32) -> Result<Frame> {
-    let hvcc = file
-        .hvcc(id)
-        .ok_or_else(|| Error::invalid(format!("heif: hvc1 item {id} has no `hvcC`")))?;
-    let info = hvc_info(hvcc)?;
-    file.check_size(info.width, info.height)?;
-    let (_, params) = hvcc_nals(hvcc)?;
-    let deps = file.refs_from(id, b"pred");
-    if deps.len() > 64 {
-        return Err(Error::invalid("heif: too many `pred` references"));
-    }
-    let mut datas = Vec::with_capacity(deps.len() + 1);
-    for &d in &deps {
-        if d == id || file.item(d).map(|it| it.item_type) != Some(*b"hvc1") {
-            return Err(Error::invalid(format!("heif: bad `pred` reference {d}")));
-        }
-        datas.push(file.item_data(d)?);
-    }
-    datas.push(file.item_data(id)?);
+    ItemDecoder::new().decode(file, id)
+}
 
-    let run = || -> Result<Option<Frame>> {
-        let mut dec = Decoder::new();
-        for nal in &params {
-            dec.push_nal(nal, None).map_err(map_err)?;
+/// An HEVC decoder kept across a run of items (the tiles of a grid).
+///
+/// A fresh `rusty_h265::Decoder` per tile re-allocates and zeroes its picture
+/// pool and filter scratch, and re-parses the parameter sets, 48 times for a
+/// 12 MP iPhone photo. Every tile is an IDR picture, so one decoder decodes
+/// them in sequence with no state carried from one to the next; the
+/// parameter sets are re-sent only when the tile's `hvcC` differs. Any error
+/// or contained panic drops the decoder, so a damaged tile cannot leave
+/// state behind for the next.
+pub(crate) struct ItemDecoder {
+    dec: Option<Decoder>,
+    /// The `hvcC` whose parameter sets `dec` holds, and what its SPS says.
+    hvcc: Vec<u8>,
+    info: Option<HvcInfo>,
+}
+
+impl ItemDecoder {
+    pub(crate) fn new() -> Self {
+        ItemDecoder {
+            dec: None,
+            hvcc: Vec::new(),
+            info: None,
         }
-        for data in &datas {
-            for nal in length_prefixed(data, info.nal_len)? {
-                dec.push_nal(nal, None).map_err(map_err)?;
+    }
+
+    /// Decode `hvc1` item `id` (after the items it is predicted from,
+    /// `pred`) and return the last picture in output order.
+    pub(crate) fn decode(&mut self, file: &HeifFile, id: u32) -> Result<Frame> {
+        let hvcc = file
+            .hvcc(id)
+            .ok_or_else(|| Error::invalid(format!("heif: hvc1 item {id} has no `hvcC`")))?;
+        let same = self.dec.is_some() && self.hvcc == hvcc;
+        let info = match (same, self.info) {
+            (true, Some(info)) => info,
+            _ => {
+                let info = hvc_info(hvcc)?;
+                file.check_size(info.width, info.height)?;
+                info
             }
+        };
+        let deps = file.refs_from(id, b"pred");
+        if deps.len() > 64 {
+            return Err(Error::invalid("heif: too many `pred` references"));
         }
-        dec.flush();
-        let mut last = None;
-        while let Ok(f) = dec.next_frame() {
-            last = Some(f);
+        let mut datas = Vec::with_capacity(deps.len() + 1);
+        for &d in &deps {
+            if d == id || file.item(d).map(|it| it.item_type) != Some(*b"hvc1") {
+                return Err(Error::invalid(format!("heif: bad `pred` reference {d}")));
+            }
+            datas.push(file.item_data(d)?);
         }
-        Ok(last)
-    };
-    match catch_unwind(AssertUnwindSafe(run)) {
-        Ok(Ok(Some(f))) => Ok(f),
-        Ok(Ok(None)) => Err(Error::invalid(format!(
-            "heif: item {id} decoded no picture"
-        ))),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(Error::invalid(
-            "heif: HEVC decoder panicked on malformed input (recovered)",
-        )),
+        datas.push(file.item_data(id)?);
+
+        let mut dec = match self.dec.take() {
+            Some(d) if same => d,
+            _ => Decoder::new(),
+        };
+        let run = |dec: &mut Decoder| -> Result<Option<Frame>> {
+            if !same {
+                for nal in hvcc_nals(hvcc)?.1 {
+                    dec.push_nal(nal, None).map_err(map_err)?;
+                }
+            }
+            for data in &datas {
+                for nal in length_prefixed(data, info.nal_len)? {
+                    dec.push_nal(nal, None).map_err(map_err)?;
+                }
+            }
+            dec.flush();
+            let mut last = None;
+            while let Ok(f) = dec.next_frame() {
+                last = Some(f);
+            }
+            Ok(last)
+        };
+        let r = catch_unwind(AssertUnwindSafe(|| run(&mut dec)));
+        if let Ok(Ok(Some(_))) = &r {
+            // Keep the decoder (and what it holds) for the next item.
+            if !same {
+                self.hvcc.clear();
+                self.hvcc.extend_from_slice(hvcc);
+            }
+            self.info = Some(info);
+            self.dec = Some(dec);
+        } else {
+            self.hvcc.clear();
+            self.info = None;
+        }
+        match r {
+            Ok(Ok(Some(f))) => Ok(f),
+            Ok(Ok(None)) => Err(Error::invalid(format!(
+                "heif: item {id} decoded no picture"
+            ))),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(Error::invalid(
+                "heif: HEVC decoder panicked on malformed input (recovered)",
+            )),
+        }
     }
 }
 

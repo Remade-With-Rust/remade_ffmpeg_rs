@@ -511,6 +511,9 @@ impl<'a> Heif<'a> {
         if self.opts.apply_transforms {
             for (p, _) in self.file.properties_of(id) {
                 match p {
+                    // `irot` 0 (which Apple writes on every image) is the
+                    // identity: rotating would only copy the whole image.
+                    Property::Irot(0) => {}
                     Property::Irot(r) => img = img.rotate_ccw(*r),
                     Property::Imir(a) => img.mirror(*a),
                     Property::Clap(c) => {
@@ -574,10 +577,10 @@ impl<'a> Heif<'a> {
                     matches!(p, Property::Irot(_) | Property::Imir(_) | Property::Clap(_))
                 })
         };
-        let decode_tile = |t: u32| -> Result<Tile> {
+        let decode_tile = |dec: &mut hevc::ItemDecoder, t: u32| -> Result<Tile> {
             if plain(t) {
                 self.check_properties(t)?;
-                Ok(Tile::Frame(hevc::decode_frame(&self.file, t)?))
+                Ok(Tile::Frame(dec.decode(&self.file, t)?))
             } else {
                 Ok(Tile::Image(self.decode_at(t, depth + 1)?))
             }
@@ -589,9 +592,10 @@ impl<'a> Heif<'a> {
         .min(tiles.len());
 
         if threads <= 1 {
+            let mut dec = hevc::ItemDecoder::new();
             for (i, &t) in tiles.iter().enumerate() {
                 let (x, y) = place(i);
-                decode_tile(t)?.blit(&mut out, x, y)?;
+                decode_tile(&mut dec, t)?.blit(&mut out, x, y)?;
             }
             return Ok(out);
         }
@@ -605,17 +609,20 @@ impl<'a> Heif<'a> {
                 let next = &next;
                 let tiles = &tiles;
                 let decode_tile = &decode_tile;
-                s.spawn(move || loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if i >= tiles.len() {
-                        break;
-                    }
-                    let r = decode_tile(tiles[i]);
-                    let failed = r.is_err();
-                    if tx.send((i, r)).is_err() || failed {
-                        // Stop the other workers early on the first error.
-                        next.store(tiles.len(), std::sync::atomic::Ordering::Relaxed);
-                        break;
+                s.spawn(move || {
+                    let mut dec = hevc::ItemDecoder::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= tiles.len() {
+                            break;
+                        }
+                        let r = decode_tile(&mut dec, tiles[i]);
+                        let failed = r.is_err();
+                        if tx.send((i, r)).is_err() || failed {
+                            // Stop the other workers early on the first error.
+                            next.store(tiles.len(), std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
                     }
                 });
             }
