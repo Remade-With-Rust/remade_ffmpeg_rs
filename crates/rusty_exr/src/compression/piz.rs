@@ -17,8 +17,17 @@ fn wenc14(a: u16, b: u16) -> (u16, u16) {
     (m as u16, d as u16)
 }
 
-#[inline]
+/// OpenEXR's `wdec14` (`ai = l + (h & 1) + (h >> 1)` in signed 16-bit,
+/// `a = ai`, `b = ai - h`), done mod 2^16: every step only feeds a
+/// truncation to 16 bits, so wrapping u16 arithmetic gives the same bits.
+#[inline(always)]
 fn wdec14(l: u16, h: u16) -> (u16, u16) {
+    let a = l.wrapping_add(h & 1).wrapping_add(((h as i16) >> 1) as u16);
+    (a, a.wrapping_sub(h))
+}
+
+#[cfg(test)]
+fn wdec14_reference(l: u16, h: u16) -> (u16, u16) {
     let (l, h) = (l as i16 as i32, h as i16 as i32);
     let ai = l + (h & 1) + (h >> 1);
     let a = ai as i16;
@@ -41,8 +50,16 @@ fn wenc16(a: u16, b: u16) -> (u16, u16) {
     (m as u16, (d & MOD_MASK) as u16)
 }
 
-#[inline]
+/// OpenEXR's `wdec16` mod 2^16 (all its terms are masked to 16 bits).
+#[inline(always)]
 fn wdec16(l: u16, h: u16) -> (u16, u16) {
+    let bb = l.wrapping_sub(h >> 1);
+    let aa = h.wrapping_add(bb).wrapping_sub(A_OFFSET as u16);
+    (aa, bb)
+}
+
+#[cfg(test)]
+fn wdec16_reference(l: u16, h: u16) -> (u16, u16) {
     let (m, d) = (i32::from(l), i32::from(h));
     let bb = (m - (d >> 1)) & MOD_MASK;
     let aa = (d + bb - A_OFFSET) & MOD_MASK;
@@ -140,6 +157,8 @@ fn wav_decode_impl<const W14: bool>(buf: &mut [u16], nx: usize, ox: usize, ny: u
         let mut py = 0;
         while py <= ey {
             let ex = py + ox * (nx - p2);
+            // Every index below is at most ex + oy1 + ox1.
+            assert!(ex + oy1 + ox1 < buf.len());
             let mut px = py;
             while px <= ex {
                 let p01 = px + ox1;
@@ -190,7 +209,12 @@ fn planar_u16(geom: &BlockGeom<'_>, raw: &[u8]) -> Vec<u16> {
         .collect()
 }
 
-pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
+/// Decode a PIZ chunk into `scratch.w` (channel-planar 16-bit words).
+pub(crate) fn decompress(
+    geom: &BlockGeom<'_>,
+    data: &[u8],
+    scratch: &mut super::Scratch,
+) -> Result<()> {
     let mut c = crate::header::Cursor::new(data);
     let bmin = {
         let b = c.bytes(2)?;
@@ -207,13 +231,25 @@ pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
     if bmin <= bmax {
         bitmap[bmin..=bmax].copy_from_slice(c.bytes(bmax - bmin + 1)?);
     }
-    // Reverse lookup table: dense index -> value.
-    let mut lut = vec![0u16; 1 << 16];
-    let mut k = 0usize;
-    for v in 0..(1usize << 16) {
-        if v == 0 || bitmap[v >> 3] & (1 << (v & 7)) != 0 {
-            lut[k] = v as u16;
-            k += 1;
+    // Reverse lookup table: dense index -> value; indices past the last
+    // value map to 0. Built from the bitmap's set bits only.
+    let lut = &mut scratch.lut;
+    lut.clear();
+    lut.resize(1 << 16, 0);
+    lut[0] = 0;
+    let mut k = 1usize;
+    if bmin <= bmax {
+        for (i, &byte) in bitmap[bmin..=bmax].iter().enumerate() {
+            let mut bits = byte;
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let v = ((bmin + i) << 3) | b;
+                if v != 0 {
+                    lut[k] = v as u16;
+                    k += 1;
+                }
+            }
         }
     }
     let max_value = (k - 1) as u16;
@@ -222,7 +258,8 @@ pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
         return Err(Error::invalid("PIZ Huffman length"));
     }
     let n16 = geom.raw_size / 2;
-    let mut tmp = huffman::decompress(c.bytes(len as usize)?, n16)?;
+    huffman::decompress_into(c.bytes(len as usize)?, n16, &mut scratch.w)?;
+    let tmp = &mut scratch.w;
     let mut start = 0;
     for ch in &geom.chans {
         let spp = ch.ty.bytes() / 2;
@@ -242,14 +279,10 @@ pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
         }
         start += count;
     }
-    for v in &mut tmp {
+    for v in tmp.iter_mut() {
         *v = lut[*v as usize];
     }
-    let mut planar = vec![0u8; geom.raw_size];
-    for (d, v) in planar.chunks_exact_mut(2).zip(&tmp) {
-        d.copy_from_slice(&v.to_le_bytes());
-    }
-    Ok(geom.planar_to_raw(&planar))
+    Ok(())
 }
 
 pub(crate) fn compress(geom: &BlockGeom<'_>, raw: &[u8]) -> Vec<u8> {
@@ -311,6 +344,16 @@ pub(crate) fn compress(geom: &BlockGeom<'_>, raw: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wavelet_ops_match_reference() {
+        for l in (0..=u16::MAX).step_by(7) {
+            for h in (0..=u16::MAX).step_by(11) {
+                assert_eq!(wdec16(l, h), wdec16_reference(l, h));
+                assert_eq!(wdec14(l, h), wdec14_reference(l, h));
+            }
+        }
+    }
 
     #[test]
     fn wavelet_round_trip() {

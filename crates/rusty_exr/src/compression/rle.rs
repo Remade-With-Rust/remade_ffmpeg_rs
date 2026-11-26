@@ -11,7 +11,15 @@ const MAX_RUN: usize = 127;
 /// byte `n < 0` is followed by `-n` literal bytes; `n >= 0` by one byte
 /// repeated `n + 1` times.
 pub(crate) fn unpack(src: &[u8], out_len: usize) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(out_len);
+    let mut out = Vec::new();
+    unpack_into(src, out_len, &mut out)?;
+    Ok(out)
+}
+
+/// [`unpack`] into a reused buffer.
+pub(crate) fn unpack_into(src: &[u8], out_len: usize, out: &mut Vec<u8>) -> Result<()> {
+    out.clear();
+    out.reserve_exact(out_len);
     let mut i = 0;
     while i < src.len() {
         let n = src[i] as i8;
@@ -45,7 +53,7 @@ pub(crate) fn unpack(src: &[u8], out_len: usize) -> Result<Vec<u8>> {
             out.len()
         )));
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Encode bytes as run-length tokens (byte-identical to OpenEXR's and the
@@ -88,12 +96,15 @@ pub(crate) fn pack(data: &[u8]) -> Vec<u8> {
     out
 }
 
-pub(crate) fn decompress(data: &[u8], raw_size: usize) -> Result<Vec<u8>> {
-    let mut tmp = unpack(data, raw_size)?;
-    super::zip::undo_predictor(&mut tmp);
-    let mut out = vec![0u8; raw_size];
-    super::zip::interleave(&tmp, &mut out);
-    Ok(out)
+/// Un-RLE and undo the predictor into `scratch.a` (even bytes, then odd).
+pub(crate) fn decompress_halves(
+    data: &[u8],
+    raw_size: usize,
+    scratch: &mut super::Scratch,
+) -> Result<()> {
+    unpack_into(data, raw_size, &mut scratch.a)?;
+    super::zip::undo_predictor(&mut scratch.a);
+    Ok(())
 }
 
 pub(crate) fn compress(raw: &[u8]) -> Vec<u8> {
@@ -122,7 +133,11 @@ mod tests {
             let p = pack(&c);
             assert_eq!(unpack(&p, c.len()).unwrap(), c);
             let z = compress(&c);
-            assert_eq!(decompress(&z, c.len()).unwrap(), c);
+            let mut s = crate::compression::Scratch::default();
+            decompress_halves(&z, c.len(), &mut s).unwrap();
+            let mut back = vec![0; c.len()];
+            crate::compression::zip::interleave(&s.a, &mut back);
+            assert_eq!(back, c);
         }
     }
 }

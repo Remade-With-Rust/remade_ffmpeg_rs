@@ -124,6 +124,71 @@ impl BlockGeom<'_> {
     }
 }
 
+/// Per-worker reusable decode state: buffers that keep their capacity
+/// from chunk to chunk, and one zlib inflater that is reset, not rebuilt.
+#[derive(Default)]
+pub(crate) struct Scratch {
+    pub a: Vec<u8>,
+    pub b: Vec<u8>,
+    pub w: Vec<u16>,
+    pub lut: Vec<u16>,
+    inflater: Option<flate2::Decompress>,
+}
+
+/// Where a decompressed chunk's bytes are, and in which layout.
+pub(crate) enum Layout<'s> {
+    /// The raw line-interleaved layout.
+    Raw(&'s [u8]),
+    /// The raw layout split into its even bytes (first half) and odd bytes
+    /// (second half): ZIP and RLE before their final interleave.
+    Halves(&'s [u8]),
+    /// Channel-planar little-endian bytes (each channel's rows contiguous,
+    /// channels in list order).
+    Planar(&'s [u8]),
+    /// Channel-planar 16-bit words (32-bit samples as low, high pairs).
+    PlanarU16(&'s [u16]),
+}
+
+/// Inflate a zlib stream into `out`, which ends up exactly `n` bytes long.
+/// `out`'s capacity is reused and never zero-filled first.
+pub(crate) fn inflate_vec(
+    inflater: &mut Option<flate2::Decompress>,
+    src: &[u8],
+    out: &mut Vec<u8>,
+    n: usize,
+) -> Result<()> {
+    let d = match inflater {
+        Some(d) => {
+            d.reset(true);
+            d
+        }
+        None => inflater.insert(flate2::Decompress::new(true)),
+    };
+    out.clear();
+    out.reserve_exact(n);
+    let status = d
+        .decompress_vec(src, out, flate2::FlushDecompress::Finish)
+        .map_err(|e| Error::invalid(format!("zlib data: {e}")))?;
+    if status != flate2::Status::StreamEnd || out.len() != n {
+        return Err(Error::invalid(format!(
+            "zlib data inflates to {} or more bytes, expected {n}",
+            out.len()
+        )));
+    }
+    Ok(())
+}
+
+impl Scratch {
+    /// Inflate into `self.a`.
+    pub fn inflate_a(&mut self, src: &[u8], n: usize) -> Result<()> {
+        inflate_vec(&mut self.inflater, src, &mut self.a, n)
+    }
+    /// Inflate into `self.b`.
+    pub fn inflate_b(&mut self, src: &[u8], n: usize) -> Result<()> {
+        inflate_vec(&mut self.inflater, src, &mut self.b, n)
+    }
+}
+
 /// Inflate a zlib stream into exactly `out.len()` bytes.
 pub(crate) fn inflate_exact(src: &[u8], out: &mut [u8]) -> Result<()> {
     let mut d = flate2::Decompress::new(true);
@@ -145,13 +210,14 @@ pub(crate) fn deflate(data: &[u8], level: u8) -> Vec<u8> {
     miniz_oxide::deflate::compress_to_vec_zlib(data, level)
 }
 
-/// Decompress one chunk into its raw layout.
-pub(crate) fn decompress(
+/// Decompress one chunk, leaving the result in `data` or `scratch`.
+pub(crate) fn decompress_layout<'a>(
     compression: Compression,
     geom: &BlockGeom<'_>,
-    data: &[u8],
+    data: &'a [u8],
     max_chunk_bytes: u64,
-) -> Result<Vec<u8>> {
+    scratch: &'a mut Scratch,
+) -> Result<Layout<'a>> {
     if geom.raw_size as u64 > max_chunk_bytes {
         return Err(Error::limit(format!("chunk of {} bytes", geom.raw_size)));
     }
@@ -165,17 +231,60 @@ pub(crate) fn decompress(
                 geom.raw_size
             )));
         }
-        return Ok(data.to_vec());
+        return Ok(Layout::Raw(data));
     }
     match compression {
         Compression::None => unreachable!(),
-        Compression::Rle => rle::decompress(data, geom.raw_size),
-        Compression::Zips | Compression::Zip => zip::decompress(data, geom.raw_size),
-        Compression::Piz => piz::decompress(geom, data),
-        Compression::Pxr24 => pxr24::decompress(geom, data),
-        Compression::B44 | Compression::B44a => b44::decompress(geom, data),
-        Compression::Dwaa | Compression::Dwab => dwa::decompress(geom, data),
+        Compression::Rle => {
+            rle::decompress_halves(data, geom.raw_size, scratch)?;
+            Ok(Layout::Halves(&scratch.a))
+        }
+        Compression::Zips | Compression::Zip => {
+            zip::decompress_halves(data, geom.raw_size, scratch)?;
+            Ok(Layout::Halves(&scratch.a))
+        }
+        Compression::Piz => {
+            piz::decompress(geom, data, scratch)?;
+            Ok(Layout::PlanarU16(&scratch.w))
+        }
+        Compression::Pxr24 => {
+            pxr24::decompress(geom, data, scratch)?;
+            Ok(Layout::Raw(&scratch.a))
+        }
+        Compression::B44 | Compression::B44a => {
+            scratch.a = b44::decompress(geom, data)?;
+            Ok(Layout::Planar(&scratch.a))
+        }
+        Compression::Dwaa | Compression::Dwab => {
+            scratch.a = dwa::decompress(geom, data)?;
+            Ok(Layout::Planar(&scratch.a))
+        }
     }
+}
+
+/// Decompress one chunk into a fresh raw-layout buffer (the chunk API).
+pub(crate) fn decompress(
+    compression: Compression,
+    geom: &BlockGeom<'_>,
+    data: &[u8],
+    max_chunk_bytes: u64,
+) -> Result<Vec<u8>> {
+    let mut scratch = Scratch::default();
+    Ok(
+        match decompress_layout(compression, geom, data, max_chunk_bytes, &mut scratch)? {
+            Layout::Raw(r) => r.to_vec(),
+            Layout::Halves(h) => {
+                let mut out = vec![0u8; h.len()];
+                zip::interleave(h, &mut out);
+                out
+            }
+            Layout::Planar(p) => geom.planar_to_raw(p),
+            Layout::PlanarU16(w) => {
+                let bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+                geom.planar_to_raw(&bytes)
+            }
+        },
+    )
 }
 
 /// Compress one chunk from its raw layout. Returns the bytes to store

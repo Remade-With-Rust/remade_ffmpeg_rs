@@ -1,8 +1,5 @@
 //! Reading EXR files: structure, chunks, and image assembly.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
-
 use crate::compression::{self, count_sampled, sampled, BlockGeom, ChanGeom};
 use crate::error::{Error, Limits, Result};
 use crate::header::{
@@ -601,9 +598,15 @@ impl<'a> Decoder<'a> {
         })
     }
 
-    /// Read and decompress chunk `index` of part `part`.
-    pub fn decode_chunk(&self, part: usize, index: usize) -> Result<Block> {
-        let p = self.part(part)?;
+    /// Locate chunk `index` of part `part`, validate its header, and return
+    /// its position, geometry and packed bytes.
+    #[allow(clippy::type_complexity)]
+    fn chunk_data<'s>(
+        &'s self,
+        p: &'s Part,
+        part: usize,
+        index: usize,
+    ) -> Result<(ChunkPos, (i32, i32, usize, usize), &'s [u8])> {
         if index >= p.info.chunk_count {
             return Err(Error::usage(format!(
                 "chunk {index} of {}",
@@ -611,8 +614,7 @@ impl<'a> Decoder<'a> {
             )));
         }
         let pos = Self::chunk_pos(&p.info, index)?;
-        let (x0, y0, w, lines) = Self::chunk_rect(&p.info, pos);
-        let geom = Self::geom(&p.info, x0, y0, w, lines)?;
+        let rect = Self::chunk_rect(&p.info, pos);
         let off = p.offsets[index];
         if off >= self.data.len() as u64 || off < 8 {
             return Err(Error::invalid(format!(
@@ -654,7 +656,14 @@ impl<'a> Decoder<'a> {
         if size < 0 || size as usize > c.remaining() {
             return Err(Error::invalid(format!("chunk {index} data size {size}")));
         }
-        let packed = c.bytes(size as usize)?;
+        Ok((pos, rect, c.bytes(size as usize)?))
+    }
+
+    /// Read and decompress chunk `index` of part `part`.
+    pub fn decode_chunk(&self, part: usize, index: usize) -> Result<Block> {
+        let p = self.part(part)?;
+        let (pos, (x0, y0, w, lines), packed) = self.chunk_data(p, part, index)?;
+        let geom = Self::geom(&p.info, x0, y0, w, lines)?;
         let data = compression::decompress(
             p.info.compression,
             &geom,
@@ -684,24 +693,44 @@ impl<'a> Decoder<'a> {
     pub fn decode_level(&self, i: usize, lx: usize, ly: usize) -> Result<Image> {
         let p = self.part(i)?;
         let info = &p.info;
-        // Chunk range and level size.
-        let (chunks, lw, lh): (Vec<usize>, usize, usize) = match &info.levels {
+        let dw = info.data_window;
+        // Row bands: disjoint row ranges of the output, each with the chunks
+        // that fill it. A scanline block is one band; a row of tiles is one.
+        let (bands, lw, lh): (Vec<(i32, usize, Vec<usize>)>, usize, usize) = match &info.levels {
             None => {
                 if lx != 0 || ly != 0 {
                     return Err(Error::usage("scanline parts have one level"));
                 }
-                ((0..info.chunk_count).collect(), info.width, info.height)
+                let lpb = info.compression.lines_per_block() as usize;
+                let bands = (0..info.chunk_count)
+                    .map(|k| {
+                        let y0 = dw.y_min + (k * lpb) as i32;
+                        (y0, lpb.min(info.height - k * lpb), vec![k])
+                    })
+                    .collect();
+                (bands, info.width, info.height)
             }
             Some(lv) => {
                 let li = lv
                     .level_index(lx, ly)
                     .ok_or_else(|| Error::usage(format!("level ({lx}, {ly})")))?;
-                let n = lv.tiles_x(lx) * lv.tiles_y(ly);
+                let (tx, ty) = (lv.tiles_x(lx), lv.tiles_y(ly));
+                let th = lv.desc.y_size as usize;
                 let first = lv.first_chunk[li];
-                ((first..first + n).collect(), lv.widths[lx], lv.heights[ly])
+                let lh = lv.heights[ly];
+                let bands = (0..ty)
+                    .map(|r| {
+                        let y0 = dw.y_min + (r * th) as i32;
+                        (
+                            y0,
+                            th.min(lh - r * th),
+                            (0..tx).map(|c| first + r * tx + c).collect(),
+                        )
+                    })
+                    .collect();
+                (bands, lv.widths[lx], lh)
             }
         };
-        let dw = info.data_window;
         let level_window = Box2i {
             x_min: dw.x_min,
             y_min: dw.y_min,
@@ -709,80 +738,96 @@ impl<'a> Decoder<'a> {
             y_max: dw.y_min + lh as i32 - 1,
         };
         let mut total = 0u64;
-        let mut planes = Vec::with_capacity(info.channels.len());
+        let mut sizes = Vec::with_capacity(info.channels.len());
         for c in &info.channels {
             let cw = count_sampled(dw.x_min, lw, c.x_sampling);
             let ch = count_sampled(dw.y_min, lh, c.y_sampling);
-            let n = cw * ch;
-            total += (n * c.sample_type.bytes()) as u64;
+            total += (cw * ch * c.sample_type.bytes()) as u64;
             if total > self.limits.max_image_bytes {
                 return Err(Error::limit(format!("image of more than {total} bytes")));
             }
-            planes.push((cw, ch, n));
+            sizes.push((cw, ch));
         }
-        // Every chunk must hold at least its header, so a file cannot claim
-        // more image than it could possibly carry blocks for.
         let mut channels: Vec<Channel> = info
             .channels
             .iter()
-            .zip(&planes)
-            .map(|(d, &(w, h, n))| Channel {
+            .zip(&sizes)
+            .map(|(d, &(w, h))| Channel {
                 desc: d.clone(),
                 width: w,
                 height: h,
                 samples: match d.sample_type {
-                    SampleType::F16 => Samples::F16(vec![0; n]),
-                    SampleType::F32 => Samples::F32(vec![0.0; n]),
-                    SampleType::U32 => Samples::U32(vec![0; n]),
+                    SampleType::F16 => Samples::F16(vec![0; w * h]),
+                    SampleType::F32 => Samples::F32(vec![0.0; w * h]),
+                    SampleType::U32 => Samples::U32(vec![0; w * h]),
                 },
             })
             .collect();
 
-        let nthreads = self.threads.resolve().min(chunks.len()).max(1);
-        if nthreads == 1 {
-            for &ci in &chunks {
-                let b = self.decode_chunk(i, ci)?;
-                place(&mut channels, dw, &b);
+        // Split every channel plane into the bands' row ranges.
+        let mut per_band: Vec<Vec<PlaneMut<'_>>> = (0..bands.len()).map(|_| Vec::new()).collect();
+        for ch in &mut channels {
+            let ys = ch.desc.y_sampling;
+            let w = ch.width;
+            let mut rest = PlaneMut::from(&mut ch.samples);
+            for (b, (y0, lines, _)) in bands.iter().enumerate() {
+                let rows = count_sampled(*y0, *lines, ys);
+                let (head, tail) = rest.split_at(rows * w);
+                per_band[b].push(head);
+                rest = tail;
             }
-        } else {
-            let next = AtomicUsize::new(0);
-            let (tx, rx) = mpsc::sync_channel::<(usize, Result<Block>)>(nthreads * 2);
-            let mut first_err: Option<(usize, Error)> = None;
-            std::thread::scope(|s| {
-                for _ in 0..nthreads {
-                    let tx = tx.clone();
-                    let next = &next;
-                    let chunks = &chunks;
-                    s.spawn(move || loop {
-                        let k = next.fetch_add(1, Ordering::Relaxed);
-                        if k >= chunks.len() {
-                            break;
-                        }
-                        let r = self.decode_chunk(i, chunks[k]);
-                        if tx.send((k, r)).is_err() {
-                            break;
-                        }
-                    });
-                }
-                drop(tx);
-                for (k, r) in rx {
-                    match r {
-                        Ok(b) => {
-                            if first_err.is_none() {
-                                place(&mut channels, dw, &b);
-                            }
-                        }
-                        Err(e) => {
-                            if first_err.as_ref().is_none_or(|(fk, _)| k < *fk) {
-                                first_err = Some((k, e));
-                            }
-                        }
+        }
+        let tasks: Vec<Task<'_>> = bands
+            .into_iter()
+            .zip(per_band)
+            .map(|((y0, _, chunks), planes)| Task {
+                y0,
+                chunks,
+                planes,
+                widths: sizes.iter().map(|s| s.0).collect(),
+            })
+            .collect();
+
+        let nthreads = self.threads.resolve().min(tasks.len()).max(1);
+        let errors: std::sync::Mutex<Vec<(usize, Error)>> = std::sync::Mutex::new(Vec::new());
+        let queue = std::sync::Mutex::new(tasks.into_iter());
+        let work = || {
+            let mut scratch = compression::Scratch::default();
+            loop {
+                let task = {
+                    let mut q = queue
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    q.next()
+                };
+                let Some(mut task) = task else { break };
+                let chunks = std::mem::take(&mut task.chunks);
+                for &ci in &chunks {
+                    if let Err(e) = self.decode_into(p, i, ci, &mut task, &mut scratch) {
+                        errors
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((ci, e));
+                        break;
                     }
                 }
-            });
-            if let Some((_, e)) = first_err {
-                return Err(e);
             }
+        };
+        if nthreads == 1 {
+            work();
+        } else {
+            std::thread::scope(|s| {
+                for _ in 0..nthreads {
+                    s.spawn(work);
+                }
+            });
+        }
+        let mut errors = errors
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !errors.is_empty() {
+            errors.sort_by_key(|(k, _)| *k);
+            return Err(errors.swap_remove(0).1);
         }
         Ok(Image {
             header: p.header.clone(),
@@ -791,45 +836,242 @@ impl<'a> Decoder<'a> {
             channels,
         })
     }
+
+    /// Decode chunk `ci` straight into a band's planes.
+    fn decode_into(
+        &self,
+        p: &Part,
+        part: usize,
+        ci: usize,
+        task: &mut Task<'_>,
+        scratch: &mut compression::Scratch,
+    ) -> Result<()> {
+        let (_, (x0, y0, w, lines), packed) = self.chunk_data(p, part, ci)?;
+        let geom = Self::geom(&p.info, x0, y0, w, lines)?;
+        let layout = compression::decompress_layout(
+            p.info.compression,
+            &geom,
+            packed,
+            self.limits.max_chunk_bytes,
+            scratch,
+        )?;
+        place(&p.info, &geom, x0, task, &layout);
+        Ok(())
+    }
 }
 
-/// Copy a decoded chunk into the channel planes.
-fn place(channels: &mut [Channel], dw: Box2i, b: &Block) {
-    let mut off = 0usize;
-    for line in 0..b.height {
-        let y = b.y0 + line as i32;
-        for (ci, ch) in channels.iter_mut().enumerate() {
-            let ys = ch.desc.y_sampling;
-            if !sampled(y, ys) {
-                continue;
+/// A mutable view of one channel plane (or a row range of it).
+enum PlaneMut<'a> {
+    F16(&'a mut [u16]),
+    F32(&'a mut [f32]),
+    U32(&'a mut [u32]),
+}
+
+impl<'a> PlaneMut<'a> {
+    fn from(s: &'a mut Samples) -> Self {
+        match s {
+            Samples::F16(v) => Self::F16(v),
+            Samples::F32(v) => Self::F32(v),
+            Samples::U32(v) => Self::U32(v),
+        }
+    }
+    fn split_at(self, n: usize) -> (Self, Self) {
+        match self {
+            Self::F16(v) => {
+                let (a, b) = v.split_at_mut(n);
+                (Self::F16(a), Self::F16(b))
             }
-            let (n, _) = b.channel_sizes[ci];
-            let bytes = n * ch.desc.sample_type.bytes();
-            let src = &b.data[off..off + bytes];
-            off += bytes;
-            let row = ((i64::from(y) - i64::from(dw.y_min)) / i64::from(ys)) as usize;
-            let xs = ch.desc.x_sampling;
-            let col = count_sampled(
-                dw.x_min,
-                (i64::from(b.x0) - i64::from(dw.x_min)) as usize,
-                xs,
-            );
-            let start = row * ch.width + col;
-            match &mut ch.samples {
-                Samples::F16(v) => {
-                    for (d, s) in v[start..start + n].iter_mut().zip(src.chunks_exact(2)) {
-                        *d = u16::from_le_bytes([s[0], s[1]]);
+            Self::F32(v) => {
+                let (a, b) = v.split_at_mut(n);
+                (Self::F32(a), Self::F32(b))
+            }
+            Self::U32(v) => {
+                let (a, b) = v.split_at_mut(n);
+                (Self::U32(a), Self::U32(b))
+            }
+        }
+    }
+}
+
+/// One band of output rows and the chunks that fill it.
+struct Task<'a> {
+    /// First line (absolute y) of the band.
+    y0: i32,
+    chunks: Vec<usize>,
+    /// Per channel: the band's rows of that channel's plane.
+    planes: Vec<PlaneMut<'a>>,
+    /// Per channel: plane width in samples.
+    widths: Vec<usize>,
+}
+
+/// Little-endian 16-bit samples from bytes.
+#[inline]
+fn put16(dst: &mut [u16], src: &[u8]) {
+    for (d, s) in dst.iter_mut().zip(src.chunks_exact(2)) {
+        *d = u16::from_le_bytes([s[0], s[1]]);
+    }
+}
+
+/// Little-endian 32-bit samples from bytes.
+#[inline]
+fn put32(dst: &mut [u32], src: &[u8]) {
+    for (d, s) in dst.iter_mut().zip(src.chunks_exact(4)) {
+        *d = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+    }
+}
+
+#[inline]
+fn put32f(dst: &mut [f32], src: &[u8]) {
+    for (d, s) in dst.iter_mut().zip(src.chunks_exact(4)) {
+        *d = f32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+    }
+}
+
+/// 16-bit samples whose low bytes are in `a` and high bytes in `b`.
+#[inline]
+fn put16_halves(dst: &mut [u16], a: &[u8], b: &[u8]) {
+    for ((d, &lo), &hi) in dst.iter_mut().zip(a).zip(b) {
+        *d = u16::from(lo) | (u16::from(hi) << 8);
+    }
+}
+
+/// 32-bit samples whose bytes 0/2 are in `a` and 1/3 in `b`.
+#[inline]
+fn put32_halves(dst: &mut [u32], a: &[u8], b: &[u8]) {
+    for ((d, x), y) in dst.iter_mut().zip(a.chunks_exact(2)).zip(b.chunks_exact(2)) {
+        *d = u32::from_le_bytes([x[0], y[0], x[1], y[1]]);
+    }
+}
+
+/// 32-bit samples from (low, high) 16-bit word pairs.
+#[inline]
+fn put32_words(dst: &mut [u32], src: &[u16]) {
+    for (d, s) in dst.iter_mut().zip(src.chunks_exact(2)) {
+        *d = u32::from(s[0]) | (u32::from(s[1]) << 16);
+    }
+}
+
+/// Source of one row segment.
+enum Seg<'s> {
+    Bytes(&'s [u8]),
+    Halves(&'s [u8], &'s [u8]),
+    Words(&'s [u16]),
+}
+
+fn put_row(dst: &mut PlaneMut<'_>, start: usize, n: usize, seg: Seg<'_>) {
+    match (dst, seg) {
+        (PlaneMut::F16(v), Seg::Bytes(s)) => put16(&mut v[start..start + n], s),
+        (PlaneMut::F16(v), Seg::Halves(a, b)) => put16_halves(&mut v[start..start + n], a, b),
+        (PlaneMut::F16(v), Seg::Words(w)) => v[start..start + n].copy_from_slice(&w[..n]),
+        (PlaneMut::U32(v), Seg::Bytes(s)) => put32(&mut v[start..start + n], s),
+        (PlaneMut::U32(v), Seg::Halves(a, b)) => put32_halves(&mut v[start..start + n], a, b),
+        (PlaneMut::U32(v), Seg::Words(w)) => put32_words(&mut v[start..start + n], w),
+        (PlaneMut::F32(v), Seg::Bytes(s)) => put32f(&mut v[start..start + n], s),
+        (PlaneMut::F32(v), Seg::Halves(a, b)) => {
+            for ((d, x), y) in v[start..start + n]
+                .iter_mut()
+                .zip(a.chunks_exact(2))
+                .zip(b.chunks_exact(2))
+            {
+                *d = f32::from_le_bytes([x[0], y[0], x[1], y[1]]);
+            }
+        }
+        (PlaneMut::F32(v), Seg::Words(w)) => {
+            for (d, s) in v[start..start + n].iter_mut().zip(w.chunks_exact(2)) {
+                *d = f32::from_bits(u32::from(s[0]) | (u32::from(s[1]) << 16));
+            }
+        }
+    }
+}
+
+/// Copy a decompressed chunk into a band's planes.
+fn place(
+    info: &PartInfo,
+    geom: &BlockGeom<'_>,
+    x0: i32,
+    task: &mut Task<'_>,
+    layout: &compression::Layout<'_>,
+) {
+    let dw = info.data_window;
+    // Per channel: plane width, the chunk's first column, and the band row
+    // index of the chunk's first sampled line.
+    let mut cols = Vec::with_capacity(geom.chans.len());
+    for (c, g) in geom.chans.iter().enumerate() {
+        let col = count_sampled(
+            dw.x_min,
+            (i64::from(x0) - i64::from(dw.x_min)) as usize,
+            g.x_sampling,
+        );
+        let row0 = count_sampled(
+            task.y0,
+            (i64::from(geom.y0) - i64::from(task.y0)) as usize,
+            g.y_sampling,
+        );
+        let pw = task.widths[c];
+        cols.push((pw, col, row0));
+    }
+    match *layout {
+        compression::Layout::Raw(_) | compression::Layout::Halves(_) => {
+            let (raw, half) = match *layout {
+                compression::Layout::Raw(r) => (r, 0),
+                compression::Layout::Halves(h) => (h, h.len() / 2),
+                _ => unreachable!(),
+            };
+            let mut off = 0usize;
+            let mut rows = vec![0usize; geom.chans.len()];
+            for line in 0..geom.lines {
+                let y = geom.y0 + line as i32;
+                for (c, g) in geom.chans.iter().enumerate() {
+                    if !sampled(y, g.y_sampling) {
+                        continue;
                     }
+                    let n = g.width;
+                    let nb = n * g.ty.bytes();
+                    let (pw, col, row0) = cols[c];
+                    let start = (row0 + rows[c]) * pw + col;
+                    rows[c] += 1;
+                    let seg = if half == 0 {
+                        Seg::Bytes(&raw[off..off + nb])
+                    } else {
+                        let h = off / 2;
+                        Seg::Halves(&raw[h..h + nb / 2], &raw[half + h..half + h + nb / 2])
+                    };
+                    put_row(&mut task.planes[c], start, n, seg);
+                    off += nb;
                 }
-                Samples::F32(v) => {
-                    for (d, s) in v[start..start + n].iter_mut().zip(src.chunks_exact(4)) {
-                        *d = f32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-                    }
+            }
+        }
+        compression::Layout::Planar(bytes) => {
+            let mut off = 0usize;
+            for (c, g) in geom.chans.iter().enumerate() {
+                let (pw, col, row0) = cols[c];
+                let rb = g.row_bytes();
+                for r in 0..g.height {
+                    let start = (row0 + r) * pw + col;
+                    put_row(
+                        &mut task.planes[c],
+                        start,
+                        g.width,
+                        Seg::Bytes(&bytes[off..off + rb]),
+                    );
+                    off += rb;
                 }
-                Samples::U32(v) => {
-                    for (d, s) in v[start..start + n].iter_mut().zip(src.chunks_exact(4)) {
-                        *d = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-                    }
+            }
+        }
+        compression::Layout::PlanarU16(words) => {
+            let mut off = 0usize;
+            for (c, g) in geom.chans.iter().enumerate() {
+                let (pw, col, row0) = cols[c];
+                let rw = g.width * g.ty.bytes() / 2;
+                for r in 0..g.height {
+                    let start = (row0 + r) * pw + col;
+                    put_row(
+                        &mut task.planes[c],
+                        start,
+                        g.width,
+                        Seg::Words(&words[off..off + rw]),
+                    );
+                    off += rw;
                 }
             }
         }

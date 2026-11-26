@@ -72,39 +72,47 @@ impl<'a> BitIn<'a> {
             count: 0,
         }
     }
-    #[inline]
+    /// Top the buffer up to at least 57 valid bits (zeros past the end).
+    #[inline(always)]
     fn refill(&mut self) {
-        while self.count <= 56 {
-            let b = if self.byte < self.data.len() {
-                self.data[self.byte]
-            } else {
-                0
-            };
-            self.byte += 1;
-            self.buf |= u64::from(b) << (56 - self.count);
-            self.count += 8;
+        if self.count > 56 {
+            return;
+        }
+        if let Some(b) = self.data.get(self.byte..self.byte + 8) {
+            let v = u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+            self.buf |= v >> self.count;
+            let take = (63 - self.count) >> 3;
+            self.byte += take as usize;
+            self.count += take << 3;
+        } else {
+            while self.count <= 56 {
+                let b = self.data.get(self.byte).copied().unwrap_or(0);
+                self.byte += 1;
+                self.buf |= u64::from(b) << (56 - self.count);
+                self.count += 8;
+            }
         }
     }
-    /// The next `n` bits (1..=58), MSB first. Requires a refill first.
-    #[inline]
+    /// The next `n` bits (1..=57), MSB first. Requires a refill first.
+    #[inline(always)]
     fn peek(&self, n: u32) -> u64 {
         self.buf >> (64 - n)
     }
-    #[inline]
+    #[inline(always)]
     fn consume(&mut self, n: u32) {
         self.buf <<= n;
         self.count -= n;
     }
 }
 
-/// Unpack the code-length table.
+/// Unpack the code-length table into `table` (entries `im..=imax`).
 fn unpack_table(
     c: &mut BitIn<'_>,
     limit_bits: u64,
     im: usize,
     imax: usize,
-) -> Result<(Vec<u64>, u64)> {
-    let mut table = vec![0u64; ENC_SIZE];
+    table: &mut [u64],
+) -> Result<u64> {
     let mut used = 0u64;
     let mut take = |c: &mut BitIn<'_>, n: u32| -> Result<u64> {
         used += u64::from(n);
@@ -138,23 +146,54 @@ fn unpack_table(
             i += 1;
         }
     }
-    canonical(&mut table)?;
-    Ok((table, used))
+    Ok(used)
 }
 
-/// Short-code table entry: `symbol << 8 | length`; 0 = empty; long-code
-/// slots hold `LONG | index` into the long-candidate lists.
+/// Short-code table entry: `symbol << 8 | length`; 0 = no code; `LONG`
+/// marks a prefix that starts a code longer than `DEC_BITS`.
 const LONG: u32 = 0x8000_0000;
 
+/// Decoding tables for one stream.
 struct DecTable {
+    /// Indexed by the next `DEC_BITS` bits.
     short: Vec<u32>,
-    /// Candidate symbols for each long-code slot, in symbol order.
-    long: Vec<Vec<u32>>,
+    /// Per code length: the first (numerically smallest) code.
+    first: [u64; 59],
+    /// Per code length: number of codes.
+    count: [u32; 59],
+    /// Per code length: index of its first symbol in `syms`.
+    offset: [u32; 59],
+    /// Symbols ordered by (length, code).
+    syms: Vec<u32>,
 }
 
+/// Build the decoding tables from canonical `length | code << 6` entries.
+///
+/// OpenEXR's canonical codes give longer codes numerically smaller values:
+/// at `L` bits, every code longer than `L` has a prefix below the first
+/// `L`-bit code, and every shorter code extends above the last one. So the
+/// length of the code at the head of the stream is the smallest `L` whose
+/// `L`-bit prefix is at least `first[L]`, and that prefix's distance from
+/// `first[L]` indexes the symbol.
 fn build_dec_table(table: &[u64], im: usize, imax: usize) -> Result<DecTable> {
     let mut short = vec![0u32; DEC_SIZE];
-    let mut long: Vec<Vec<u32>> = Vec::new();
+    let mut count = [0u32; 59];
+    let mut first = [u64::MAX; 59];
+    for &e in &table[im..=imax] {
+        let l = hlen(e) as usize;
+        if l > 0 {
+            count[l] += 1;
+            first[l] = first[l].min(hcode(e));
+        }
+    }
+    let mut offset = [0u32; 59];
+    let mut total = 0u32;
+    for l in 1..59 {
+        offset[l] = total;
+        total += count[l];
+    }
+    let mut syms = vec![0u32; total as usize];
+    let mut kraft = 0u128;
     for (sym, &e) in table.iter().enumerate().take(imax + 1).skip(im) {
         let c = hcode(e);
         let l = hlen(e);
@@ -164,19 +203,21 @@ fn build_dec_table(table: &[u64], im: usize, imax: usize) -> Result<DecTable> {
         if c >> l != 0 {
             return Err(Error::invalid("Huffman code exceeds its length"));
         }
+        kraft += 1u128 << (58 - l);
+        let idx = c - first[l as usize];
+        if idx >= u64::from(count[l as usize]) {
+            return Err(Error::invalid("Huffman codes not canonical"));
+        }
+        syms[(offset[l as usize] + idx as u32) as usize] = sym as u32;
         if l > u64::from(DEC_BITS) {
             let slot = (c >> (l - u64::from(DEC_BITS))) as usize;
             let s = short[slot];
-            if s == 0 {
-                short[slot] = LONG | long.len() as u32;
-                long.push(vec![sym as u32]);
-            } else if s & LONG != 0 {
-                long[(s & !LONG) as usize].push(sym as u32);
-            } else {
+            if s != 0 && s != LONG {
                 return Err(Error::invalid(
                     "Huffman long code collides with a short one",
                 ));
             }
+            short[slot] = LONG;
         } else {
             let start = (c << (u64::from(DEC_BITS) - l)) as usize;
             let n = 1usize << (u64::from(DEC_BITS) - l);
@@ -189,11 +230,27 @@ fn build_dec_table(table: &[u64], im: usize, imax: usize) -> Result<DecTable> {
             }
         }
     }
-    Ok(DecTable { short, long })
+    if kraft > 1u128 << 58 {
+        return Err(Error::invalid("Huffman code lengths oversubscribed"));
+    }
+    Ok(DecTable {
+        short,
+        first,
+        count,
+        offset,
+        syms,
+    })
 }
 
 /// Decode a Huffman stream into exactly `out_len` u16 values.
 pub(crate) fn decompress(data: &[u8], out_len: usize) -> Result<Vec<u16>> {
+    let mut out = Vec::new();
+    decompress_into(data, out_len, &mut out)?;
+    Ok(out)
+}
+
+/// Parse the header and code table; returns (tables, run code, code bits).
+fn read_tables(data: &[u8]) -> Result<(Vec<u64>, usize, usize, &[u8], u64)> {
     if data.len() < 20 {
         return Err(Error::invalid("Huffman header truncated"));
     }
@@ -209,39 +266,48 @@ pub(crate) fn decompress(data: &[u8], out_len: usize) -> Result<Vec<u16>> {
         return Err(Error::invalid("Huffman bit count exceeds the data"));
     }
     let mut c = BitIn::new(body);
-    let (table, table_bits) = unpack_table(&mut c, body.len() as u64 * 8, im, imax)?;
+    let mut table = vec![0u64; imax + 1];
+    let table_bits = unpack_table(&mut c, body.len() as u64 * 8, im, imax, &mut table)?;
+    canonical(&mut table[im..=imax])?;
     // The code bits start at the byte after the table.
     let table_bytes = table_bits.div_ceil(8) as usize;
     let code = &body[table_bytes..];
     if n_bits > code.len() as u64 * 8 {
         return Err(Error::invalid("Huffman bit count exceeds the data"));
     }
+    Ok((
+        table,
+        im,
+        imax,
+        &code[..n_bits.div_ceil(8) as usize],
+        n_bits,
+    ))
+}
+
+/// [`decompress`] into a reused buffer.
+pub(crate) fn decompress_into(data: &[u8], out_len: usize, out: &mut Vec<u16>) -> Result<()> {
+    let (table, im, imax, code, n_bits) = read_tables(data)?;
     let dec = build_dec_table(&table, im, imax)?;
     let rlc = imax as u32;
 
-    let mut out: Vec<u16> = Vec::with_capacity(out_len);
-    let mut bits = BitIn::new(&code[..n_bits.div_ceil(8) as usize]);
+    out.clear();
+    out.resize(out_len, 0);
+    let mut pos = 0usize;
+    let mut bits = BitIn::new(code);
     let mut left = n_bits;
     while left > 0 {
-        bits.refill();
+        // 32 bits cover a short code (<= 14) and a run count (8).
+        if bits.count < 32 {
+            bits.refill();
+        }
         let e = dec.short[bits.peek(DEC_BITS) as usize];
-        let (sym, l) = if e & LONG == 0 {
-            let l = e & 0xff;
-            if l == 0 {
-                return Err(Error::invalid("invalid Huffman code"));
-            }
-            (e >> 8, l)
+        let (sym, l) = if e & 0xff != 0 {
+            (e >> 8, e & 0xff)
+        } else if e == LONG {
+            bits.refill();
+            decode_long(&dec, &bits)?
         } else {
-            let mut found = None;
-            for &s in &dec.long[(e & !LONG) as usize] {
-                let te = table[s as usize];
-                let l = hlen(te) as u32;
-                if u64::from(l) <= left && bits.peek(l) == hcode(te) {
-                    found = Some((s, l));
-                    break;
-                }
-            }
-            found.ok_or_else(|| Error::invalid("invalid Huffman code"))?
+            return Err(Error::invalid("invalid Huffman code"));
         };
         if u64::from(l) > left {
             return Err(Error::invalid("Huffman code runs past the bit count"));
@@ -256,25 +322,83 @@ pub(crate) fn decompress(data: &[u8], out_len: usize) -> Result<Vec<u16>> {
             let n = bits.peek(8) as usize;
             bits.consume(8);
             left -= 8;
-            let Some(&last) = out.last() else {
+            if pos == 0 {
                 return Err(Error::invalid("Huffman run with nothing to repeat"));
-            };
-            if out.len() + n > out_len {
+            }
+            if pos + n > out_len {
                 return Err(Error::invalid("Huffman data longer than expected"));
             }
+            let last = out[pos - 1];
+            out[pos..pos + n].fill(last);
+            pos += n;
+        } else {
+            let Some(slot) = out.get_mut(pos) else {
+                return Err(Error::invalid("Huffman data longer than expected"));
+            };
+            *slot = sym as u16;
+            pos += 1;
+        }
+    }
+    if pos != out_len {
+        return Err(Error::invalid(format!(
+            "Huffman data decodes to {pos} values, expected {out_len}"
+        )));
+    }
+    Ok(())
+}
+
+/// The code longer than `DEC_BITS` at the head of the stream.
+#[cold]
+#[inline(never)]
+fn decode_long(dec: &DecTable, bits: &BitIn<'_>) -> Result<(u32, u32)> {
+    for l in DEC_BITS + 1..=57 {
+        let p = bits.peek(l);
+        let f = dec.first[l as usize];
+        if p >= f {
+            let idx = p - f;
+            if idx >= u64::from(dec.count[l as usize]) {
+                break;
+            }
+            return Ok((dec.syms[(dec.offset[l as usize] + idx as u32) as usize], l));
+        }
+    }
+    Err(Error::invalid("invalid Huffman code"))
+}
+
+/// The straightforward decoder (per-slot candidate lists), kept as the
+/// oracle for [`decompress_into`].
+#[cfg(test)]
+fn decompress_reference(data: &[u8], out_len: usize) -> Result<Vec<u16>> {
+    let (table, im, imax, code, n_bits) = read_tables(data)?;
+    let mut out = Vec::new();
+    let mut bits = BitIn::new(code);
+    let mut left = n_bits;
+    while left > 0 {
+        bits.refill();
+        let mut found = None;
+        for (sym, &e) in table.iter().enumerate().take(imax + 1).skip(im) {
+            let l = hlen(e) as u32;
+            if l > 0 && u64::from(l) <= left && bits.peek(l) == hcode(e) {
+                found = Some((sym as u32, l));
+                break;
+            }
+        }
+        let (sym, l) = found.ok_or_else(|| Error::invalid("invalid Huffman code"))?;
+        bits.consume(l);
+        left -= u64::from(l);
+        if sym == imax as u32 {
+            bits.refill();
+            let n = bits.peek(8) as usize;
+            bits.consume(8);
+            left = left.checked_sub(8).ok_or_else(|| Error::invalid("run"))?;
+            let last = *out.last().ok_or_else(|| Error::invalid("run"))?;
             out.resize(out.len() + n, last);
         } else {
-            if out.len() >= out_len {
-                return Err(Error::invalid("Huffman data longer than expected"));
-            }
             out.push(sym as u16);
         }
     }
     if out.len() != out_len {
-        return Err(Error::invalid(format!(
-            "Huffman data decodes to {} values, expected {out_len}",
-            out.len()
-        )));
+        return Err(Error::invalid("length"));
     }
     Ok(out)
 }
@@ -503,6 +627,50 @@ mod tests {
             let z = compress(&c).unwrap();
             assert_eq!(decompress(&z, c.len()).unwrap(), c);
         }
+    }
+
+    #[test]
+    fn fast_decoder_matches_reference() {
+        let mut seed = 99;
+        for case in 0..40 {
+            let n = 1 + (lcg(&mut seed) % 3000) as usize;
+            let spread = [2u32, 30, 300, 5000, 65536][case % 5];
+            // Skewed values so code lengths run long (past 14 bits).
+            let data: Vec<u16> = (0..n)
+                .map(|_| {
+                    let r = lcg(&mut seed);
+                    let v = (r % spread) * (r % 7 + 1) / 7;
+                    if r % 13 == 0 {
+                        v as u16
+                    } else {
+                        (v % 64) as u16
+                    }
+                })
+                .collect();
+            let z = compress(&data).unwrap();
+            assert_eq!(decompress(&z, n).unwrap(), data, "case {case}");
+            assert_eq!(decompress_reference(&z, n).unwrap(), data, "case {case}");
+        }
+    }
+
+    #[test]
+    fn long_codes_match_reference() {
+        // Geometric frequencies: symbol k appears 2^(19-k) times, so code
+        // lengths reach about 20 bits and take the long-code path.
+        let mut data = Vec::new();
+        for k in 0..20u16 {
+            data.extend(std::iter::repeat_n(k * 3 + 1, 1usize << (19 - k)));
+        }
+        let mut seed = 5;
+        for i in (1..data.len()).rev() {
+            data.swap(i, (lcg(&mut seed) as usize) % (i + 1));
+        }
+        let z = compress(&data).unwrap();
+        let (table, im, imax, _, _) = read_tables(&z).unwrap();
+        let longest = table[im..=imax].iter().map(|&e| hlen(e)).max().unwrap();
+        assert!(longest > u64::from(DEC_BITS), "longest code {longest}");
+        assert_eq!(decompress(&z, data.len()).unwrap(), data);
+        assert_eq!(decompress_reference(&z, data.len()).unwrap(), data);
     }
 
     #[test]

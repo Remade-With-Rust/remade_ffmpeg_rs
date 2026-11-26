@@ -101,5 +101,5 @@ pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
         }
         op += n;
     }
-    Ok(geom.planar_to_raw(&planar))
+    Ok(planar)
 }

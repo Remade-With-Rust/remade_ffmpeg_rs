@@ -38,16 +38,24 @@ fn packed_bytes(t: SampleType) -> usize {
     }
 }
 
-pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
+/// Decode a PXR24 chunk into `scratch.a` (raw layout).
+pub(crate) fn decompress(
+    geom: &BlockGeom<'_>,
+    data: &[u8],
+    scratch: &mut super::Scratch,
+) -> Result<()> {
     let packed_size: usize = geom
         .chans
         .iter()
         .map(|c| c.width * c.height * packed_bytes(c.ty))
         .sum();
-    let mut packed = vec![0u8; packed_size];
-    super::inflate_exact(data, &mut packed)
+    scratch
+        .inflate_b(data, packed_size)
         .map_err(|e| Error::invalid(format!("PXR24 chunk: {e}")))?;
-    let mut out = vec![0u8; geom.raw_size];
+    let packed = &scratch.b;
+    let out = &mut scratch.a;
+    out.clear();
+    out.resize(geom.raw_size, 0);
     let mut ip = 0;
     let mut op = 0;
     for line in 0..geom.lines {
@@ -59,33 +67,45 @@ pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
             let w = c.width;
             match c.ty {
                 SampleType::F16 => {
-                    let (p0, p1) = (&packed[ip..ip + w], &packed[ip + w..ip + 2 * w]);
+                    let (p0, p1) = packed[ip..ip + 2 * w].split_at(w);
                     let mut acc = 0u16;
-                    for x in 0..w {
-                        acc = acc.wrapping_add(u16::from_be_bytes([p0[x], p1[x]]));
-                        out[op + 2 * x..op + 2 * x + 2].copy_from_slice(&acc.to_le_bytes());
+                    for ((d, &hi), &lo) in out[op..op + 2 * w].chunks_exact_mut(2).zip(p0).zip(p1) {
+                        acc = acc.wrapping_add(u16::from_be_bytes([hi, lo]));
+                        d.copy_from_slice(&acc.to_le_bytes());
                     }
                     ip += 2 * w;
                     op += 2 * w;
                 }
                 SampleType::U32 => {
-                    let p = &packed[ip..ip + 4 * w];
+                    let (p0, rest) = packed[ip..ip + 4 * w].split_at(w);
+                    let (p1, rest) = rest.split_at(w);
+                    let (p2, p3) = rest.split_at(w);
                     let mut acc = 0u32;
-                    for x in 0..w {
-                        let d = u32::from_be_bytes([p[x], p[w + x], p[2 * w + x], p[3 * w + x]]);
-                        acc = acc.wrapping_add(d);
-                        out[op + 4 * x..op + 4 * x + 4].copy_from_slice(&acc.to_le_bytes());
+                    for ((((d, &a), &b), &c), &e) in out[op..op + 4 * w]
+                        .chunks_exact_mut(4)
+                        .zip(p0)
+                        .zip(p1)
+                        .zip(p2)
+                        .zip(p3)
+                    {
+                        acc = acc.wrapping_add(u32::from_be_bytes([a, b, c, e]));
+                        d.copy_from_slice(&acc.to_le_bytes());
                     }
                     ip += 4 * w;
                     op += 4 * w;
                 }
                 SampleType::F32 => {
-                    let p = &packed[ip..ip + 3 * w];
+                    let (p0, rest) = packed[ip..ip + 3 * w].split_at(w);
+                    let (p1, p2) = rest.split_at(w);
                     let mut acc = 0u32;
-                    for x in 0..w {
-                        let d = u32::from_be_bytes([p[x], p[w + x], p[2 * w + x], 0]);
-                        acc = acc.wrapping_add(d);
-                        out[op + 4 * x..op + 4 * x + 4].copy_from_slice(&acc.to_le_bytes());
+                    for (((d, &a), &b), &c) in out[op..op + 4 * w]
+                        .chunks_exact_mut(4)
+                        .zip(p0)
+                        .zip(p1)
+                        .zip(p2)
+                    {
+                        acc = acc.wrapping_add(u32::from_be_bytes([a, b, c, 0]));
+                        d.copy_from_slice(&acc.to_le_bytes());
                     }
                     ip += 3 * w;
                     op += 4 * w;
@@ -93,7 +113,7 @@ pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
             }
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 pub(crate) fn compress(geom: &BlockGeom<'_>, raw: &[u8]) -> Vec<u8> {

@@ -5,61 +5,39 @@
 use crate::error::Result;
 
 /// Undo the predictor in place: `t[i] = t[i-1] + t[i] - 128` (mod 256).
+///
+/// A byte prefix sum, eight bytes per step. Within a word the even and odd
+/// bytes are spread into 16-bit lanes, where four bytes can never overflow a
+/// lane, so one multiply by `0x0001_0001_0001_0001` forms all the lane
+/// prefix sums at once; the running byte from the previous word is added at
+/// the end. Only that final add sits on the loop-carried path.
 pub(crate) fn undo_predictor(t: &mut [u8]) {
-    // A prefix sum over bytes. Bias every byte by -128 first, then
-    // accumulate eight bytes at a time inside a u64 lane-wise (each byte is
-    // the running sum of the bytes before it within the word, plus the
-    // carry-in from the previous word broadcast to every lane). Byte lanes
-    // never interact because every step is a lane-wise wrapping add.
-    const L: u64 = 0x0101_0101_0101_0101;
-    let n = t.len();
-    if n == 0 {
+    const M: u64 = 0x00ff_00ff_00ff_00ff;
+    const SPLAT16: u64 = 0x0001_0001_0001_0001;
+    let Some((first, rest)) = t.split_first_mut() else {
         return;
+    };
+    let mut prev = *first;
+    let mut words = rest.chunks_exact_mut(8);
+    for c in &mut words {
+        // d_k - 128 (mod 256) in every byte.
+        let w = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
+            ^ 0x8080_8080_8080_8080;
+        let even = w & M;
+        let odd = (w >> 8) & M;
+        // Lane i of `pre` = sum of bytes 0..=2i+1.
+        let pre = (even + odd).wrapping_mul(SPLAT16);
+        let p = u64::from(prev) * SPLAT16;
+        let out_odd = (pre + p) & M;
+        let out_even = (pre.wrapping_sub(odd) + p) & M;
+        let out = out_even | (out_odd << 8);
+        c.copy_from_slice(&out.to_le_bytes());
+        prev = (out >> 56) as u8;
     }
-    let mut prev = t[0];
-    let mut i = 1;
-    // Head: process bytes until a word boundary is reached at index i.
-    while i < n && (i - 1) % 8 != 0 {
-        prev = prev.wrapping_add(t[i]).wrapping_sub(128);
-        t[i] = prev;
-        i += 1;
+    for v in words.into_remainder() {
+        prev = prev.wrapping_add(*v).wrapping_sub(128);
+        *v = prev;
     }
-    while i + 8 <= n {
-        let mut w = u64::from_le_bytes([
-            t[i],
-            t[i + 1],
-            t[i + 2],
-            t[i + 3],
-            t[i + 4],
-            t[i + 5],
-            t[i + 6],
-            t[i + 7],
-        ]);
-        // d_k - 128 for each lane (lane-wise subtract of 0x80 == xor 0x80).
-        w ^= 0x8080_8080_8080_8080;
-        // In-word inclusive prefix sum over byte lanes (lane-wise adds via
-        // masking so no carry crosses a lane).
-        w = add_lanes(w, w << 8);
-        w = add_lanes(w, w << 16);
-        w = add_lanes(w, w << 32);
-        // Add the carry-in (previous output byte) to every lane.
-        w = add_lanes(w, u64::from(prev) * L);
-        t[i..i + 8].copy_from_slice(&w.to_le_bytes());
-        prev = (w >> 56) as u8;
-        i += 8;
-    }
-    while i < n {
-        prev = prev.wrapping_add(t[i]).wrapping_sub(128);
-        t[i] = prev;
-        i += 1;
-    }
-}
-
-/// Lane-wise (8 x u8) wrapping add.
-#[inline(always)]
-fn add_lanes(a: u64, b: u64) -> u64 {
-    const H: u64 = 0x8080_8080_8080_8080;
-    ((a & !H).wrapping_add(b & !H)) ^ ((a ^ b) & H)
 }
 
 /// Apply the predictor in place (the inverse of [`undo_predictor`]).
@@ -98,13 +76,16 @@ pub(crate) fn deinterleave(src: &[u8], dst: &mut [u8]) {
     }
 }
 
-pub(crate) fn decompress(data: &[u8], raw_size: usize) -> Result<Vec<u8>> {
-    let mut tmp = vec![0u8; raw_size];
-    super::inflate_exact(data, &mut tmp)?;
-    undo_predictor(&mut tmp);
-    let mut out = vec![0u8; raw_size];
-    interleave(&tmp, &mut out);
-    Ok(out)
+/// Inflate and undo the predictor into `scratch.a`, which then holds the
+/// raw layout's even bytes followed by its odd bytes.
+pub(crate) fn decompress_halves(
+    data: &[u8],
+    raw_size: usize,
+    scratch: &mut super::Scratch,
+) -> Result<()> {
+    scratch.inflate_a(data, raw_size)?;
+    undo_predictor(&mut scratch.a);
+    Ok(())
 }
 
 pub(crate) fn compress(raw: &[u8]) -> Vec<u8> {

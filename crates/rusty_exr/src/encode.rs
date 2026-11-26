@@ -291,7 +291,8 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
             chans,
             raw_size,
         };
-        let mut raw = Vec::with_capacity(raw_size);
+        let mut raw = vec![0u8; raw_size];
+        let mut o = 0usize;
         for line in 0..lines {
             let y = y0 + line as i32;
             for c in &channels {
@@ -301,16 +302,25 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
                 }
                 let row = ((i64::from(y) - i64::from(dw.y_min)) / i64::from(ys)) as usize;
                 let (a, b) = (row * c.width, (row + 1) * c.width);
+                let n = c.width * c.desc.sample_type.bytes();
+                let dst = &mut raw[o..o + n];
+                o += n;
                 match &c.samples {
-                    Samples::F16(v) => v[a..b]
-                        .iter()
-                        .for_each(|s| raw.extend_from_slice(&s.to_le_bytes())),
-                    Samples::F32(v) => v[a..b]
-                        .iter()
-                        .for_each(|s| raw.extend_from_slice(&s.to_le_bytes())),
-                    Samples::U32(v) => v[a..b]
-                        .iter()
-                        .for_each(|s| raw.extend_from_slice(&s.to_le_bytes())),
+                    Samples::F16(v) => {
+                        for (d, s) in dst.chunks_exact_mut(2).zip(&v[a..b]) {
+                            d.copy_from_slice(&s.to_le_bytes());
+                        }
+                    }
+                    Samples::F32(v) => {
+                        for (d, s) in dst.chunks_exact_mut(4).zip(&v[a..b]) {
+                            d.copy_from_slice(&s.to_le_bytes());
+                        }
+                    }
+                    Samples::U32(v) => {
+                        for (d, s) in dst.chunks_exact_mut(4).zip(&v[a..b]) {
+                            d.copy_from_slice(&s.to_le_bytes());
+                        }
+                    }
                 }
             }
         }
