@@ -4672,8 +4672,9 @@ pub enum Bandwidth {
     /// Code the whole spectrum at every bitrate: the encoder as it shipped in
     /// 2.1.2 (byte-identical).
     Full,
-    /// A cutoff from the bitrate and channel count (see [`auto_bandwidth_hz`]).
-    /// The default.
+    /// A cutoff from the bitrate and channel count (see [`auto_bandwidth_hz`]):
+    /// 17 kHz under 192 kbps, 20 kHz from there to under 160 kbps a channel,
+    /// the whole spectrum above. The default.
     #[default]
     Auto,
     /// A fixed cutoff in Hz.
@@ -4698,16 +4699,27 @@ pub enum Bandwidth {
 ///   (-0.06 on one clip, -0.08 on one channel scored alone), hence the
 ///   total-rate ceiling: from 192 kbps up the bandwidth is the 2.1.2 one.
 ///
+/// Above that, and under [`AUTO_BANDWIDTH_HIGH_MAX_BPS_PER_CHANNEL`] a
+/// channel (stereo from 192 up to 318 kbps, mono from 129 to 159 kbps), the
+/// cutoff is [`AUTO_BANDWIDTH_HIGH_HZ`]; from there up, the whole spectrum.
+///
 /// Mono and stereo only: no multichannel layout was measured, so 3 or more
 /// channels keep the whole spectrum, as in 2.1.2.
 #[must_use]
 pub fn auto_bandwidth_hz(bitrate_bps: u32, channels: u16, sample_rate: u32) -> Option<u32> {
     let per_channel = bitrate_bps / u32::from(channels.max(1));
-    (channels <= 2
-        && bitrate_bps < AUTO_BANDWIDTH_MAX_BPS
-        && per_channel <= AUTO_BANDWIDTH_MAX_BPS_PER_CHANNEL)
-        .then_some(AUTO_BANDWIDTH_HZ)
-        .filter(|&hz| hz < sample_rate / 2)
+    let hz = if channels > 2 {
+        None
+    } else if bitrate_bps < AUTO_BANDWIDTH_MAX_BPS
+        && per_channel <= AUTO_BANDWIDTH_MAX_BPS_PER_CHANNEL
+    {
+        Some(AUTO_BANDWIDTH_HZ)
+    } else if per_channel < AUTO_BANDWIDTH_HIGH_MAX_BPS_PER_CHANNEL {
+        Some(AUTO_BANDWIDTH_HIGH_HZ)
+    } else {
+        None
+    };
+    hz.filter(|&hz| hz < sample_rate / 2)
 }
 
 /// The [`Bandwidth::Auto`] cutoff (see [`auto_bandwidth_hz`]).
@@ -4716,6 +4728,30 @@ const AUTO_BANDWIDTH_HZ: u32 = 17_000;
 const AUTO_BANDWIDTH_MAX_BPS: u32 = 192_000;
 /// [`Bandwidth::Auto`] limits only streams at or under this rate a channel.
 const AUTO_BANDWIDTH_MAX_BPS_PER_CHANNEL: u32 = 128_000;
+
+/// The [`Bandwidth::Auto`] cutoff from 192 kbps (stereo) up to
+/// [`AUTO_BANDWIDTH_HIGH_MAX_BPS_PER_CHANNEL`].
+///
+/// Coding 20-24 kHz at these rates takes bits the audible band needs: on
+/// 48 kHz content with energy up there (music recorded to 24 kHz, noise, an
+/// electronic patch) the noise below 20 kHz drops by 1 to 3 dB and PEAQ's
+/// noise-to-mask ratio by 0.5 to 3 dB. PEAQ ODG with both signals low-passed
+/// at 21 kHz (so its bandwidth measure, which reads the reference's bandwidth
+/// off the decoded signal above 21.6 kHz and gave a 20 kHz cutoff up to +1.9
+/// ODG on its own, plays no part), 8 such music clips x 4 time offsets:
+/// +0.017 at 192 kbps stereo, +0.019 at 224 and +0.004 at 256, no clip worse
+/// than -0.017 +- 0.013; noise-like content +0.12 to +0.17. A lower cutoff
+/// scores higher still, but this PEAQ hears little above 18 kHz, so the
+/// sweep has no optimum to read; 20 kHz is the edge of hearing (FFmpeg 9.1
+/// cuts at 19.4 and 20.9 kHz at 96 and 128 kbps a channel). Waveform SNR on
+/// content with energy above 20 kHz falls (white noise at 256 kbps 11.6 ->
+/// 7.2 dB), since that energy is no longer coded.
+const AUTO_BANDWIDTH_HIGH_HZ: u32 = 20_000;
+
+/// [`AUTO_BANDWIDTH_HIGH_HZ`] applies under this rate a channel. At 160 kbps
+/// a channel (320 kbps stereo) the same cutoff was neutral on music to -0.04
+/// ODG on three clips, so from there up the whole spectrum is coded, as before.
+const AUTO_BANDWIDTH_HIGH_MAX_BPS_PER_CHANNEL: u32 = 160_000;
 
 /// The first spectral line not coded under `hz` for a window of `n_coeffs`
 /// lines (`usize::MAX` for no limit): the start of the first band at or above
@@ -8930,15 +8966,23 @@ mod lowrate {
         assert_eq!(frame_demand_weights(&[0.0; 4], 1.0), vec![1.0; 4]);
     }
 
-    /// The automatic cutoff applies under 192 kbps and 128 kbps a channel,
+    /// The automatic cutoff: 17 kHz under 192 kbps and 128 kbps a channel,
+    /// 20 kHz from there to under 160 kbps a channel, mono and stereo only,
     /// never at or above Nyquist; the cutoff falls on a band edge.
     #[test]
     fn bandwidth_table_and_cutoff() {
         assert_eq!(auto_bandwidth_hz(64_000, 1, 44_100), Some(17_000));
         assert_eq!(auto_bandwidth_hz(128_000, 1, 44_100), Some(17_000));
+        assert_eq!(auto_bandwidth_hz(144_000, 1, 48_000), Some(20_000));
         assert_eq!(auto_bandwidth_hz(160_000, 1, 44_100), None);
         assert_eq!(auto_bandwidth_hz(160_000, 2, 44_100), Some(17_000));
-        assert_eq!(auto_bandwidth_hz(192_000, 2, 44_100), None);
+        assert_eq!(auto_bandwidth_hz(192_000, 2, 44_100), Some(20_000));
+        assert_eq!(auto_bandwidth_hz(256_000, 2, 48_000), Some(20_000));
+        assert_eq!(auto_bandwidth_hz(318_000, 2, 48_000), Some(20_000));
+        assert_eq!(auto_bandwidth_hz(320_000, 2, 48_000), None);
+        assert_eq!(auto_bandwidth_hz(512_000, 2, 48_000), None);
+        assert_eq!(auto_bandwidth_hz(640_000, 6, 48_000), None);
+        assert_eq!(auto_bandwidth_hz(256_000, 2, 32_000), None);
         assert_eq!(auto_bandwidth_hz(320_000, 6, 48_000), None);
         assert_eq!(auto_bandwidth_hz(128_000, 6, 48_000), None);
         assert_eq!(auto_bandwidth_hz(64_000, 2, 32_000), None);
