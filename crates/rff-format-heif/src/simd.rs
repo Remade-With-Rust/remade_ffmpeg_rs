@@ -519,13 +519,40 @@ mod x86 {
         }
     }
 
-    /// `(v * 255 + 0.5).clamp(0, 255) as u8`, as `i32` lanes.
+    /// `trunc(v * 255 + 0.5)` as `i32` lanes: the scalar `to8` before its
+    /// clamp. [`pack_rgba`] applies the clamp by saturation.
     #[inline(always)]
     unsafe fn to8(v: __m256) -> __m256i {
         unsafe {
-            let t = _mm256_add_ps(_mm256_mul_ps(v, _mm256_set1_ps(255.0)), _mm256_set1_ps(0.5));
-            let t = _mm256_min_ps(_mm256_max_ps(t, _mm256_setzero_ps()), _mm256_set1_ps(255.0));
-            _mm256_cvttps_epi32(t)
+            _mm256_cvttps_epi32(_mm256_add_ps(
+                _mm256_mul_ps(v, _mm256_set1_ps(255.0)),
+                _mm256_set1_ps(0.5),
+            ))
+        }
+    }
+
+    /// Eight pixels' `R`, `G`, `B` (from [`to8`]) and alpha byte (`0..=255`)
+    /// as `i32` lanes -> 32 bytes `RGBARGBA...`.
+    ///
+    /// The scalar code clamps `t = v * 255 + 0.5` to `[0, 255]` and then
+    /// truncates; this truncates first and then saturates (`packs_epi32` to
+    /// i16, `packus_epi16` to u8). The two agree for every finite `t` with
+    /// `|t| < 2^31`: for `t` in `[0, 256)` both give `trunc(t)`, for
+    /// `t >= 256` both give 255, and for `t < 0` both give 0 (`trunc(t)` is
+    /// 0 or negative). `|t|` stays far below `2^31`: even out-of-range
+    /// samples (`u16::MAX` at 8 bits, limited range) give `|t|` under 80,000.
+    /// The signed `packs` comes first on purpose: `packus_epi32` would leave
+    /// values `>= 32768` that the second pack reads as negative.
+    #[inline(always)]
+    unsafe fn pack_rgba(r: __m256i, g: __m256i, b: __m256i, a: __m256i) -> __m256i {
+        unsafe {
+            // Per 128-bit lane: r0..3 g0..3 b0..3 a0..3 as bytes.
+            let bytes = _mm256_packus_epi16(_mm256_packs_epi32(r, g), _mm256_packs_epi32(b, a));
+            let order = _mm256_setr_epi8(
+                0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15, //
+                0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+            );
+            _mm256_shuffle_epi8(bytes, order)
         }
     }
 
@@ -570,7 +597,8 @@ mod x86 {
             let a255 = _mm256_set1_epi32(255);
             let ahalf = _mm256_set1_epi32((c.amax / 2) as i32);
             let amax = _mm256_set1_ps(c.amax as f32);
-            let opaque = _mm256_set1_epi32(255 << 24);
+            let opaque = _mm256_set1_epi32(255);
+            let lowbyte = _mm256_set1_epi32(255);
             for g in 0..n / 8 {
                 let x = g * 8;
                 let yv = _mm256_mul_ps(_mm256_sub_ps(load8_f32(y.add(x)), y_off), y_scale);
@@ -608,15 +636,12 @@ mod x86 {
                     let v = _mm256_cvtepu16_epi32(_mm_loadu_si128(a.add(x) as *const __m128i));
                     let num = _mm256_add_epi32(_mm256_mullo_epi32(v, a255), ahalf);
                     let q = _mm256_cvttps_epi32(_mm256_div_ps(_mm256_cvtepi32_ps(num), amax));
-                    _mm256_slli_epi32(q, 24)
+                    // `a8 as u8` wraps rather than saturates: keep the low byte.
+                    _mm256_and_si256(q, lowbyte)
                 } else {
                     opaque
                 };
-                let px = _mm256_or_si256(
-                    _mm256_or_si256(r, _mm256_slli_epi32(gg, 8)),
-                    _mm256_or_si256(_mm256_slli_epi32(b, 16), av),
-                );
-                _mm256_storeu_si256(out.add(x * 4) as *mut __m256i, px);
+                _mm256_storeu_si256(out.add(x * 4) as *mut __m256i, pack_rgba(r, gg, b, av));
             }
         }
     }
@@ -704,7 +729,8 @@ mod x86 {
             let a255 = _mm256_set1_epi32(255);
             let ahalf = _mm256_set1_epi32((c.amax / 2) as i32);
             let amax = _mm256_set1_ps(c.amax as f32);
-            let opaque = _mm256_set1_epi32(255 << 24);
+            let opaque = _mm256_set1_epi32(255);
+            let lowbyte = _mm256_set1_epi32(255);
             for g in 0..n / 8 {
                 let x = g * 8;
                 let yv = _mm256_mul_ps(_mm256_sub_ps(load8_f32(y.add(x)), y_off), y_scale);
@@ -728,15 +754,12 @@ mod x86 {
                     let v = _mm256_cvtepu16_epi32(_mm_loadu_si128(a.add(x) as *const __m128i));
                     let num = _mm256_add_epi32(_mm256_mullo_epi32(v, a255), ahalf);
                     let q = _mm256_cvttps_epi32(_mm256_div_ps(_mm256_cvtepi32_ps(num), amax));
-                    _mm256_slli_epi32(q, 24)
+                    // `a8 as u8` wraps rather than saturates: keep the low byte.
+                    _mm256_and_si256(q, lowbyte)
                 } else {
                     opaque
                 };
-                let px = _mm256_or_si256(
-                    _mm256_or_si256(r, _mm256_slli_epi32(gg, 8)),
-                    _mm256_or_si256(_mm256_slli_epi32(b, 16), av),
-                );
-                _mm256_storeu_si256(out.add(x * 4) as *mut __m256i, px);
+                _mm256_storeu_si256(out.add(x * 4) as *mut __m256i, pack_rgba(r, gg, b, av));
             }
         }
     }
