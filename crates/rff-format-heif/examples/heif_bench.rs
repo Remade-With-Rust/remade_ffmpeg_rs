@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! heif_bench dump  <file> <out.raw>
+//! heif_bench rgba  <file> <out.raw> [threads]
 //! heif_bench bench <file> <iters> <threads>
 //! ```
 //!
@@ -57,6 +58,25 @@ fn main() {
             }
             std::fs::write(&a[3], out).expect("write output");
         }
+        Some("rgba") => {
+            let data = std::fs::read(&a[2]).expect("read input");
+            let threads: usize = a.get(4).map_or(0, |t| t.parse().expect("threads"));
+            let opts = DecodeOptions {
+                threads,
+                ..DecodeOptions::default()
+            };
+            let heif = match Heif::parse_with(&data, opts) {
+                Ok(h) => h,
+                Err(e) => fail(e),
+            };
+            let d = match heif.decode_primary() {
+                Ok(d) => d,
+                Err(e) => fail(e),
+            };
+            let mut out = format!("HEIFRGBA {} {}\n", d.image.width, d.image.height).into_bytes();
+            out.extend_from_slice(&d.to_rgba8());
+            std::fs::write(&a[3], out).expect("write output");
+        }
         Some("bench") => {
             let data = std::fs::read(&a[2]).expect("read input");
             let iters: usize = a[3].parse().expect("iters");
@@ -78,7 +98,7 @@ fn main() {
             }
             println!("px {px} bytes {bytes}");
         }
-        _ => eprintln!("usage: heif_bench dump <file> <out> | bench <file> <iters> <threads>"),
+        _ => eprintln!("usage: heif_bench dump <file> <out> | rgba <file> <out> [threads] | bench <file> <iters> <threads>"),
     }
 }
 

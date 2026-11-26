@@ -156,28 +156,42 @@ fn rotate_quarter(src: &[u16], w: usize, h: usize, q: u8, threads: usize) -> Vec
     if nw == 0 || nh == 0 {
         return dst;
     }
+    // Output rows `rows` x columns `cols` the sample at a time, into `out`
+    // (whose first row is output row `y0`).
+    let scalar = |y0: usize, out: &mut [u16], rows: (usize, usize), cols: (usize, usize)| {
+        for r in rows.0..rows.1 {
+            let yn = y0 + r;
+            let o = &mut out[r * nw + cols.0..r * nw + cols.1];
+            if q == 1 {
+                // new[yn][xn] = old[xn][w-1-yn]
+                let xo = w - 1 - yn;
+                for (d, xn) in o.iter_mut().zip(cols.0..) {
+                    *d = src[xn * w + xo];
+                }
+            } else {
+                // new[yn][xn] = old[h-1-xn][yn]
+                for (d, xn) in o.iter_mut().zip(cols.0..) {
+                    *d = src[(h - 1 - xn) * w + yn];
+                }
+            }
+        }
+    };
     // `rows` output rows starting at row `y0`, into `out` (their samples).
+    // Each block's whole 8x8 tiles go through the SIMD transpose; the ragged
+    // right and bottom strips (only at the plane's edges) go sample by sample.
     let band = |y0: usize, out: &mut [u16]| {
         let rows = out.len() / nw;
         for by in (0..rows).step_by(B) {
+            let ye = (by + B).min(rows);
+            let ty = by + (ye - by) / 8 * 8;
             for bx in (0..nw).step_by(B) {
                 let xe = (bx + B).min(nw);
-                for r in by..(by + B).min(rows) {
-                    let yn = y0 + r;
-                    let o = &mut out[r * nw + bx..r * nw + xe];
-                    if q == 1 {
-                        // new[yn][xn] = old[xn][w-1-yn]
-                        let xo = w - 1 - yn;
-                        for (d, xn) in o.iter_mut().zip(bx..) {
-                            *d = src[xn * w + xo];
-                        }
-                    } else {
-                        // new[yn][xn] = old[h-1-xn][yn]
-                        for (d, xn) in o.iter_mut().zip(bx..) {
-                            *d = src[(h - 1 - xn) * w + yn];
-                        }
-                    }
+                let tx = bx + (xe - bx) / 8 * 8;
+                if ty > by && tx > bx {
+                    crate::simd::rotate_tiles(src, w, h, q, out, nw, y0, (by, ty), (bx, tx));
                 }
+                scalar(y0, out, (by, ty), (tx, xe));
+                scalar(y0, out, (ty, ye), (bx, xe));
             }
         }
     };
@@ -456,8 +470,28 @@ mod tests {
             (130, 7),
             (7, 200),
             (257, 129),
+            // Whole 8x8 tiles only, tiles plus one ragged strip, both strips,
+            // and blocks whose tile count differs per band.
+            (8, 8),
+            (16, 9),
+            (9, 16),
+            (67, 131),
+            (136, 72),
+            (200, 70),
+            (4032 / 16, 3024 / 16 + 3),
         ] {
-            let p = ramp(w, h);
+            let mut p = ramp(w, h);
+            // Full-range values (not just a ramp): the extremes and noise.
+            let mut s = 0x9e37_79b9u32;
+            for (i, v) in p.data.iter_mut().enumerate() {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *v = match i % 5 {
+                    0 => 0xffff,
+                    1 => 0,
+                    2 => 0x3ff,
+                    _ => (s >> 16) as u16,
+                };
+            }
             for q in [1, 3] {
                 for threads in [1, 2, 3, 8] {
                     assert_eq!(

@@ -34,12 +34,14 @@
 //! Every count and size in the file is bounded by [`Limits`]; a malformed
 //! file returns an error, never a panic or an unbounded allocation.
 
-#![forbid(unsafe_code)]
+// `unsafe` lives only in `simd`, behind safe bounds-checked wrappers.
+#![deny(unsafe_code)]
 
 mod demux;
 mod hevc;
 mod image;
 mod rgb;
+mod simd;
 
 use std::borrow::Cow;
 
