@@ -235,31 +235,75 @@ fn frame_layout(f: &Frame) -> Result<(Chroma, (usize, usize, usize, usize))> {
     Ok((chroma, pic.crop))
 }
 
+/// A decoded frame's size: its conformance window.
+pub(crate) fn frame_size(f: &Frame) -> (u32, u32) {
+    (f.picture.crop.2 as u32, f.picture.crop.3 as u32)
+}
+
 /// Copy a decoded frame (its conformance window) into a new [`Image`].
+///
+/// Each plane is built row by row from the picture, so no sample is written
+/// twice: a zero-filled plane that [`blit_frame`] then overwrote cost a full
+/// memset per plane (the allocator zeroes mid-sized blocks itself).
 pub(crate) fn frame_to_image(f: &Frame) -> Result<Image> {
-    let (chroma, (_, _, cw, ch)) = frame_layout(f)?;
-    let mut img = Image {
+    let (chroma, (cx, cy, cw, ch)) = frame_layout(f)?;
+    let (sx, sy) = chroma.shift();
+    let mut planes = Vec::with_capacity(chroma.planes());
+    for i in 0..chroma.planes() {
+        let sp = &f.picture.planes[i];
+        let (px, py, pw, ph) = if i == 0 {
+            (cx, cy, cw, ch)
+        } else {
+            (
+                cx >> sx,
+                cy >> sy,
+                (cw as u32).div_ceil(1 << sx) as usize,
+                (ch as u32).div_ceil(1 << sy) as usize,
+            )
+        };
+        let src = window(sp, px, py, pw, ph)?;
+        let mut data = Vec::with_capacity(pw * ph);
+        for r in 0..ph {
+            data.extend_from_slice(&src[r * sp.stride..r * sp.stride + pw]);
+        }
+        planes.push(Plane {
+            width: pw as u32,
+            height: ph as u32,
+            data,
+        });
+    }
+    Ok(Image {
         width: cw as u32,
         height: ch as u32,
         chroma,
         bit_depth: f.picture.bit_depth_luma,
-        planes: Vec::new(),
+        planes,
+    })
+}
+
+/// The `pw`x`ph` window at `(px, py)` of a decoder plane, as one slice from
+/// its first sample to its last (rows `stride` apart).
+fn window(sp: &rusty_h265::Plane, px: usize, py: usize, pw: usize, ph: usize) -> Result<&[u16]> {
+    let start = py * sp.stride + px;
+    // The conformance window lies inside the coded picture (the decoder
+    // guarantees it), so this slice is in bounds; `get` keeps a malformed
+    // one an error rather than a panic.
+    let need = if ph == 0 {
+        0
+    } else {
+        (ph - 1) * sp.stride + pw
     };
-    let (ccw, cch) = chroma.chroma_size(cw as u32, ch as u32);
-    for i in 0..chroma.planes() {
-        let (w, h) = if i == 0 {
-            (cw as u32, ch as u32)
-        } else {
-            (ccw, cch)
-        };
-        img.planes.push(Plane::filled(w, h, 0));
-    }
-    blit_frame(f, &mut img, 0, 0)?;
-    Ok(img)
+    sp.data
+        .get(start..start + need)
+        .ok_or_else(|| Error::invalid("heif: conformance window outside the picture"))
 }
 
 /// Copy a decoded frame's conformance window into `dst` at luma `(x, y)`,
 /// clipped to `dst`.
+///
+/// Kept out of line: inlined into the grid's `Tile::blit` the 48 tiles of a
+/// 12 MP grid cost 1,245,168 Ir against 979,296 here (callgrind).
+#[inline(never)]
 pub(crate) fn blit_frame(f: &Frame, dst: &mut Image, x: u32, y: u32) -> Result<()> {
     let (chroma, (cx, cy, cw, ch)) = frame_layout(f)?;
     if chroma != dst.chroma || f.picture.bit_depth_luma != dst.bit_depth {
@@ -282,19 +326,7 @@ pub(crate) fn blit_frame(f: &Frame, dst: &mut Image, x: u32, y: u32) -> Result<(
                 y >> sy,
             )
         };
-        let start = py * sp.stride + px;
-        // The conformance window lies inside the coded picture (the decoder
-        // guarantees it), so these slices are in bounds; `get` keeps a
-        // malformed one an error rather than a panic.
-        let need = if ph == 0 {
-            0
-        } else {
-            (ph - 1) * sp.stride + pw
-        };
-        let src = sp
-            .data
-            .get(start..start + need)
-            .ok_or_else(|| Error::invalid("heif: conformance window outside the picture"))?;
+        let src = window(sp, px, py, pw, ph)?;
         blit_plane(dp, pw as u32, ph as u32, src, sp.stride, ox, oy);
     }
     Ok(())

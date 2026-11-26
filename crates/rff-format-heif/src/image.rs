@@ -99,15 +99,13 @@ impl Plane {
         let src = &self.data;
         match quarters & 3 {
             0 => self.clone(),
-            2 => {
-                let mut data = src.clone();
-                data.reverse();
-                Plane {
-                    width: self.width,
-                    height: self.height,
-                    data,
-                }
-            }
+            // A half turn is the samples in reverse order: one pass, not a
+            // clone followed by an in-place reverse.
+            2 => Plane {
+                width: self.width,
+                height: self.height,
+                data: src.iter().rev().copied().collect(),
+            },
             q => Plane {
                 width: self.height,
                 height: self.width,
@@ -156,28 +154,47 @@ fn rotate_quarter(src: &[u16], w: usize, h: usize, q: u8, threads: usize) -> Vec
     if nw == 0 || nh == 0 {
         return dst;
     }
+    // Output rows `rows` x columns `cols` the sample at a time, into `out`
+    // (whose first row is output row `y0`).
+    let scalar = |y0: usize, out: &mut [u16], rows: (usize, usize), cols: (usize, usize)| {
+        // Most blocks have no ragged strip: an empty column range must not
+        // still walk (and bounds-check) every row.
+        if cols.0 == cols.1 {
+            return;
+        }
+        for r in rows.0..rows.1 {
+            let yn = y0 + r;
+            let o = &mut out[r * nw + cols.0..r * nw + cols.1];
+            if q == 1 {
+                // new[yn][xn] = old[xn][w-1-yn]
+                let xo = w - 1 - yn;
+                for (d, xn) in o.iter_mut().zip(cols.0..) {
+                    *d = src[xn * w + xo];
+                }
+            } else {
+                // new[yn][xn] = old[h-1-xn][yn]
+                for (d, xn) in o.iter_mut().zip(cols.0..) {
+                    *d = src[(h - 1 - xn) * w + yn];
+                }
+            }
+        }
+    };
     // `rows` output rows starting at row `y0`, into `out` (their samples).
+    // Each block's whole 8x8 tiles go through the SIMD transpose; the ragged
+    // right and bottom strips (only at the plane's edges) go sample by sample.
     let band = |y0: usize, out: &mut [u16]| {
         let rows = out.len() / nw;
         for by in (0..rows).step_by(B) {
+            let ye = (by + B).min(rows);
+            let ty = by + (ye - by) / 8 * 8;
             for bx in (0..nw).step_by(B) {
                 let xe = (bx + B).min(nw);
-                for r in by..(by + B).min(rows) {
-                    let yn = y0 + r;
-                    let o = &mut out[r * nw + bx..r * nw + xe];
-                    if q == 1 {
-                        // new[yn][xn] = old[xn][w-1-yn]
-                        let xo = w - 1 - yn;
-                        for (d, xn) in o.iter_mut().zip(bx..) {
-                            *d = src[xn * w + xo];
-                        }
-                    } else {
-                        // new[yn][xn] = old[h-1-xn][yn]
-                        for (d, xn) in o.iter_mut().zip(bx..) {
-                            *d = src[(h - 1 - xn) * w + yn];
-                        }
-                    }
+                let tx = bx + (xe - bx) / 8 * 8;
+                if ty > by && tx > bx {
+                    crate::simd::rotate_tiles(src, w, h, q, out, nw, y0, (by, ty), (bx, tx));
                 }
+                scalar(y0, out, (by, ty), (tx, xe));
+                scalar(y0, out, (ty, ye), (bx, xe));
             }
         }
     };
@@ -245,6 +262,26 @@ impl Image {
         }
     }
 
+    /// A zeroed image (chroma too): a canvas for callers that overwrite
+    /// every sample. Unlike [`blank`](Self::blank) it writes nothing: a large
+    /// zeroed allocation is fresh pages, where filling chroma with the
+    /// midpoint is a pass over memory the caller is about to overwrite.
+    pub(crate) fn zeroed(width: u32, height: u32, chroma: Chroma, bit_depth: u8) -> Image {
+        let mut planes = vec![Plane::filled(width, height, 0)];
+        if chroma != Chroma::Monochrome {
+            let (cw, ch) = chroma.chroma_size(width, height);
+            planes.push(Plane::filled(cw, ch, 0));
+            planes.push(Plane::filled(cw, ch, 0));
+        }
+        Image {
+            width,
+            height,
+            chroma,
+            bit_depth,
+            planes,
+        }
+    }
+
     /// The planes back to back, tightly packed: one byte per sample at up to
     /// 8 bits, little-endian `u16` above (the `yuv420p` / `yuv420p10le`
     /// layouts).
@@ -257,11 +294,16 @@ impl Image {
             }
             out
         } else {
-            let mut out = Vec::with_capacity(n * 2);
+            // Sized once and written in place: a two-byte `extend` per sample
+            // re-checked the capacity every time and never vectorised.
+            let mut out = vec![0u8; n * 2];
+            let mut rest = out.as_mut_slice();
             for p in &self.planes {
-                for &v in &p.data {
-                    out.extend_from_slice(&v.to_le_bytes());
+                let (dst, tail) = rest.split_at_mut(p.data.len() * 2);
+                for (o, &v) in dst.chunks_exact_mut(2).zip(&p.data) {
+                    o.copy_from_slice(&v.to_le_bytes());
                 }
+                rest = tail;
             }
             out
         }
@@ -456,8 +498,28 @@ mod tests {
             (130, 7),
             (7, 200),
             (257, 129),
+            // Whole 8x8 tiles only, tiles plus one ragged strip, both strips,
+            // and blocks whose tile count differs per band.
+            (8, 8),
+            (16, 9),
+            (9, 16),
+            (67, 131),
+            (136, 72),
+            (200, 70),
+            (4032 / 16, 3024 / 16 + 3),
         ] {
-            let p = ramp(w, h);
+            let mut p = ramp(w, h);
+            // Full-range values (not just a ramp): the extremes and noise.
+            let mut s = 0x9e37_79b9u32;
+            for (i, v) in p.data.iter_mut().enumerate() {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *v = match i % 5 {
+                    0 => 0xffff,
+                    1 => 0,
+                    2 => 0x3ff,
+                    _ => (s >> 16) as u16,
+                };
+            }
             for q in [1, 3] {
                 for threads in [1, 2, 3, 8] {
                     assert_eq!(
@@ -465,6 +527,37 @@ mod tests {
                         rotate_quarter_naive(&p.data, w as usize, h as usize, q),
                         "{w}x{h} q{q} threads {threads}"
                     );
+                }
+            }
+        }
+    }
+
+    /// The packing against the per-sample loop it replaced, at every depth
+    /// it distinguishes, odd sizes, and full-range sample values.
+    #[test]
+    fn planar_bytes_match_per_sample_packing() {
+        let mut s = 0x7f4a_7c15u32;
+        for (w, h) in [(1, 1), (3, 5), (17, 9), (64, 33)] {
+            for chroma in [Chroma::Yuv420, Chroma::Yuv444, Chroma::Monochrome] {
+                for bd in [8u8, 10, 12] {
+                    let mut img = Image::blank(w, h, chroma, bd);
+                    for p in &mut img.planes {
+                        for v in &mut p.data {
+                            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                            *v = (s >> 16) as u16;
+                        }
+                    }
+                    let mut want = Vec::new();
+                    for p in &img.planes {
+                        for &v in &p.data {
+                            if bd <= 8 {
+                                want.push(v as u8);
+                            } else {
+                                want.extend_from_slice(&v.to_le_bytes());
+                            }
+                        }
+                    }
+                    assert_eq!(img.to_planar_bytes(), want, "{w}x{h} {chroma:?} {bd}");
                 }
             }
         }
