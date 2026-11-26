@@ -41,7 +41,7 @@ mod image;
 mod luts;
 
 pub use decode::{Block, ChunkPos, Decoder, PartKind, Threads};
-pub use encode::{encode, window, EncodeOptions};
+pub use encode::{encode, window, Deflate, EncodeOptions};
 pub use error::{Error, Limits, Result};
 pub use half::{f16_to_f32, f32_to_f16, f32_to_f16_clamped};
 pub use header::{

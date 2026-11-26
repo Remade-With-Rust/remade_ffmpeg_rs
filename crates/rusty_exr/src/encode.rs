@@ -15,6 +15,21 @@ pub struct EncodeOptions {
     /// Scanline order; `Increasing` (the default) or `Decreasing`.
     pub line_order: LineOrder,
     pub threads: Threads,
+    /// Deflate implementation for ZIP, ZIPS and PXR24.
+    pub deflate: Deflate,
+}
+
+/// Which deflate implementation the ZIP, ZIPS and PXR24 writers use (both
+/// at level 4; any EXR reader decodes either).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Deflate {
+    /// miniz_oxide, as the `exr` crate uses: files are byte-identical to
+    /// the ones `exr` writes for the same image.
+    #[default]
+    ExrCompatible,
+    /// zlib-rs: about twice as fast as miniz_oxide on image data and
+    /// slightly smaller output; the bytes differ from `exr`'s.
+    Fast,
 }
 
 impl Default for EncodeOptions {
@@ -24,6 +39,7 @@ impl Default for EncodeOptions {
             compression: Compression::Zip,
             line_order: LineOrder::Increasing,
             threads: Threads::Auto,
+            deflate: Deflate::ExrCompatible,
         }
     }
 }
@@ -324,10 +340,21 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
                 }
             }
         }
-        compression::compress(comp, &geom, &raw)
+        compression::compress(comp, &geom, raw, opts.deflate)
     };
 
-    let nthreads = opts.threads.resolve().min(nchunks).max(1);
+    // Below about 1 MiB of input per worker a thread costs more than it
+    // saves.
+    let image_bytes: usize = channels
+        .iter()
+        .map(|c| c.samples.len() * c.desc.sample_type.bytes())
+        .sum();
+    let nthreads = opts
+        .threads
+        .resolve()
+        .min(nchunks)
+        .min(image_bytes >> 20)
+        .max(1);
     let mut packed: Vec<Option<Vec<u8>>> = vec![None; nchunks];
     if nthreads == 1 {
         for (i, slot) in packed.iter_mut().enumerate() {

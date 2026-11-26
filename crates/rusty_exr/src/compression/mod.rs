@@ -206,9 +206,28 @@ pub(crate) fn inflate_exact(src: &[u8], out: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-/// Deflate with miniz_oxide at `level` (zlib framing).
-pub(crate) fn deflate(data: &[u8], level: u8) -> Vec<u8> {
-    miniz_oxide::deflate::compress_to_vec_zlib(data, level)
+/// Deflate at level 4 (zlib framing): miniz_oxide (byte-identical to the
+/// `exr` crate) or zlib-rs (about twice as fast, smaller output).
+pub(crate) fn deflate(data: &[u8], deflater: crate::Deflate) -> Vec<u8> {
+    match deflater {
+        crate::Deflate::ExrCompatible => miniz_oxide::deflate::compress_to_vec_zlib(data, 4),
+        crate::Deflate::Fast => {
+            let mut c = flate2::Compress::new(flate2::Compression::new(4), true);
+            // zlib's compressBound: one call normally finishes.
+            let n = data.len();
+            let mut out = Vec::with_capacity(n + (n >> 12) + (n >> 14) + (n >> 25) + 64);
+            loop {
+                let consumed = usize::try_from(c.total_in()).unwrap_or(n).min(n);
+                let status = c
+                    .compress_vec(&data[consumed..], &mut out, flate2::FlushCompress::Finish)
+                    .expect("in-memory deflate cannot fail");
+                if status == flate2::Status::StreamEnd {
+                    break out;
+                }
+                out.reserve(out.capacity().max(4096));
+            }
+        }
+    }
 }
 
 /// Decompress one chunk, leaving the result in `data` or `scratch`.
@@ -293,21 +312,22 @@ pub(crate) fn decompress(
 pub(crate) fn compress(
     compression: Compression,
     geom: &BlockGeom<'_>,
-    raw: &[u8],
+    raw: Vec<u8>,
+    deflater: crate::Deflate,
 ) -> Result<Vec<u8>> {
     debug_assert_eq!(raw.len(), geom.raw_size);
     let packed = match compression {
-        Compression::None => return Ok(raw.to_vec()),
-        Compression::Rle => rle::compress(raw),
-        Compression::Zips | Compression::Zip => zip::compress(raw),
-        Compression::Piz => piz::compress(geom, raw),
-        Compression::Pxr24 => pxr24::compress(geom, raw),
+        Compression::None => return Ok(raw),
+        Compression::Rle => rle::compress(&raw),
+        Compression::Zips | Compression::Zip => zip::compress(&raw, deflater),
+        Compression::Piz => piz::compress(geom, &raw),
+        Compression::Pxr24 => pxr24::compress(geom, &raw, deflater),
         c => return Err(Error::unsupported(format!("writing {c:?} compression"))),
     };
     if packed.len() < raw.len() {
         Ok(packed)
     } else {
-        Ok(raw.to_vec())
+        Ok(raw)
     }
 }
 

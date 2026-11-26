@@ -83,6 +83,7 @@ fn lossless_round_trips() {
                         compression: c,
                         line_order: order,
                         threads,
+                        ..EncodeOptions::default()
                     };
                     let file = rusty_exr::encode(&img, &opts).unwrap();
                     let back = rusty_exr::Decoder::new(&file)
@@ -96,6 +97,24 @@ fn lossless_round_trips() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn fast_deflate_round_trips() {
+    let img = image(70, 40, 13);
+    for c in [Compression::Zips, Compression::Zip, Compression::Pxr24] {
+        let opts = EncodeOptions {
+            deflate: rusty_exr::Deflate::Fast,
+            ..EncodeOptions::new(c)
+        };
+        let fast = rusty_exr::encode(&img, &opts).unwrap();
+        let exr = rusty_exr::encode(&img, &EncodeOptions::new(c)).unwrap();
+        let (a, b) = (
+            rusty_exr::decode(&fast).unwrap(),
+            rusty_exr::decode(&exr).unwrap(),
+        );
+        same_samples(&a, &b, true);
     }
 }
 
@@ -118,7 +137,8 @@ fn pxr24_rounds_float_only() {
 
 #[test]
 fn output_is_deterministic_across_threads() {
-    let img = image(130, 70, 3);
+    // Large enough (about 2.6 MB) that several workers actually run.
+    let img = image(512, 256, 3);
     for c in [Compression::Zip, Compression::Piz, Compression::Pxr24] {
         let a = rusty_exr::encode(
             &img,
@@ -126,6 +146,7 @@ fn output_is_deterministic_across_threads() {
                 compression: c,
                 line_order: LineOrder::Increasing,
                 threads: Threads::Single,
+                ..EncodeOptions::default()
             },
         )
         .unwrap();
@@ -135,10 +156,22 @@ fn output_is_deterministic_across_threads() {
                 compression: c,
                 line_order: LineOrder::Increasing,
                 threads: Threads::Count(5),
+                ..EncodeOptions::default()
             },
         )
         .unwrap();
         assert_eq!(a, b, "{c:?}");
+        let d1 = rusty_exr::Decoder::new(&a)
+            .unwrap()
+            .threads(Threads::Single)
+            .decode_part(0)
+            .unwrap();
+        let d5 = rusty_exr::Decoder::new(&a)
+            .unwrap()
+            .threads(Threads::Count(5))
+            .decode_part(0)
+            .unwrap();
+        same_samples(&d1, &d5, true);
     }
 }
 

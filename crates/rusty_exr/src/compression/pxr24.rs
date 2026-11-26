@@ -54,7 +54,7 @@ pub(crate) fn decompress(
         .map_err(|e| Error::invalid(format!("PXR24 chunk: {e}")))?;
     let packed = &scratch.b;
     let out = &mut scratch.a;
-    out.clear();
+    // Every byte is written below, so a reused buffer is not re-zeroed.
     out.resize(geom.raw_size, 0);
     let mut ip = 0;
     let mut op = 0;
@@ -116,7 +116,7 @@ pub(crate) fn decompress(
     Ok(())
 }
 
-pub(crate) fn compress(geom: &BlockGeom<'_>, raw: &[u8]) -> Vec<u8> {
+pub(crate) fn compress(geom: &BlockGeom<'_>, raw: &[u8], deflater: crate::Deflate) -> Vec<u8> {
     let packed_size: usize = geom
         .chans
         .iter()
@@ -176,5 +176,5 @@ pub(crate) fn compress(geom: &BlockGeom<'_>, raw: &[u8]) -> Vec<u8> {
             }
         }
     }
-    super::deflate(&packed, 4)
+    super::deflate(&packed, deflater)
 }

@@ -317,7 +317,8 @@ pub(crate) fn decompress_into(
     let dec = build_dec_table(&hs.codes, &mut hs.short, &mut hs.syms)?;
     let rlc = imax as u32;
 
-    out.clear();
+    // Every element is written before success is returned, so a reused
+    // buffer is not re-zeroed.
     out.resize(out_len, 0);
     let mut pos = 0usize;
     let mut bits = BitIn::new(code);

@@ -88,11 +88,11 @@ pub(crate) fn decompress_halves(
     Ok(())
 }
 
-pub(crate) fn compress(raw: &[u8]) -> Vec<u8> {
+pub(crate) fn compress(raw: &[u8], deflater: crate::Deflate) -> Vec<u8> {
     let mut tmp = vec![0u8; raw.len()];
     deinterleave(raw, &mut tmp);
     apply_predictor(&mut tmp);
-    super::deflate(&tmp, 4)
+    super::deflate(&tmp, deflater)
 }
 
 #[cfg(test)]
