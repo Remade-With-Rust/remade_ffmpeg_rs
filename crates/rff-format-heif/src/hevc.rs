@@ -300,6 +300,10 @@ fn window(sp: &rusty_h265::Plane, px: usize, py: usize, pw: usize, ph: usize) ->
 
 /// Copy a decoded frame's conformance window into `dst` at luma `(x, y)`,
 /// clipped to `dst`.
+///
+/// Kept out of line: inlined into the grid's `Tile::blit` the 48 tiles of a
+/// 12 MP grid cost 1,245,168 Ir against 979,296 here (callgrind).
+#[inline(never)]
 pub(crate) fn blit_frame(f: &Frame, dst: &mut Image, x: u32, y: u32) -> Result<()> {
     let (chroma, (cx, cy, cw, ch)) = frame_layout(f)?;
     if chroma != dst.chroma || f.picture.bit_depth_luma != dst.bit_depth {
