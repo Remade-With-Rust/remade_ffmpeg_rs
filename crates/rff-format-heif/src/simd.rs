@@ -226,9 +226,10 @@ pub(crate) fn chroma_terms(
     #[cfg(target_arch = "x86_64")]
     {
         let (cbp, crp, trp, tbp) = (cb.as_ptr(), cr.as_ptr(), tr.as_mut_ptr(), tb.as_mut_ptr());
-        // SAFETY: AVX2 is present (asserted). Group `g` reads chroma
-        // `[8g >> sx, (8g >> sx) + (8 >> sx))` and writes `tr`/`tb`
-        // `[8g, 8g+8)`; with `8g + 8 <= n` all inside the asserted lengths.
+        // SAFETY: AVX2 is present (asserted). A step at luma column `x`
+        // covering `k` (8 or 16) columns, with `x + k <= n`, reads chroma
+        // `[x >> sx, (x + k) >> sx)` and writes `tr`/`tb` `[x, x + k)`: all
+        // inside the asserted lengths.
         unsafe {
             match (mode, sx) {
                 (RgbMode::Identity, 1) => x86::chroma_terms_avx2::<1, 1>(c, cbp, crp, trp, tbp, n),
@@ -639,22 +640,41 @@ mod x86 {
             let kcr = _mm256_set1_ps(c.kcr);
             let kcb = _mm256_set1_ps(c.kcb);
             let half = _mm256_set1_ps(0.5);
-            for g in 0..n / 8 {
-                let x = g * 8;
+            // The red and blue terms of eight chroma samples.
+            let terms = |cbv: __m256, crv: __m256| {
+                let cbv = _mm256_mul_ps(_mm256_sub_ps(cbv, mid), c_scale);
+                let crv = _mm256_mul_ps(_mm256_sub_ps(crv, mid), c_scale);
+                if MODE == 1 {
+                    (_mm256_add_ps(crv, half), _mm256_add_ps(cbv, half))
+                } else {
+                    (_mm256_mul_ps(kcr, crv), _mm256_mul_ps(kcb, cbv))
+                }
+            };
+            let mut x = 0;
+            if SX == 1 {
+                // Eight chroma samples cover sixteen luma columns: convert
+                // them once, then duplicate each result into two lanes.
+                let lo = _mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3);
+                let hi = _mm256_setr_epi32(4, 4, 5, 5, 6, 6, 7, 7);
+                while x + 16 <= n {
+                    let (r, b) = terms(load8_f32(cb.add(x / 2)), load8_f32(cr.add(x / 2)));
+                    _mm256_storeu_ps(tr.add(x), _mm256_permutevar8x32_ps(r, lo));
+                    _mm256_storeu_ps(tr.add(x + 8), _mm256_permutevar8x32_ps(r, hi));
+                    _mm256_storeu_ps(tb.add(x), _mm256_permutevar8x32_ps(b, lo));
+                    _mm256_storeu_ps(tb.add(x + 8), _mm256_permutevar8x32_ps(b, hi));
+                    x += 16;
+                }
+            }
+            while x < n {
                 let (cbv, crv) = if SX == 1 {
                     (load4x2_f32(cb.add(x / 2)), load4x2_f32(cr.add(x / 2)))
                 } else {
                     (load8_f32(cb.add(x)), load8_f32(cr.add(x)))
                 };
-                let cbv = _mm256_mul_ps(_mm256_sub_ps(cbv, mid), c_scale);
-                let crv = _mm256_mul_ps(_mm256_sub_ps(crv, mid), c_scale);
-                let (r, b) = if MODE == 1 {
-                    (_mm256_add_ps(crv, half), _mm256_add_ps(cbv, half))
-                } else {
-                    (_mm256_mul_ps(kcr, crv), _mm256_mul_ps(kcb, cbv))
-                };
+                let (r, b) = terms(cbv, crv);
                 _mm256_storeu_ps(tr.add(x), r);
                 _mm256_storeu_ps(tb.add(x), b);
+                x += 8;
             }
         }
     }
