@@ -105,14 +105,18 @@ impl<'a> BitIn<'a> {
     }
 }
 
-/// Unpack the code-length table into `table` (entries `im..=imax`).
+/// Unpack the code-length table: every symbol in `im..=imax` with a
+/// non-zero length, in symbol order, as `(symbol, length)`. Zero runs are
+/// skipped without touching each entry, so the cost follows the codes
+/// present, not the symbol range.
 fn unpack_table(
     c: &mut BitIn<'_>,
     limit_bits: u64,
     im: usize,
     imax: usize,
-    table: &mut [u64],
+    codes: &mut Vec<(u32, u64)>,
 ) -> Result<u64> {
+    codes.clear();
     let mut used = 0u64;
     let mut take = |c: &mut BitIn<'_>, n: u32| -> Result<u64> {
         used += u64::from(n);
@@ -127,36 +131,64 @@ fn unpack_table(
     let mut i = im;
     while i <= imax {
         let l = take(c, 6)?;
-        table[i] = l;
         if l == LONG_ZEROCODE_RUN {
             let run = (take(c, 8)? + SHORTEST_LONG_RUN) as usize;
             if i + run > imax + 1 {
                 return Err(Error::invalid("Huffman table longer than declared"));
             }
-            table[i..i + run].iter_mut().for_each(|v| *v = 0);
             i += run;
         } else if l >= SHORT_ZEROCODE_RUN {
             let run = (l - SHORT_ZEROCODE_RUN + 2) as usize;
             if i + run > imax + 1 {
                 return Err(Error::invalid("Huffman table longer than declared"));
             }
-            table[i..i + run].iter_mut().for_each(|v| *v = 0);
             i += run;
         } else {
+            if l > 0 {
+                codes.push((i as u32, l));
+            }
             i += 1;
         }
     }
     Ok(used)
 }
 
+/// `canonical` over a sparse `(symbol, length)` list (symbol order):
+/// lengths become `length | code << 6`.
+fn canonical_sparse(codes: &mut [(u32, u64)]) {
+    let mut n = [0u64; 59];
+    for &(_, l) in codes.iter() {
+        n[l as usize] += 1;
+    }
+    let mut c = 0u64;
+    for i in (1..=58).rev() {
+        let nc = (c + n[i]) >> 1;
+        n[i] = c;
+        c = nc;
+    }
+    for (_, e) in codes.iter_mut() {
+        let l = *e as usize;
+        *e = l as u64 | (n[l] << 6);
+        n[l] += 1;
+    }
+}
+
 /// Short-code table entry: `symbol << 8 | length`; 0 = no code; `LONG`
 /// marks a prefix that starts a code longer than `DEC_BITS`.
 const LONG: u32 = 0x8000_0000;
 
-/// Decoding tables for one stream.
-struct DecTable {
-    /// Indexed by the next `DEC_BITS` bits.
+/// Buffers reused from one Huffman stream to the next (per worker).
+#[derive(Default)]
+pub(crate) struct HufScratch {
+    codes: Vec<(u32, u64)>,
     short: Vec<u32>,
+    syms: Vec<u32>,
+}
+
+/// Decoding tables for one stream.
+struct DecTable<'a> {
+    /// Indexed by the next `DEC_BITS` bits.
+    short: &'a [u32],
     /// Per code length: the first (numerically smallest) code.
     first: [u64; 59],
     /// Per code length: number of codes.
@@ -164,7 +196,7 @@ struct DecTable {
     /// Per code length: index of its first symbol in `syms`.
     offset: [u32; 59],
     /// Symbols ordered by (length, code).
-    syms: Vec<u32>,
+    syms: &'a [u32],
 }
 
 /// Build the decoding tables from canonical `length | code << 6` entries.
@@ -175,16 +207,28 @@ struct DecTable {
 /// length of the code at the head of the stream is the smallest `L` whose
 /// `L`-bit prefix is at least `first[L]`, and that prefix's distance from
 /// `first[L]` indexes the symbol.
-fn build_dec_table(table: &[u64], im: usize, imax: usize) -> Result<DecTable> {
-    let mut short = vec![0u32; DEC_SIZE];
+fn build_dec_table<'a>(
+    codes: &[(u32, u64)],
+    short: &'a mut Vec<u32>,
+    syms: &'a mut Vec<u32>,
+) -> Result<DecTable<'a>> {
     let mut count = [0u32; 59];
     let mut first = [u64::MAX; 59];
-    for &e in &table[im..=imax] {
-        let l = hlen(e) as usize;
-        if l > 0 {
-            count[l] += 1;
-            first[l] = first[l].min(hcode(e));
+    let mut kraft = 0u128;
+    for &(_, e) in codes {
+        let l = hlen(e);
+        let c = hcode(e);
+        if c >> l != 0 {
+            return Err(Error::invalid("Huffman code exceeds its length"));
         }
+        count[l as usize] += 1;
+        first[l as usize] = first[l as usize].min(c);
+        kraft += 1u128 << (58 - l);
+    }
+    // Canonical codes with Kraft sum <= 1 are prefix-free by construction;
+    // past 1 two codes would overlap.
+    if kraft > 1u128 << 58 {
+        return Err(Error::invalid("Huffman code lengths oversubscribed"));
     }
     let mut offset = [0u32; 59];
     let mut total = 0u32;
@@ -192,65 +236,50 @@ fn build_dec_table(table: &[u64], im: usize, imax: usize) -> Result<DecTable> {
         offset[l] = total;
         total += count[l];
     }
-    let mut syms = vec![0u32; total as usize];
-    let mut kraft = 0u128;
-    for (sym, &e) in table.iter().enumerate().take(imax + 1).skip(im) {
+    syms.clear();
+    syms.resize(total as usize, 0);
+    // A complete code (Kraft sum exactly 1) fills every short slot, so the
+    // table only needs clearing when some prefixes have no code.
+    if kraft != 1u128 << 58 || short.len() != DEC_SIZE {
+        short.clear();
+        short.resize(DEC_SIZE, 0);
+    }
+    for &(sym, e) in codes {
         let c = hcode(e);
         let l = hlen(e);
-        if l == 0 {
-            continue;
-        }
-        if c >> l != 0 {
-            return Err(Error::invalid("Huffman code exceeds its length"));
-        }
-        kraft += 1u128 << (58 - l);
         let idx = c - first[l as usize];
-        if idx >= u64::from(count[l as usize]) {
-            return Err(Error::invalid("Huffman codes not canonical"));
-        }
-        syms[(offset[l as usize] + idx as u32) as usize] = sym as u32;
+        syms[(offset[l as usize] + idx as u32) as usize] = sym;
         if l > u64::from(DEC_BITS) {
-            let slot = (c >> (l - u64::from(DEC_BITS))) as usize;
-            let s = short[slot];
-            if s != 0 && s != LONG {
-                return Err(Error::invalid(
-                    "Huffman long code collides with a short one",
-                ));
-            }
-            short[slot] = LONG;
+            short[(c >> (l - u64::from(DEC_BITS))) as usize] = LONG;
         } else {
             let start = (c << (u64::from(DEC_BITS) - l)) as usize;
             let n = 1usize << (u64::from(DEC_BITS) - l);
-            let v = ((sym as u32) << 8) | l as u32;
-            for s in &mut short[start..start + n] {
-                if *s != 0 {
-                    return Err(Error::invalid("Huffman short codes collide"));
-                }
-                *s = v;
-            }
+            short[start..start + n].fill((sym << 8) | l as u32);
         }
     }
-    if kraft > 1u128 << 58 {
-        return Err(Error::invalid("Huffman code lengths oversubscribed"));
-    }
     Ok(DecTable {
-        short,
+        short: short.as_slice(),
         first,
         count,
         offset,
-        syms,
+        syms: syms.as_slice(),
     })
 }
 
 /// Decode a Huffman stream into exactly `out_len` u16 values.
 pub(crate) fn decompress(data: &[u8], out_len: usize) -> Result<Vec<u16>> {
     let mut out = Vec::new();
-    decompress_into(data, out_len, &mut out)?;
+    decompress_into(data, out_len, &mut out, &mut HufScratch::default())?;
     Ok(out)
 }
 
-/// Parse the header and code table; returns (tables, run code, code bits).
-fn read_tables(data: &[u8]) -> Result<(Vec<u64>, usize, usize, &[u8], u64)> {
+/// Parse the header and the code table into `codes` (canonical
+/// `(symbol, length | code << 6)` in symbol order). Returns the run-code
+/// symbol range `(im, iM)`, the code bytes and the code bit count.
+fn read_tables<'d>(
+    data: &'d [u8],
+    codes: &mut Vec<(u32, u64)>,
+) -> Result<(usize, usize, &'d [u8], u64)> {
     if data.len() < 20 {
         return Err(Error::invalid("Huffman header truncated"));
     }
@@ -266,28 +295,26 @@ fn read_tables(data: &[u8]) -> Result<(Vec<u64>, usize, usize, &[u8], u64)> {
         return Err(Error::invalid("Huffman bit count exceeds the data"));
     }
     let mut c = BitIn::new(body);
-    let mut table = vec![0u64; imax + 1];
-    let table_bits = unpack_table(&mut c, body.len() as u64 * 8, im, imax, &mut table)?;
-    canonical(&mut table[im..=imax])?;
+    let table_bits = unpack_table(&mut c, body.len() as u64 * 8, im, imax, codes)?;
+    canonical_sparse(codes);
     // The code bits start at the byte after the table.
     let table_bytes = table_bits.div_ceil(8) as usize;
     let code = &body[table_bytes..];
     if n_bits > code.len() as u64 * 8 {
         return Err(Error::invalid("Huffman bit count exceeds the data"));
     }
-    Ok((
-        table,
-        im,
-        imax,
-        &code[..n_bits.div_ceil(8) as usize],
-        n_bits,
-    ))
+    Ok((im, imax, &code[..n_bits.div_ceil(8) as usize], n_bits))
 }
 
 /// [`decompress`] into a reused buffer.
-pub(crate) fn decompress_into(data: &[u8], out_len: usize, out: &mut Vec<u16>) -> Result<()> {
-    let (table, im, imax, code, n_bits) = read_tables(data)?;
-    let dec = build_dec_table(&table, im, imax)?;
+pub(crate) fn decompress_into(
+    data: &[u8],
+    out_len: usize,
+    out: &mut Vec<u16>,
+    hs: &mut HufScratch,
+) -> Result<()> {
+    let (_, imax, code, n_bits) = read_tables(data, &mut hs.codes)?;
+    let dec = build_dec_table(&hs.codes, &mut hs.short, &mut hs.syms)?;
     let rlc = imax as u32;
 
     out.clear();
@@ -350,7 +377,7 @@ pub(crate) fn decompress_into(data: &[u8], out_len: usize, out: &mut Vec<u16>) -
 /// The code longer than `DEC_BITS` at the head of the stream.
 #[cold]
 #[inline(never)]
-fn decode_long(dec: &DecTable, bits: &BitIn<'_>) -> Result<(u32, u32)> {
+fn decode_long(dec: &DecTable<'_>, bits: &BitIn<'_>) -> Result<(u32, u32)> {
     for l in DEC_BITS + 1..=57 {
         let p = bits.peek(l);
         let f = dec.first[l as usize];
@@ -369,7 +396,12 @@ fn decode_long(dec: &DecTable, bits: &BitIn<'_>) -> Result<(u32, u32)> {
 /// oracle for [`decompress_into`].
 #[cfg(test)]
 fn decompress_reference(data: &[u8], out_len: usize) -> Result<Vec<u16>> {
-    let (table, im, imax, code, n_bits) = read_tables(data)?;
+    let mut codes = Vec::new();
+    let (im, imax, code, n_bits) = read_tables(data, &mut codes)?;
+    let mut table = vec![0u64; imax + 1];
+    for &(sym, e) in &codes {
+        table[sym as usize] = e;
+    }
     let mut out = Vec::new();
     let mut bits = BitIn::new(code);
     let mut left = n_bits;
@@ -666,8 +698,9 @@ mod tests {
             data.swap(i, (lcg(&mut seed) as usize) % (i + 1));
         }
         let z = compress(&data).unwrap();
-        let (table, im, imax, _, _) = read_tables(&z).unwrap();
-        let longest = table[im..=imax].iter().map(|&e| hlen(e)).max().unwrap();
+        let mut codes = Vec::new();
+        read_tables(&z, &mut codes).unwrap();
+        let longest = codes.iter().map(|&(_, e)| hlen(e)).max().unwrap();
         assert!(longest > u64::from(DEC_BITS), "longest code {longest}");
         assert_eq!(decompress(&z, data.len()).unwrap(), data);
         assert_eq!(decompress_reference(&z, data.len()).unwrap(), data);

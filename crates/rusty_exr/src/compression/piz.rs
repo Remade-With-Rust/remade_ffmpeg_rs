@@ -235,9 +235,7 @@ pub(crate) fn decompress(
     // value map to 0. Built from the bitmap's set bits only.
     let lut = &mut scratch.lut;
     lut.clear();
-    lut.resize(1 << 16, 0);
-    lut[0] = 0;
-    let mut k = 1usize;
+    lut.push(0);
     if bmin <= bmax {
         for (i, &byte) in bitmap[bmin..=bmax].iter().enumerate() {
             let mut bits = byte;
@@ -246,19 +244,24 @@ pub(crate) fn decompress(
                 bits &= bits - 1;
                 let v = ((bmin + i) << 3) | b;
                 if v != 0 {
-                    lut[k] = v as u16;
-                    k += 1;
+                    lut.push(v as u16);
                 }
             }
         }
     }
+    let k = lut.len();
     let max_value = (k - 1) as u16;
     let len = c.i32()?;
     if len < 0 || len as usize > c.remaining() {
         return Err(Error::invalid("PIZ Huffman length"));
     }
     let n16 = geom.raw_size / 2;
-    huffman::decompress_into(c.bytes(len as usize)?, n16, &mut scratch.w)?;
+    huffman::decompress_into(
+        c.bytes(len as usize)?,
+        n16,
+        &mut scratch.w,
+        &mut scratch.huf,
+    )?;
     let tmp = &mut scratch.w;
     let mut start = 0;
     for ch in &geom.chans {
@@ -279,8 +282,11 @@ pub(crate) fn decompress(
         }
         start += count;
     }
+    // Indices past the table (only reachable in corrupt data) map to 0,
+    // as in OpenEXR's zero-filled reverse table.
+    let lut = &scratch.lut;
     for v in tmp.iter_mut() {
-        *v = lut[*v as usize];
+        *v = lut.get(*v as usize).copied().unwrap_or(0);
     }
     Ok(())
 }

@@ -132,6 +132,7 @@ pub(crate) struct Scratch {
     pub b: Vec<u8>,
     pub w: Vec<u16>,
     pub lut: Vec<u16>,
+    pub huf: huffman::HufScratch,
     inflater: Option<flate2::Decompress>,
 }
 
