@@ -113,6 +113,44 @@ fn exif_xmp_and_colour() {
     assert_eq!(rgba.len(), 128 * 128 * 4);
 }
 
+/// A grid whose tiles do not fill their cells -- here 512x512 tiles in
+/// 520x520 cells, made by editing the tiles' `ispe` -- is composed on the
+/// neutral canvas: luma 0 and chroma at the midpoint wherever no tile
+/// writes, with one thread or several. (Exactly fitting tiles take the
+/// zeroed-canvas path; this is the fallback.)
+#[test]
+fn undersized_grid_tiles_leave_the_neutral_canvas() {
+    let mut data = fixture("with-exif.heic");
+    let at = data
+        .windows(20)
+        .position(|b| &b[4..8] == b"ispe" && b[12..20] == [0, 0, 2, 0, 0, 0, 2, 0])
+        .expect("the tiles' 512x512 ispe");
+    // size, type, version/flags, then width and height: 520 x 520.
+    data[at + 12..at + 20].copy_from_slice(&[0, 0, 2, 8, 0, 0, 2, 8]);
+    let decode = |threads| {
+        let opts = DecodeOptions {
+            threads,
+            ..DecodeOptions::default()
+        };
+        Heif::parse_with(&data, opts)
+            .unwrap()
+            .decode_primary()
+            .unwrap()
+            .image
+    };
+    let img = decode(1);
+    assert_eq!(img, decode(0));
+    assert_eq!((img.width, img.height, img.bit_depth), (2048, 1536, 8));
+    // Columns 512..520 (chroma 256..260) of every row lie between the first
+    // two tiles.
+    for y in [0u32, 700, 1535] {
+        assert!(img.planes[0].row(y)[512..520].iter().all(|&v| v == 0));
+        for c in &img.planes[1..] {
+            assert!(c.row(y / 2)[256..260].iter().all(|&v| v == 128));
+        }
+    }
+}
+
 #[test]
 fn demuxer_hands_on_one_raw_frame() {
     use rff_format::FormatRegistry;
