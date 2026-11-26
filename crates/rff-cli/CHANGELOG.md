@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.20](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-cli-v0.4.19...rff-cli-v0.4.20) - 2026-11-26
+
+### Added
+
+- *(exr)* rusty_exr — complete OpenEXR decoder + lossless scanline encoder, rff-codec-exr / rff-format-exr ([#236](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/236))
+
 ## [0.4.19](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-cli-v0.4.18...rff-cli-v0.4.19) - 2026-11-26
 
 ### Other
