@@ -1,0 +1,18 @@
+[package]
+name = "rff-codec-exr"
+description = "Remade FFmpeg (Rust): OpenEXR still-image codec (decode every compression to RGB/RGBA; encode half or float RGB/RGBA)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["exr", "openexr", "image", "codec", "hdr"]
+categories = ["multimedia", "multimedia::images"]
+
+[dependencies]
+rff-core.workspace = true
+rff-codec.workspace = true
+rusty_exr.workspace = true

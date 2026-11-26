@@ -1,0 +1,749 @@
+//! DWAA / DWAB decoding (OpenEXR's lossy DCT compressor).
+//!
+//! A DWA chunk holds four sections: "unknown" channels (zlib), the lossy
+//! DCT's AC coefficients (Huffman or zlib) and DC coefficients (zlib with
+//! the ZIP predictor), and RLE channels (zlib over run-length tokens).
+//! Channels are routed to a scheme by suffix rules stored in the chunk;
+//! R/G/B triples sharing a prefix are decoded together through an inverse
+//! Rec. 709 colour transform.
+//!
+//! Bit-exactness: OpenEXR picks its inverse DCT at run time. On every
+//! x86-64 CPU with AVX (which is what its reference build runs on) it uses
+//! a hand-written AVX routine whose float operation order differs from its
+//! scalar and SSE2 routines, and the rounded halves differ accordingly. The
+//! IDCT below reproduces that AVX routine's operation order exactly, in
+//! scalar IEEE-754 single precision, so decoded samples match OpenEXR on
+//! those machines bit for bit (and on any platform this crate runs on).
+
+use super::{huffman, BlockGeom, ChanGeom};
+use crate::error::{Error, Result};
+use crate::header::SampleType;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scheme {
+    Unknown,
+    Lossy,
+    Rle,
+}
+
+#[derive(Debug, Clone)]
+struct Rule {
+    suffix: Vec<u8>,
+    scheme: Scheme,
+    ty: SampleType,
+    csc: i32,
+    case_insensitive: bool,
+}
+
+impl Rule {
+    fn matches(&self, suffix: &[u8], ty: SampleType) -> bool {
+        if self.ty != ty {
+            return false;
+        }
+        if self.case_insensitive {
+            self.suffix.eq_ignore_ascii_case(suffix)
+        } else {
+            self.suffix == suffix
+        }
+    }
+}
+
+fn rule(suffix: &str, scheme: Scheme, ty: SampleType, csc: i32, ci: bool) -> Rule {
+    Rule {
+        suffix: suffix.as_bytes().to_vec(),
+        scheme,
+        ty,
+        csc,
+        case_insensitive: ci,
+    }
+}
+
+fn legacy_rules() -> Vec<Rule> {
+    use SampleType::{F16, F32, U32};
+    use Scheme::{Lossy, Rle};
+    let mut v = Vec::new();
+    for (s, csc) in [
+        ("r", 0),
+        ("red", 0),
+        ("g", 1),
+        ("grn", 1),
+        ("green", 1),
+        ("b", 2),
+        ("blu", 2),
+        ("blue", 2),
+        ("y", -1),
+        ("by", -1),
+        ("ry", -1),
+    ] {
+        v.push(rule(s, Lossy, F16, csc, true));
+        v.push(rule(s, Lossy, F32, csc, true));
+    }
+    v.push(rule("a", Rle, U32, -1, true));
+    v.push(rule("a", Rle, F16, -1, true));
+    v.push(rule("a", Rle, F32, -1, true));
+    v
+}
+
+fn read_rules(c: &mut crate::header::Cursor<'_>) -> Result<Vec<Rule>> {
+    if c.remaining() <= 2 {
+        return Err(Error::invalid("DWA rules truncated"));
+    }
+    let b = c.bytes(2)?;
+    let size = u16::from_le_bytes([b[0], b[1]]) as usize;
+    if size < 2 || size - 2 > c.remaining() {
+        return Err(Error::invalid("DWA rule size"));
+    }
+    let mut data = c.bytes(size - 2)?;
+    let mut rules = Vec::new();
+    while !data.is_empty() {
+        if data.len() <= 3 {
+            return Err(Error::invalid("DWA rule truncated"));
+        }
+        let Some(nul) = data.iter().take(129).position(|&b| b == 0) else {
+            return Err(Error::invalid("DWA rule suffix"));
+        };
+        if nul > data.len() - 3 {
+            return Err(Error::invalid("DWA rule truncated"));
+        }
+        let suffix = data[..nul].to_vec();
+        let value = data[nul + 1];
+        let ty = data[nul + 2];
+        data = &data[nul + 3..];
+        let csc = i32::from(value >> 4) - 1;
+        if !(-1..3).contains(&csc) {
+            return Err(Error::invalid("DWA rule colour index"));
+        }
+        let scheme = match (value >> 2) & 3 {
+            0 => Scheme::Unknown,
+            1 => Scheme::Lossy,
+            2 => Scheme::Rle,
+            _ => return Err(Error::invalid("DWA rule scheme")),
+        };
+        let ty = match ty {
+            0 => SampleType::U32,
+            1 => SampleType::F16,
+            2 => SampleType::F32,
+            _ => return Err(Error::invalid("DWA rule pixel type")),
+        };
+        rules.push(Rule {
+            suffix,
+            scheme,
+            ty,
+            csc,
+            case_insensitive: value & 1 != 0,
+        });
+    }
+    Ok(rules)
+}
+
+fn suffix_of(name: &str) -> (&[u8], &[u8]) {
+    let b = name.as_bytes();
+    match b.iter().rposition(|&c| c == b'.') {
+        Some(i) => (&b[..=i], &b[i + 1..]),
+        None => (&b[..0], b),
+    }
+}
+
+/// Classify channels; returns per-channel schemes and the CSC triples.
+fn classify(chans: &[ChanGeom<'_>], rules: &[Rule]) -> (Vec<Scheme>, Vec<[usize; 3]>) {
+    let mut schemes = vec![Scheme::Unknown; chans.len()];
+    let mut prefixes: Vec<(&[u8], [i32; 3])> = Vec::new();
+    for (ci, ch) in chans.iter().enumerate() {
+        let (prefix, suffix) = suffix_of(ch.name);
+        let pi = if let Some(i) = prefixes.iter().position(|(p, _)| *p == prefix) {
+            i
+        } else {
+            prefixes.push((prefix, [-1; 3]));
+            prefixes.len() - 1
+        };
+        for r in rules {
+            if r.matches(suffix, ch.ty) {
+                schemes[ci] = r.scheme;
+                if r.csc >= 0 {
+                    prefixes[pi].1[r.csc as usize] = ci as i32;
+                }
+            }
+        }
+    }
+    let mut sets = Vec::new();
+    for (_, idx) in prefixes {
+        if idx.iter().any(|&i| i < 0) {
+            continue;
+        }
+        let [r, g, b] = idx.map(|i| i as usize);
+        // Equal sampling means equal geometry inside one chunk.
+        let (rc, gc, bc) = (&chans[r], &chans[g], &chans[b]);
+        if rc.x_sampling != gc.x_sampling
+            || rc.x_sampling != bc.x_sampling
+            || rc.y_sampling != gc.y_sampling
+            || rc.y_sampling != bc.y_sampling
+        {
+            continue;
+        }
+        sets.push([r, g, b]);
+    }
+    (schemes, sets)
+}
+
+// ---------------------------------------------------------------------------
+// The lossy DCT decoder.
+
+const A: f32 = 3.535536e-01;
+const B: f32 = 4.903927e-01;
+const C: f32 = 4.619398e-01;
+const D: f32 = 4.157349e-01;
+const E: f32 = 2.777855e-01;
+const F: f32 = 1.913422e-01;
+const G: f32 = 9.754573e-02;
+
+/// `dst[i] = src[ZIGZAG[i]]`.
+const ZIGZAG: [usize; 64] = [
+    0, 1, 5, 6, 14, 15, 27, 28, 2, 4, 7, 13, 16, 26, 29, 42, 3, 8, 12, 17, 25, 30, 41, 43, 9, 11,
+    18, 24, 31, 40, 44, 53, 10, 19, 23, 32, 39, 45, 52, 54, 20, 22, 33, 38, 46, 51, 55, 60, 21, 34,
+    37, 47, 50, 56, 59, 61, 35, 36, 48, 49, 57, 58, 62, 63,
+];
+
+/// One row of OpenEXR's AVX row pass (full 8-point transform).
+#[inline(always)]
+fn row_pass(r: &[f32]) -> [f32; 8] {
+    const M1: [[f32; 4]; 4] = [[A, A, A, A], [C, F, -F, -C], [A, -A, -A, A], [F, -C, C, -F]];
+    const M2: [[f32; 4]; 4] = [[B, D, E, G], [D, -G, -B, -E], [E, -B, G, D], [G, -E, D, -B]];
+    let mut out = [0f32; 8];
+    for k in 0..4 {
+        let e = (r[0] * M1[0][k] + r[2] * M1[1][k]) + (r[4] * M1[2][k] + r[6] * M1[3][k]);
+        let o = (r[1] * M2[0][k] + r[3] * M2[1][k]) + (r[5] * M2[2][k] + r[7] * M2[3][k]);
+        out[k] = e + o;
+        out[7 - k] = e - o;
+    }
+    out
+}
+
+/// OpenEXR's `dctInverse8x8_avx_{zr}`: an inverse DCT where the last `zr`
+/// rows of the (row-major, frequency-domain) block are known to be zero.
+/// Operation order follows the AVX assembly instruction by instruction.
+fn idct_avx(data: &mut [f32; 64], zr: usize) {
+    let present = 8 - zr;
+    let mut rows = [[0f32; 8]; 8];
+    // Row pass over processed row pairs.
+    let mut pair = 0;
+    while pair < 8 {
+        if pair < present {
+            rows[pair] = row_pass(&data[pair * 8..pair * 8 + 8]);
+            rows[pair + 1] = row_pass(&data[pair * 8 + 8..pair * 8 + 16]);
+        }
+        pair += 2;
+    }
+    if zr == 7 {
+        for i in 0..8 {
+            for j in 0..8 {
+                data[i * 8 + j] = rows[0][j] * A;
+            }
+        }
+        return;
+    }
+    let p = |i: usize| i < present;
+    for j in 0..8 {
+        let r = |i: usize| rows[i][j];
+        // Odd outputs.
+        let mut o0 = B * r(1);
+        if p(3) {
+            o0 += D * r(3);
+            if p(5) {
+                let mut t = E * r(5);
+                if p(7) {
+                    t += G * r(7);
+                }
+                o0 += t;
+            }
+        }
+        let mut o1 = D * r(1);
+        if p(3) {
+            let mut t = G * r(3);
+            if p(5) {
+                t += B * r(5);
+            }
+            o1 -= t;
+        }
+        if p(7) {
+            o1 -= E * r(7);
+        }
+        let mut o2 = E * r(1);
+        if p(3) {
+            o2 -= B * r(3);
+        }
+        if p(5) {
+            o2 += G * r(5);
+        }
+        if p(7) {
+            o2 += D * r(7);
+        }
+        let mut o3 = G * r(1);
+        if p(5) {
+            o3 += D * r(5);
+        }
+        if p(3) {
+            let mut t = E * r(3);
+            if p(7) {
+                t += B * r(7);
+            }
+            o3 -= t;
+        }
+        // Even outputs.
+        let mut t11 = A * r(0);
+        let mut t1 = t11;
+        if p(4) {
+            let a4 = A * r(4);
+            t11 += a4;
+            t1 -= a4;
+        }
+        let mut e0 = t11;
+        let mut e3 = t11;
+        let mut e1 = t1;
+        let mut e2 = t1;
+        if p(2) {
+            let mut t7 = C * r(2);
+            if p(6) {
+                t7 += F * r(6);
+            }
+            e0 = t11 + t7;
+            e3 = t11 - t7;
+            let mut t7 = F * r(2);
+            if p(6) {
+                t7 -= C * r(6);
+            }
+            e1 = t1 + t7;
+            e2 = t1 - t7;
+        }
+        data[j] = e0 + o0;
+        data[8 + j] = e1 + o1;
+        data[16 + j] = e2 + o2;
+        data[24 + j] = e3 + o3;
+        data[32 + j] = e3 - o3;
+        data[40 + j] = e2 - o2;
+        data[48 + j] = e1 - o1;
+        data[56 + j] = e0 - o0;
+    }
+}
+
+/// Imath's `float_to_half` (NaN keeps its high payload, sets bit 0 if
+/// that is empty; finite values round to nearest even).
+#[inline]
+fn imath_f2h(f: f32) -> u16 {
+    if f.is_nan() {
+        let x = f.to_bits();
+        let m = ((x & 0x007f_ffff) >> 13) as u16;
+        return ((x >> 16) & 0x8000) as u16 | 0x7c00 | m | u16::from(m == 0);
+    }
+    crate::half::f32_to_f16(f)
+}
+
+/// Imath's `half_to_float` (NaN payload kept, quiet bit not forced).
+#[inline]
+fn imath_h2f_bits(h: u16) -> u32 {
+    if h & 0x7c00 == 0x7c00 {
+        (u32::from(h & 0x8000) << 16) | 0x7f80_0000 | (u32::from(h & 0x3ff) << 13)
+    } else {
+        crate::half::f16_to_f32(h).to_bits()
+    }
+}
+
+/// F16C `vcvtps2ph` with round-to-nearest-even.
+#[inline]
+fn f16c_f2h(f: f32) -> u16 {
+    crate::half::f32_to_f16(f)
+}
+
+struct AcReader<'a> {
+    ac: &'a [u16],
+    pos: usize,
+}
+
+/// Decode one lossy channel set (1 channel, or an R/G/B triple with CSC).
+/// `outs` receive `width * height` half values each, row-major.
+fn decode_lossy(
+    ac: &mut AcReader<'_>,
+    dc: &[u16],
+    dc_pos: &mut usize,
+    width: usize,
+    height: usize,
+    to_linear: Option<&[u16]>,
+    outs: &mut [&mut [u16]],
+) -> Result<()> {
+    let n = outs.len();
+    let nbx = width.div_ceil(8);
+    let nby = height.div_ceil(8);
+    let need = n * nbx * nby;
+    if dc.len() - *dc_pos < need {
+        return Err(Error::invalid("DWA DC data too short"));
+    }
+    let dc_base = *dc_pos;
+    *dc_pos += need;
+    let mut zig = [[0u16; 64]; 3];
+    let mut dct = [[0f32; 64]; 3];
+    let mut halves = [[0u16; 64]; 3];
+    for by in 0..nby {
+        for bx in 0..nbx {
+            let mut constant = true;
+            for comp in 0..n {
+                let z = &mut zig[comp];
+                *z = [0; 64];
+                z[0] = dc[dc_base + comp * nbx * nby + by * nbx + bx];
+                // Un-RLE the AC coefficients.
+                let mut k = 1usize;
+                let mut lnz = 0usize;
+                while k < 64 {
+                    let Some(&v) = ac.ac.get(ac.pos) else {
+                        return Err(Error::invalid("DWA AC data too short"));
+                    };
+                    ac.pos += 1;
+                    if v & 0xff00 == 0xff00 {
+                        let c = usize::from(v & 0xff);
+                        k += if c == 0 { 64 } else { c };
+                    } else {
+                        lnz = k;
+                        z[k] = v;
+                        k += 1;
+                    }
+                }
+                let d = &mut dct[comp];
+                if lnz == 0 {
+                    let v = crate::half::f16_to_f32(z[0]) * A * A;
+                    *d = [v; 64];
+                } else {
+                    constant = false;
+                    for i in 0..64 {
+                        d[i] = crate::half::f16_to_f32(z[ZIGZAG[i]]);
+                    }
+                    let zr = match lnz {
+                        0..=1 => 7,
+                        2 => 6,
+                        3..=8 => 5,
+                        9 => 4,
+                        10..=19 => 3,
+                        20 => 2,
+                        21..=34 => 1,
+                        _ => 0,
+                    };
+                    idct_avx(d, zr);
+                }
+            }
+            if n == 3 {
+                let count = if constant { 1 } else { 64 };
+                let [d0, d1, d2] = &mut dct;
+                for i in 0..count {
+                    let (s0, s1, s2) = (d0[i], d1[i], d2[i]);
+                    d0[i] = s0 + 1.5747 * s2;
+                    d1[i] = s0 - 0.1873 * s1 - 0.4682 * s2;
+                    d2[i] = s0 + 1.8556 * s1;
+                }
+            }
+            for comp in 0..n {
+                if constant {
+                    halves[comp] = [imath_f2h(dct[comp][0]); 64];
+                } else {
+                    for i in 0..64 {
+                        halves[comp][i] = f16c_f2h(dct[comp][i]);
+                    }
+                }
+            }
+            let max_y = (height - by * 8).min(8);
+            let max_x = (width - bx * 8).min(8);
+            for comp in 0..n {
+                let out = &mut outs[comp];
+                for yy in 0..max_y {
+                    let row = (by * 8 + yy) * width + bx * 8;
+                    let src = &halves[comp][yy * 8..yy * 8 + max_x];
+                    let dst = &mut out[row..row + max_x];
+                    match to_linear {
+                        Some(t) => {
+                            for (d, &s) in dst.iter_mut().zip(src) {
+                                *d = t[s as usize];
+                            }
+                        }
+                        None => dst.copy_from_slice(src),
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+
+fn u64_at(c: &mut crate::header::Cursor<'_>) -> Result<u64> {
+    c.u64()
+}
+
+pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
+    const HEADER: usize = 11 * 8;
+    if data.len() < HEADER {
+        return Err(Error::invalid("DWA header truncated"));
+    }
+    let mut c = crate::header::Cursor::new(data);
+    let mut s = [0u64; 11];
+    for v in &mut s {
+        *v = u64_at(&mut c)?;
+    }
+    let [version, unk_unc, unk_comp, ac_comp, dc_comp, rle_comp, rle_unc, rle_raw, ac_count, dc_count, ac_compression] =
+        s;
+    if s.iter().take(10).any(|&v| v > i64::MAX as u64) {
+        return Err(Error::invalid("DWA section size"));
+    }
+    let total = data.len() as u64;
+    let comp_sum = unk_comp
+        .checked_add(ac_comp)
+        .and_then(|v| v.checked_add(dc_comp))
+        .and_then(|v| v.checked_add(rle_comp))
+        .ok_or_else(|| Error::invalid("DWA section sizes"))?;
+    if total < HEADER as u64 + comp_sum {
+        return Err(Error::invalid("DWA sections exceed the chunk"));
+    }
+    let raw = geom.raw_size as u64;
+    if unk_unc > raw || rle_raw > raw || unk_unc + rle_raw > raw {
+        return Err(Error::invalid("DWA uncompressed sizes exceed the chunk"));
+    }
+    if version > 2 {
+        return Err(Error::unsupported(format!("DWA version {version}")));
+    }
+    let rules = if version < 2 {
+        legacy_rules()
+    } else {
+        read_rules(&mut c)?
+    };
+    let rest = &data[c.pos..];
+    let (sec_unk, rest) = split(rest, unk_comp)?;
+    let (sec_ac, rest) = split(rest, ac_comp)?;
+    let (sec_dc, rest) = split(rest, dc_comp)?;
+    let (sec_rle, _) = split(rest, rle_comp)?;
+
+    let chans = &geom.chans;
+    let (schemes, sets) = classify(chans, &rules);
+    let sizes: Vec<u64> = chans.iter().map(|ch| ch.bytes() as u64).collect();
+    let need = |sch: Scheme| -> u64 {
+        chans
+            .iter()
+            .zip(&schemes)
+            .zip(&sizes)
+            .filter(|((_, s), _)| **s == sch)
+            .map(|(_, &n)| n)
+            .sum()
+    };
+    validate(need(Scheme::Unknown), unk_comp, unk_unc, 0)?;
+    validate(need(Scheme::Rle), rle_comp, rle_raw, rle_unc)?;
+
+    // Buffer bounds OpenEXR checks against.
+    let pixels = (geom.lines * geom.width) as u64;
+    let nlossy = schemes.iter().filter(|&&s| s == Scheme::Lossy).count() as u64;
+    let blocks = (geom.lines as u64).div_ceil(8) * (geom.width as u64).div_ceil(8);
+    let rle_buf: u64 = chans
+        .iter()
+        .zip(&schemes)
+        .filter(|(_, &s)| s == Scheme::Rle)
+        .map(|(ch, _)| 2 * pixels * ch.ty.bytes() as u64)
+        .sum();
+
+    let unknown = if unk_comp > 0 {
+        let mut v = vec![0u8; unk_unc as usize];
+        super::inflate_exact(sec_unk, &mut v)?;
+        v
+    } else {
+        Vec::new()
+    };
+    let ac: Vec<u16> = if ac_comp > 0 {
+        if ac_count > blocks * 63 * nlossy {
+            return Err(Error::invalid("DWA AC count"));
+        }
+        match ac_compression {
+            0 => huffman::decompress(sec_ac, ac_count as usize)?,
+            1 => {
+                let mut b = vec![0u8; ac_count as usize * 2];
+                super::inflate_exact(sec_ac, &mut b)?;
+                b.chunks_exact(2)
+                    .map(|x| u16::from_le_bytes([x[0], x[1]]))
+                    .collect()
+            }
+            _ => return Err(Error::invalid("DWA AC compression")),
+        }
+    } else {
+        Vec::new()
+    };
+    let dc: Vec<u16> = if dc_comp > 0 {
+        if dc_count > blocks * nlossy {
+            return Err(Error::invalid("DWA DC count"));
+        }
+        let mut b = vec![0u8; dc_count as usize * 2];
+        super::inflate_exact(sec_dc, &mut b)?;
+        super::zip::undo_predictor(&mut b);
+        let mut o = vec![0u8; b.len()];
+        super::zip::interleave(&b, &mut o);
+        o.chunks_exact(2)
+            .map(|x| u16::from_le_bytes([x[0], x[1]]))
+            .collect()
+    } else {
+        if dc_count != 0 {
+            return Err(Error::invalid("DWA DC count without data"));
+        }
+        Vec::new()
+    };
+    let rle = if rle_raw > 0 {
+        if rle_unc > rle_buf || rle_raw > rle_buf {
+            return Err(Error::invalid("DWA RLE sizes"));
+        }
+        let mut t = vec![0u8; rle_unc as usize];
+        super::inflate_exact(sec_rle, &mut t)?;
+        super::rle::unpack(&t, rle_raw as usize)?
+    } else {
+        Vec::new()
+    };
+
+    // Output, channel-planar.
+    let mut offs = Vec::with_capacity(chans.len());
+    let mut o = 0usize;
+    for ch in chans {
+        offs.push(o);
+        o += ch.bytes();
+    }
+    let mut planar = vec![0u8; geom.raw_size];
+    let mut done = vec![false; chans.len()];
+    let mut acr = AcReader { ac: &ac, pos: 0 };
+    let mut dc_pos = 0usize;
+    let luts = crate::luts::get();
+
+    let store = |planar: &mut [u8], ci: usize, halves: &[u16]| {
+        let ch = &chans[ci];
+        let base = offs[ci];
+        let rb = ch.row_bytes();
+        match ch.ty {
+            SampleType::F16 => {
+                for (d, h) in planar[base..base + ch.bytes()]
+                    .chunks_exact_mut(2)
+                    .zip(halves)
+                {
+                    d.copy_from_slice(&h.to_le_bytes());
+                }
+            }
+            SampleType::F32 => {
+                for (d, h) in planar[base..base + ch.bytes()]
+                    .chunks_exact_mut(4)
+                    .zip(halves)
+                {
+                    d.copy_from_slice(&imath_h2f_bits(*h).to_le_bytes());
+                }
+            }
+            SampleType::U32 => {
+                // OpenEXR writes the halves at the start of each row and
+                // leaves the rest of the row zeroed.
+                for y in 0..ch.height {
+                    let row = &mut planar[base + y * rb..base + y * rb + 2 * ch.width];
+                    for (d, h) in row
+                        .chunks_exact_mut(2)
+                        .zip(&halves[y * ch.width..(y + 1) * ch.width])
+                    {
+                        d.copy_from_slice(&h.to_le_bytes());
+                    }
+                }
+            }
+        }
+    };
+
+    for set in &sets {
+        if set.iter().any(|&i| schemes[i] != Scheme::Lossy) {
+            return Err(Error::invalid("DWA colour set not lossy"));
+        }
+        let ch = &chans[set[0]];
+        let (w, h) = (ch.width, ch.height);
+        let mut bufs = [vec![0u16; w * h], vec![0u16; w * h], vec![0u16; w * h]];
+        {
+            let [b0, b1, b2] = &mut bufs;
+            let mut outs: [&mut [u16]; 3] = [b0, b1, b2];
+            decode_lossy(
+                &mut acr,
+                &dc,
+                &mut dc_pos,
+                w,
+                h,
+                Some(&luts.dwa_to_linear),
+                &mut outs,
+            )?;
+        }
+        for (k, &ci) in set.iter().enumerate() {
+            // Channels in a set share geometry (checked in `classify`).
+            store(&mut planar, ci, &bufs[k]);
+            done[ci] = true;
+        }
+    }
+
+    let mut rle_planes = 0usize;
+    let mut unk_pos = 0usize;
+    for (ci, ch) in chans.iter().enumerate() {
+        if done[ci] {
+            // RLE/unknown buffers still advance for their own schemes only.
+            continue;
+        }
+        if ch.width == 0 || ch.height == 0 {
+            continue;
+        }
+        match schemes[ci] {
+            Scheme::Lossy => {
+                let mut buf = vec![0u16; ch.width * ch.height];
+                let lin = if ch.p_linear {
+                    None
+                } else {
+                    Some(&luts.dwa_to_linear[..])
+                };
+                decode_lossy(
+                    &mut acr,
+                    &dc,
+                    &mut dc_pos,
+                    ch.width,
+                    ch.height,
+                    lin,
+                    &mut [&mut buf],
+                )?;
+                store(&mut planar, ci, &buf);
+            }
+            Scheme::Rle => {
+                let bpe = ch.ty.bytes();
+                let plane = ch.width * ch.height;
+                let base = offs[ci];
+                let src = &rle[rle_planes..rle_planes + bpe * plane];
+                let dst = &mut planar[base..base + bpe * plane];
+                for (i, d) in dst.chunks_exact_mut(bpe).enumerate() {
+                    for (k, b) in d.iter_mut().enumerate() {
+                        *b = src[k * plane + i];
+                    }
+                }
+                rle_planes += bpe * plane;
+            }
+            Scheme::Unknown => {
+                let n = ch.bytes();
+                if unk_pos + n > unknown.len() {
+                    return Err(Error::invalid("DWA unknown data too short"));
+                }
+                let base = offs[ci];
+                planar[base..base + n].copy_from_slice(&unknown[unk_pos..unk_pos + n]);
+                unk_pos += n;
+            }
+        }
+    }
+    Ok(planar)
+}
+
+fn split(d: &[u8], n: u64) -> Result<(&[u8], &[u8])> {
+    if n > d.len() as u64 {
+        return Err(Error::invalid("DWA section past end of chunk"));
+    }
+    Ok(d.split_at(n as usize))
+}
+
+fn validate(required: u64, compressed: u64, uncompressed: u64, extra: u64) -> Result<()> {
+    if required > 0 {
+        if uncompressed < required || compressed == 0 {
+            return Err(Error::invalid("DWA section size"));
+        }
+    } else if uncompressed > 0 || compressed > 0 || extra > 0 {
+        return Err(Error::invalid("DWA section without channels"));
+    }
+    Ok(())
+}

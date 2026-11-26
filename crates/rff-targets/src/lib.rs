@@ -357,6 +357,7 @@ fn preference(media: MediaType) -> &'static [CodecId] {
             CodecId::Webp,
             CodecId::Gif,
             CodecId::Jxl,
+            CodecId::Exr,
             CodecId::RawVideo,
         ],
         MediaType::Audio => &[

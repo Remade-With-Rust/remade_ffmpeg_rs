@@ -1,0 +1,55 @@
+[package]
+name = "rusty_exr"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+authors = ["Mata Network <https://www.mata.network>"]
+description = "Pure-Rust OpenEXR decoder and encoder: scanline, tiled (all levels) and multi-part files, half/float/uint channels, every compression (None, RLE, ZIPS, ZIP, PIZ, PXR24, B44, B44A, DWAA, DWAB). Decoded data is bit-identical to OpenEXR C++; hostile input errors, never panics. No C."
+readme = "README.md"
+keywords = ["exr", "openexr", "hdr", "image", "decoder"]
+categories = ["multimedia::images", "multimedia::encoding"]
+include = ["/LICENSE", "/NOTICE.md", "/README.md", "/src/"]
+
+[dependencies]
+# Inflate (ZIP, ZIPS, PXR24, DWA sections) through flate2's PURE-RUST zlib-rs
+# backend, the same backend rusty_tiff and rusty_png ship. No C zlib.
+# `runtime_detection` lets zlib-rs pick its AVX2 adler32/inflate paths at
+# run time (pure Rust; without it every chunk runs the generic code).
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs", "runtime_detection"] }
+# Deflate on the write side: miniz_oxide at level 4 is what the `exr` crate
+# writes, so ZIP/ZIPS/PXR24 output is byte-identical to it. Already in the
+# workspace graph (rusty_png, rff-format-mkv).
+miniz_oxide = "0.8.9"
+
+[dev-dependencies]
+# Bench/example roots only (project convention, see CLAUDE.md): every
+# encoder-carrying binary declares rusty_alloc as its global allocator. The
+# library itself never does.
+rusty_alloc-api.workspace = true
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
+cast_precision_loss = "allow"
+float_cmp = "allow"
+module_name_repetitions = "allow"
+too_many_lines = "allow"
+similar_names = "allow"
+many_single_char_names = "allow"
+needless_range_loop = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+unreadable_literal = "allow"
+match_same_arms = "allow"
+too_many_arguments = "allow"
+excessive_precision = "allow"
+# Prose names (OpenEXR, DWAA, B44A) are not code.
+doc_markdown = "allow"
+# Tiny bit-reader and wavelet helpers inside the hottest decode loops.
+inline_always = "allow"
