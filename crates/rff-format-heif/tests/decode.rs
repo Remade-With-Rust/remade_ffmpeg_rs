@@ -1,0 +1,257 @@
+//! Decode gates over the committed fixtures (see `fixtures/README.md`), and a
+//! mutation sweep that must never panic.
+//!
+//! The expected hashes are FNV-1a 64 of the planar YCbCr bytes libheif 1.23.7
+//! (with libde265) produces for each file with `nclx` passthrough; this crate
+//! matches them exactly.
+
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use rff_format_heif::{Chroma, DecodeOptions, Heif};
+
+fn fixture(name: &str) -> Vec<u8> {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+}
+
+fn fnv(b: &[u8]) -> u64 {
+    b.iter().fold(0xcbf2_9ce4_8422_2325, |h, &x| {
+        (h ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// True when the linked rusty_h265 refuses a range-extensions profile that
+/// uses no RExt tool. The workspace copy admits it (the profile-4 fixture
+/// decodes, and the corpus gate requires it); rusty_h265 0.7.2 on crates.io
+/// predates that, so a test run of the published crate prints a skip
+/// instead. Delete this once the published decoder has the change.
+fn rext_profile_refused(r: &rff_core::Result<rff_format_heif::Decoded>) -> bool {
+    matches!(r, Err(rff_core::Error::Unsupported(m)) if m.contains("general_profile_idc 4"))
+}
+
+/// (file, width, height, bit depth, libheif's planar hash)
+const CASES: &[(&str, u32, u32, u8, u64)] = &[
+    ("checker-1024.heic", 1024, 1024, 8, 0x8f84_08ea_284a_2325),
+    ("gradient-512.heic", 512, 512, 8, 0xe659_f053_0adc_0825),
+    (
+        "full-range-no-colr.heic",
+        128,
+        128,
+        10,
+        0x8187_7a38_bf75_2ec5,
+    ),
+    ("with-exif.heic", 2048, 1536, 8, 0xd59f_eda7_046f_42cd),
+];
+
+#[test]
+fn matches_libheif_exactly_single_and_multi_threaded() {
+    for &(name, w, h, bits, want) in CASES {
+        let data = fixture(name);
+        for threads in [1, 0] {
+            let opts = DecodeOptions {
+                threads,
+                ..DecodeOptions::default()
+            };
+            let heif = Heif::parse_with(&data, opts).unwrap();
+            let info = heif.primary_info().unwrap();
+            assert_eq!(
+                (info.width, info.height, info.bit_depth),
+                (w, h, bits),
+                "{name}"
+            );
+            let r = heif.decode_primary();
+            if rext_profile_refused(&r) {
+                eprintln!("SKIP {name}: this rusty_h265 refuses general_profile_idc 4");
+                continue;
+            }
+            let d = r.unwrap();
+            assert_eq!((d.image.width, d.image.height), (w, h), "{name}");
+            assert_eq!(d.image.chroma, Chroma::Yuv420, "{name}");
+            assert_eq!(d.image.bit_depth, bits, "{name}");
+            assert!(d.alpha.is_none(), "{name}");
+            assert_eq!(
+                fnv(&d.image.to_planar_bytes()),
+                want,
+                "{name}, threads {threads}"
+            );
+        }
+    }
+}
+
+#[test]
+fn exif_xmp_and_colour() {
+    let data = fixture("with-exif.heic");
+    let heif = Heif::parse(&data).unwrap();
+    let tiff = heif.exif_tiff().expect("Exif item");
+    assert!(tiff.starts_with(b"MM\0*") || tiff.starts_with(b"II*\0"));
+    let raw = heif.exif().unwrap();
+    assert_eq!(
+        raw.len(),
+        tiff.len() + 4 + u32::from_be_bytes(raw[..4].try_into().unwrap()) as usize
+    );
+    let xmp = heif.xmp().expect("XMP item");
+    assert!(String::from_utf8_lossy(&xmp).contains("xmpmeta"));
+    assert!(!heif.has_gain_map());
+
+    // Full range said only in the HEVC VUI: no `colr`, so it comes from the
+    // bitstream.
+    let data = fixture("full-range-no-colr.heic");
+    let r = Heif::parse(&data).unwrap().decode_primary();
+    if rext_profile_refused(&r) {
+        eprintln!("SKIP full-range-no-colr: this rusty_h265 refuses general_profile_idc 4");
+        return;
+    }
+    let d = r.unwrap();
+    let n = d.colour.nclx.expect("VUI colour");
+    assert!(d.colour.nclx_from_bitstream);
+    assert!(n.full_range);
+    assert!(d.colour.icc.is_none());
+    let rgba = d.to_rgba8();
+    assert_eq!(rgba.len(), 128 * 128 * 4);
+}
+
+#[test]
+fn demuxer_hands_on_one_raw_frame() {
+    use rff_format::FormatRegistry;
+    let mut reg = FormatRegistry::new();
+    rff_format_heif::register(&mut reg);
+    let data = fixture("gradient-512.heic");
+    assert_eq!(reg.probe(&data).map(|f| f.name), Some("heif"));
+    let mut dem = reg
+        .open_demuxer("heif", Box::new(std::io::Cursor::new(data)))
+        .unwrap();
+    let s = dem.read_header().unwrap();
+    assert_eq!((s[0].width, s[0].height), (512, 512));
+    assert_eq!(s[0].pixel_format, Some(rff_core::PixelFormat::Yuv420p));
+    let p = dem.read_packet().unwrap();
+    assert_eq!(fnv(&p.data), 0xe659_f053_0adc_0825);
+    assert!(matches!(dem.read_packet(), Err(rff_core::Error::Eof)));
+}
+
+/// Deterministic xorshift.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n.max(1) as u64) as usize
+    }
+}
+
+fn mutate(rng: &mut Rng, src: &[u8]) -> Vec<u8> {
+    let mut d = src.to_vec();
+    match rng.below(5) {
+        0 => d.truncate(rng.below(d.len())),
+        1 => {
+            for _ in 0..1 + rng.below(8) {
+                let i = rng.below(d.len());
+                d[i] ^= 1 << rng.below(8);
+            }
+        }
+        2 => {
+            // A big value into a likely size/count field.
+            let i = rng.below(d.len().saturating_sub(4));
+            let v = [0xFFu8, 0xFF, 0xFF, 0xF0 | rng.below(16) as u8];
+            d[i..i + 4].copy_from_slice(&v);
+        }
+        3 => {
+            let i = rng.below(d.len());
+            d[i] = rng.next() as u8;
+            let j = rng.below(d.len());
+            d[j] = 0;
+        }
+        _ => {
+            let i = rng.below(d.len());
+            let n = rng.below(64).min(d.len() - i);
+            d.drain(i..i + n);
+        }
+    }
+    d
+}
+
+/// Decode `data` every way the API offers. Any panic that reaches here is a
+/// failure; the HEVC decoder's own contained panics are counted separately.
+fn exercise(data: &[u8]) {
+    let opts = DecodeOptions {
+        threads: 1,
+        ..DecodeOptions::default()
+    };
+    if let Ok(h) = Heif::parse_with(data, opts) {
+        let _ = h.primary_info();
+        let _ = h.decode_primary();
+        let _ = h.exif_tiff();
+        let _ = h.xmp();
+        let _ = h.decode_depth();
+        for t in h.thumbnails() {
+            let _ = h.decode_item(t);
+        }
+    }
+}
+
+fn sweep(seeds: &[(&str, Vec<u8>)], rounds: usize) -> (usize, usize) {
+    static CONTAINED: AtomicUsize = AtomicUsize::new(0);
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {
+        CONTAINED.fetch_add(1, Ordering::Relaxed);
+    }));
+    let mut escaped = Vec::new();
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    for (name, src) in seeds {
+        for round in 0..rounds {
+            let m = mutate(&mut rng, src);
+            if catch_unwind(AssertUnwindSafe(|| exercise(&m))).is_err() {
+                escaped.push(format!("{name} round {round}"));
+            }
+        }
+    }
+    std::panic::set_hook(prev);
+    assert!(escaped.is_empty(), "panics escaped the API: {escaped:?}");
+    (seeds.len() * rounds, CONTAINED.load(Ordering::Relaxed))
+}
+
+#[test]
+fn mutated_files_are_errors_not_panics() {
+    let seeds: Vec<_> = [
+        "checker-1024.heic",
+        "gradient-512.heic",
+        "full-range-no-colr.heic",
+    ]
+    .iter()
+    .map(|n| (*n, fixture(n)))
+    .collect();
+    let (n, contained) = sweep(&seeds, 400);
+    eprintln!("{n} mutated files, {contained} decoder panics contained");
+}
+
+/// Deep sweep over a directory of real files:
+/// `HEIF_FUZZ_DIR=... HEIF_FUZZ_ROUNDS=2000 cargo test --release -- --ignored`.
+#[test]
+#[ignore]
+fn deep_mutation_sweep() {
+    let dir = std::env::var("HEIF_FUZZ_DIR").expect("HEIF_FUZZ_DIR");
+    let rounds: usize = std::env::var("HEIF_FUZZ_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500);
+    let seeds: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .map(|e| {
+            let p = e.path();
+            (
+                Box::leak(p.display().to_string().into_boxed_str()) as &str,
+                std::fs::read(&p).unwrap(),
+            )
+        })
+        .collect();
+    let (n, contained) = sweep(&seeds, rounds);
+    eprintln!("{n} mutated files, {contained} decoder panics contained");
+}

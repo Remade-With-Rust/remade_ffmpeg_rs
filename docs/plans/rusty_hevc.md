@@ -344,7 +344,7 @@ in the message. Status: ☐ open · ☑ done · ✗ pruned (record why).
 | H5.1 | Adapter + registration | N7, extradata handling (`hvcC` → VPS/SPS/PPS prepend) | `crates/rff-codec-hevc` + `CodecId::Hevc` + `rff_format::hvc`; MP4/Matroska/TS demux and decode **pixel-identical to ffmpeg**, `-c:v h264` transcode works; Main 10 needed a new high-bit-depth→ 8-bit narrowing in `rff-filter` | ☑ 2026-09-05 |
 | H5.2 | Muxing on stream copy | N2 `build_hvcc_record`, N3–N5 mux halves, `MuxCaps` | `mux_caps.rs` + `targets_end_to_end.rs` cover HEVC; ffmpeg 8.1.2 decodes our MP4/MKV/TS/HLS/DASH output | ☐ |
 | H5.3 | RTP + FLV input | N6 | `ffmpeg -f rtp` → `rff` receives RFC 7798 (single/AP/FU) frame-exact; Janus `rtp_send --hevc` when a chip encoder exists | ☐ |
-| H5.4 | HEIC still (stretch) | N8 | an iPhone `.heic` → `rff -i x.heic out.png`, pixels equal `ffmpeg`/libheif | ☐ |
+| H5.4 | HEIC still (stretch) | N8 | an iPhone `.heic` → `rff -i x.heic out.png`, pixels equal `ffmpeg`/libheif | ✅ `rff-format-heif` (#137): YCbCr byte-identical to libheif 1.23.7 on every file both decode |
 | H5.5 | Docs truth-sync | `compatibility.md`, `ffmpeg-parity.md` (10/10 pure-Rust decoders), `readme.md` codec table, crate README with the hardening table (`use-protection-please`) | docs match `rff -codecs` | ☐ |
 
 ### Phase 6 — Robustness, then speed (only after Phase 4 is green)

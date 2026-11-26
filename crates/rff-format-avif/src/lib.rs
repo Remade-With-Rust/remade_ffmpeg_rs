@@ -19,6 +19,7 @@
 use std::io::{Read, Write};
 
 use rff_core::{CodecId, ColorRange, Error, MediaType, Packet, Rational, Result};
+use rff_format::heif::{child_boxes, find_box as find};
 use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, Stream};
 
 /// Register the AVIF format into a [`FormatRegistry`].
@@ -261,11 +262,8 @@ fn ispe(width: u32, height: u32) -> Vec<u8> {
 }
 
 fn pixi() -> Vec<u8> {
-    let mut b = Vec::new();
-    b.push(3); // num_channels
-    b.push(8);
-    b.push(8);
-    b.push(8); // bits per channel
+    // num_channels, then bits per channel.
+    let b = [3u8, 8, 8, 8];
     full_bx(b"pixi", 0, 0, &b)
 }
 
@@ -335,9 +333,10 @@ impl Default for Av1cFields {
 }
 
 fn build_av1c(f: &Av1cFields, config_obus: &[u8]) -> Vec<u8> {
-    let mut b = Vec::new();
-    b.push(0x81); // marker=1, version=1
-    b.push((f.seq_profile << 5) | (f.seq_level_idx_0 & 0x1f));
+    let mut b = vec![
+        0x81, // marker=1, version=1
+        (f.seq_profile << 5) | (f.seq_level_idx_0 & 0x1f),
+    ];
     b.push(
         (f.seq_tier_0 << 7)
             | (f.high_bitdepth << 6)
@@ -566,36 +565,6 @@ impl Demuxer for AvifDemuxer {
     }
 }
 
-/// Parse sibling boxes at the top level of `buf` into `(type, payload)` pairs.
-/// Tolerates the 64-bit `largesize` form and the `size == 0` (to-end) form.
-fn child_boxes(buf: &[u8]) -> Vec<([u8; 4], &[u8])> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i + 8 <= buf.len() {
-        let size32 = u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]) as usize;
-        let typ = [buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]];
-        let (payload_start, box_end) = if size32 == 1 {
-            if i + 16 > buf.len() {
-                break;
-            }
-            let large = u64::from_be_bytes(buf[i + 8..i + 16].try_into().unwrap()) as usize;
-            (i + 16, i.checked_add(large).unwrap_or(buf.len()))
-        } else if size32 == 0 {
-            (i + 8, buf.len())
-        } else {
-            (i + 8, i + size32)
-        };
-        // A size below the header's own (2-7, or a 64-bit size under 16) ends the box
-        // before its payload starts: stop there, as FFmpeg's mov_read_default does.
-        if box_end > buf.len() || box_end < payload_start {
-            break;
-        }
-        out.push((typ, &buf[payload_start..box_end]));
-        i = box_end;
-    }
-    out
-}
-
 /// Read image dimensions from the `ispe` property under `iprp`/`ipco`.
 fn read_ispe(meta_children: &[([u8; 4], &[u8])]) -> Result<(u32, u32)> {
     let iprp =
@@ -678,10 +647,6 @@ fn read_nclx_full_range(meta_children: &[([u8; 4], &[u8])]) -> Option<bool> {
         .find(|(_, p)| p.starts_with(b"nclx"))
         .and_then(|(_, p)| p.get(10))
         .map(|flags| flags & 0x80 != 0)
-}
-
-fn find<'a>(boxes: &[([u8; 4], &'a [u8])], typ: &[u8; 4]) -> Option<&'a [u8]> {
-    boxes.iter().find(|(t, _)| t == typ).map(|(_, p)| *p)
 }
 
 #[cfg(test)]

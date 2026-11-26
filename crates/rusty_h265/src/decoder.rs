@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::frame::{Frame, Picture};
 use crate::nal::{split_annex_b, unescape, NalHeader, NalType, Rbsp};
 use crate::pic::PicState;
-use crate::ps::{parse_pps, parse_sps, parse_vps, Pps, Sps, TileLayout, Vps, PROFILE_MAIN, PROFILE_MAIN10, PROFILE_MAIN_STILL};
+use crate::ps::{parse_pps, parse_sps, parse_vps, Pps, Sps, TileLayout, Vps, PROFILE_MAIN, PROFILE_MAIN10, PROFILE_MAIN_STILL, PROFILE_REXT};
 use crate::sei::{self, PictureHash};
 use crate::slice::{parse_slice_header, SliceHeader};
 
@@ -895,10 +895,20 @@ impl Decoder {
 
 /// v1 scope: Main / Main 10 / Main Still Picture, 4:2:0 (or monochrome
 /// syntax), ≤ 10 bit, no extensions.
+///
+/// A format-range-extensions profile (`general_profile_idc` 4: Main Intra,
+/// Main 10 Intra, Main 4:4:4 ...) is admitted too, because every RExt coding
+/// tool is switched on by a flag in `sps_range_extension()` /
+/// `pps_range_extension()`: a 4:2:0, ≤ 10-bit stream whose SPS and PPS carry
+/// no extension decodes by exactly the version-1 process. The chroma,
+/// bit-depth and extension checks below still refuse anything that would
+/// need an RExt tool. (HEIF writers label still images "Main Intra" this way.)
 fn check_scope(sps: &Sps, pps: &Pps) -> Result<()> {
     let prof = sps.ptl.profile();
-    if !matches!(prof, 0 | PROFILE_MAIN | PROFILE_MAIN10 | PROFILE_MAIN_STILL) {
-        return Err(Error::unsupported(format!("general_profile_idc {prof} (only Main / Main 10 / Main Still Picture)")));
+    if !matches!(prof, 0 | PROFILE_MAIN | PROFILE_MAIN10 | PROFILE_MAIN_STILL | PROFILE_REXT) {
+        return Err(Error::unsupported(format!(
+            "general_profile_idc {prof} (only Main / Main 10 / Main Still Picture, or a range-extensions profile using no RExt tool)"
+        )));
     }
     if sps.chroma_format_idc != 1 {
         return Err(Error::unsupported(format!("chroma_format_idc {} (only 4:2:0)", sps.chroma_format_idc)));

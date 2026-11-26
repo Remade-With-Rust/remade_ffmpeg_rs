@@ -5058,6 +5058,7 @@ dependencies = [
  "rff-format-flac",
  "rff-format-flv",
  "rff-format-gif",
+ "rff-format-heif",
  "rff-format-hls",
  "rff-format-ivf",
  "rff-format-jpeg",
@@ -5455,6 +5456,16 @@ version = "0.9.1"
 dependencies = [
  "rff-core",
  "rff-format",
+]
+
+[[package]]
+name = "rff-format-heif"
+version = "0.9.1"
+dependencies = [
+ "rff-core",
+ "rff-format",
+ "rusty_alloc-api",
+ "rusty_h265",
 ]
 
 [[package]]
