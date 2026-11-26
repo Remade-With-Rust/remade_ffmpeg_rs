@@ -544,7 +544,7 @@ impl<'a> Heif<'a> {
             Some(img) => Ok(img),
             // A tile that does not exactly fill its cell (a malformed file):
             // compose again on the neutral canvas, which is what shows
-            // through wherever no tile writes.
+            // through wherever no tile writes, serially.
             None => self
                 .compose_grid(id, depth, false)?
                 .ok_or_else(|| Error::invalid("heif: grid composition failed")),
@@ -557,8 +557,9 @@ impl<'a> Heif<'a> {
     /// tile fills its cell exactly do the cells partition the canvas (luma
     /// and chroma -- the cell size is a multiple of the subsampling), so that
     /// every sample is written once and the fill would never be seen. Without
-    /// `zeroed` the canvas is the neutral [`Image::blank`] and it never gives
-    /// up.
+    /// `zeroed` the canvas is the neutral [`Image::blank`], the tiles are
+    /// decoded and placed in order on the calling thread (so overlapping
+    /// tiles give one answer), and it never gives up.
     fn compose_grid(&self, id: u32, depth: u32, zeroed: bool) -> Result<Option<Image>> {
         let g = self.file.grid(id)?;
         let tiles = self.file.refs_from(id, b"dimg");
@@ -620,7 +621,14 @@ impl<'a> Heif<'a> {
                 Ok(Tile::Image(self.decode_at(t, depth + 1)?))
             }
         };
-        let threads = self.threads().min(tiles.len());
+        // The fallback places its tiles on this thread, in order: tiles that
+        // miss their cells may overlap, and overlapping tiles placed in the
+        // order the workers finish gave a different picture run to run.
+        let threads = if zeroed {
+            self.threads().min(tiles.len())
+        } else {
+            1
+        };
 
         if threads <= 1 {
             let mut dec = hevc::ItemDecoder::new();

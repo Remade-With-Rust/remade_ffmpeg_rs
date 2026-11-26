@@ -151,6 +151,45 @@ fn undersized_grid_tiles_leave_the_neutral_canvas() {
     }
 }
 
+/// Tiles larger than their cells overlap their neighbours, so the result
+/// depends on the order the tiles are placed in. It must not depend on how
+/// many threads decode them: the same file decodes to the same picture with
+/// one thread or several, every time. (Made from with-exif.heic: 512x512
+/// tiles in 504x504 cells, the grid's output cut to 2016x1512 so the cells
+/// still cover it.)
+#[test]
+fn oversized_grid_tiles_compose_the_same_on_any_thread_count() {
+    let mut data = fixture("with-exif.heic");
+    let at = data
+        .windows(20)
+        .position(|b| &b[4..8] == b"ispe" && b[12..20] == [0, 0, 2, 0, 0, 0, 2, 0])
+        .expect("the tiles' 512x512 ispe");
+    data[at + 12..at + 20].copy_from_slice(&[0, 0, 1, 0xf8, 0, 0, 1, 0xf8]);
+    // The grid descriptor: version, flags, rows - 1, columns - 1, output
+    // width and height (16-bit): 2048x1536 -> 2016x1512.
+    let g = data
+        .windows(8)
+        .position(|b| b == [0, 0, 2, 3, 8, 0, 6, 0])
+        .expect("the grid descriptor");
+    data[g + 4..g + 8].copy_from_slice(&[0x07, 0xe0, 0x05, 0xe8]);
+    let decode = |threads| {
+        let opts = DecodeOptions {
+            threads,
+            ..DecodeOptions::default()
+        };
+        Heif::parse_with(&data, opts)
+            .unwrap()
+            .decode_primary()
+            .unwrap()
+            .image
+    };
+    let one = decode(1);
+    assert_eq!((one.width, one.height), (2016, 1512));
+    for round in 0..6 {
+        assert!(decode(0) == one, "multi-threaded decode {round} differs");
+    }
+}
+
 #[test]
 fn demuxer_hands_on_one_raw_frame() {
     use rff_format::FormatRegistry;
