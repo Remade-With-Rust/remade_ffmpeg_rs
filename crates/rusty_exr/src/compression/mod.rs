@@ -288,17 +288,23 @@ pub(crate) fn deflate(data: &[u8], deflater: crate::Deflate) -> Vec<u8> {
     }
 }
 
+/// One channel's output rows for a chunk (whole plane rows, row-major).
+pub(crate) enum Direct<'a> {
+    F16(&'a mut [u16]),
+    F32(&'a mut [f32]),
+}
+
 /// Decompress one chunk, leaving the result in `data` or `scratch`.
-/// `direct` may hold, per channel, the output rows the chunk covers (whole
-/// plane rows, row-major); a decoder that can write a channel there does so
-/// and flags it in the layout (DWA, HALF lossy channels). Empty: none.
+/// `direct` may hold, per channel, the output rows the chunk covers; a
+/// decoder that can write a channel there does so and flags it in the
+/// layout (DWA: HALF and FLOAT lossy channels). Empty: none.
 pub(crate) fn decompress_layout<'a>(
     compression: Compression,
     geom: &BlockGeom<'_>,
     data: &'a [u8],
     max_chunk_bytes: u64,
     scratch: &'a mut Scratch,
-    direct: &mut [Option<&mut [u16]>],
+    direct: &mut [Option<Direct<'_>>],
 ) -> Result<Layout<'a>> {
     if geom.raw_size as u64 > max_chunk_bytes {
         return Err(Error::limit(format!("chunk of {} bytes", geom.raw_size)));

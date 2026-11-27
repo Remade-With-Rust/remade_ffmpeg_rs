@@ -613,7 +613,7 @@ pub(crate) fn decompress(
     geom: &BlockGeom<'_>,
     data: &[u8],
     scratch: &mut super::Scratch,
-    direct: &mut [Option<&mut [u16]>],
+    direct: &mut [Option<super::Direct<'_>>],
 ) -> Result<()> {
     const HEADER: usize = 11 * 8;
     if data.len() < HEADER {
@@ -762,16 +762,12 @@ pub(crate) fn decompress(
         o += ch.bytes() / 2;
     }
     let words = super::grow(words_buf, geom.raw_size / 2);
-    // HALF lossy channels whose output rows the caller handed over are
-    // decoded straight into them (and skipped when the words are placed).
+    // Lossy channels whose output rows the caller handed over are decoded
+    // straight into them (HALF) or converted into them (FLOAT), and skipped
+    // when the words are placed.
     ds.placed.clear();
     ds.placed.resize(chans.len(), false);
-    let mut target = |ci: usize, n: usize| -> Option<&mut [u16]> {
-        direct
-            .get_mut(ci)
-            .and_then(Option::take)
-            .filter(|d| d.len() == n)
-    };
+    let isa = crate::simd::isa();
     let mut done = vec![false; chans.len()];
     let mut acr = AcReader { ac, pos: 0 };
     let mut dc_pos = 0usize;
@@ -785,16 +781,16 @@ pub(crate) fn decompress(
         }
         let ch = &chans[set[0]];
         let (w, h) = (ch.width, ch.height);
-        let direct = set.iter().all(|&i| chans[i].ty == SampleType::F16)
+        let all_half = set.iter().all(|&i| chans[i].ty == SampleType::F16)
             && set[0] != set[1]
             && set[0] != set[2]
             && set[1] != set[2];
-        if direct {
+        if all_half {
             // Straight to the output rows when the caller handed over all
             // three; else into the words (channels in a set share geometry,
             // checked in `classify`, and distinct channels own disjoint word
             // ranges). One call site either way.
-            let mut outs = match set.map(|i| target(i, w * h)) {
+            let mut outs = match set.map(|i| take_f16(direct, i, w * h)) {
                 [Some(a), Some(b), Some(c)] => {
                     for &ci in set {
                         ds.placed[ci] = true;
@@ -813,7 +809,13 @@ pub(crate) fn decompress(
             ];
             decode_lossy(&mut acr, dc, &mut dc_pos, w, h, Some(to_linear), &mut outs)?;
             for (k, &ci) in set.iter().enumerate() {
-                store_words(words, &chans[ci], offs[ci], &ds.bufs[k][..w * h]);
+                let halves = &ds.bufs[k][..w * h];
+                if let Some(out) = take_f32(direct, ci, &chans[ci], w * h) {
+                    halves_to_f32(isa, halves, out);
+                    ds.placed[ci] = true;
+                } else {
+                    store_words(words, &chans[ci], offs[ci], halves);
+                }
             }
         }
         for &ci in set {
@@ -836,7 +838,7 @@ pub(crate) fn decompress(
                 let lin = if ch.p_linear { None } else { Some(to_linear) };
                 let n = ch.width * ch.height;
                 if ch.ty == SampleType::F16 {
-                    let out = match target(ci, n) {
+                    let out = match take_f16(direct, ci, n) {
                         Some(out) => {
                             ds.placed[ci] = true;
                             out
@@ -863,7 +865,12 @@ pub(crate) fn decompress(
                         lin,
                         &mut [&mut *buf],
                     )?;
-                    store_words(words, ch, offs[ci], buf);
+                    if let Some(out) = take_f32(direct, ci, ch, n) {
+                        halves_to_f32(isa, buf, out);
+                        ds.placed[ci] = true;
+                    } else {
+                        store_words(words, ch, offs[ci], buf);
+                    }
                 }
             }
             Scheme::Rle => {
@@ -907,6 +914,48 @@ fn halves_to_f32_words(isa: crate::simd::Isa, halves: &[u16], words: &mut [u16])
         i += 1;
         if i % 8 == 0 && i + 8 <= n {
             i += crate::simd::dwa_f32_words(isa, &halves[i..], &mut words[2 * i..]);
+        }
+    }
+}
+
+/// The caller's HALF output rows for channel `ci`, if it handed over `n`.
+fn take_f16<'d>(
+    direct: &mut [Option<super::Direct<'d>>],
+    ci: usize,
+    n: usize,
+) -> Option<&'d mut [u16]> {
+    match direct.get_mut(ci).map(Option::take) {
+        Some(Some(super::Direct::F16(d))) if d.len() == n => Some(d),
+        _ => None,
+    }
+}
+
+/// The caller's FLOAT output rows for FLOAT channel `ci`, if it handed
+/// over `n`.
+fn take_f32<'d>(
+    direct: &mut [Option<super::Direct<'d>>],
+    ci: usize,
+    ch: &ChanGeom<'_>,
+    n: usize,
+) -> Option<&'d mut [f32]> {
+    if ch.ty != SampleType::F32 {
+        return None;
+    }
+    match direct.get_mut(ci).map(Option::take) {
+        Some(Some(super::Direct::F32(d))) if d.len() == n => Some(d),
+        _ => None,
+    }
+}
+
+/// [`halves_to_f32_words`] into floats.
+fn halves_to_f32(isa: crate::simd::Isa, halves: &[u16], out: &mut [f32]) {
+    let n = halves.len();
+    let mut i = crate::simd::dwa_f32(isa, halves, out);
+    while i < n {
+        out[i] = f32::from_bits(imath_h2f_bits(halves[i]));
+        i += 1;
+        if i % 8 == 0 && i + 8 <= n {
+            i += crate::simd::dwa_f32(isa, &halves[i..], &mut out[i..]);
         }
     }
 }
@@ -1064,6 +1113,16 @@ mod tests {
                     let mut got = vec![0xaaaau16; 2 * len];
                     halves_to_f32_words(isa, h, &mut got);
                     assert_eq!(got, want, "{isa:?} start {start} len {len}");
+                    let mut f = vec![f32::from_bits(0xdead_beef); len];
+                    halves_to_f32(isa, h, &mut f);
+                    let fw: Vec<u16> = f
+                        .iter()
+                        .flat_map(|v| {
+                            let b = v.to_bits();
+                            [b as u16, (b >> 16) as u16]
+                        })
+                        .collect();
+                    assert_eq!(fw, want, "f32 {isa:?} start {start} len {len}");
                 }
             }
         }

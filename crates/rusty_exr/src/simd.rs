@@ -268,11 +268,29 @@ pub(crate) fn dwa_f32_words(isa: Isa, halves: &[u16], words: &mut [u16]) -> usiz
     assert!(words.len() >= 2 * halves.len());
     match isa {
         #[cfg(target_arch = "x86_64")]
-        // SAFETY: SSE2 is part of x86-64; length checked above.
-        Isa::Sse2 => unsafe { x86::dwa_f32_words_sse2(halves, words) },
+        // SAFETY: SSE2 is part of x86-64; `words` holds 2 * halves.len()
+        // u16 (checked above), the same bytes as halves.len() floats, and
+        // the kernel stores unaligned.
+        Isa::Sse2 => unsafe { x86::dwa_f32_sse2(halves, words.as_mut_ptr().cast()) },
         #[cfg(target_arch = "x86_64")]
         // SAFETY: as above, and AVX2 + F16C were detected.
-        Isa::Avx2 => unsafe { x86::dwa_f32_words_avx2(halves, words) },
+        Isa::Avx2 => unsafe { x86::dwa_f32_avx2(halves, words.as_mut_ptr().cast()) },
+        _ => 0,
+    }
+}
+
+/// [`dwa_f32_words`] into floats: `out[i] = f32::from_bits(
+/// dwa::imath_h2f_bits(halves[i]))` for the same NaN-free prefix of whole
+/// 8-sample groups. `out` holds at least `halves.len()` floats.
+pub(crate) fn dwa_f32(isa: Isa, halves: &[u16], out: &mut [f32]) -> usize {
+    assert!(out.len() >= halves.len());
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SSE2 is part of x86-64; length checked above.
+        Isa::Sse2 => unsafe { x86::dwa_f32_sse2(halves, out.as_mut_ptr()) },
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: as above, and AVX2 + F16C were detected.
+        Isa::Avx2 => unsafe { x86::dwa_f32_avx2(halves, out.as_mut_ptr()) },
         _ => 0,
     }
 }
@@ -1259,7 +1277,8 @@ mod x86 {
         _mm_movemask_epi8(_mm_cmpgt_epi16(a, _mm_set1_epi16(0x7c00))) != 0
     }
 
-    pub(super) unsafe fn dwa_f32_words_sse2(h: &[u16], w: &mut [u16]) -> usize {
+    /// `o` must be valid for `h.len()` unaligned f32 stores.
+    pub(super) unsafe fn dwa_f32_sse2(h: &[u16], o: *mut f32) -> usize {
         let z = _mm_setzero_si128();
         let mut i = 0;
         while i + 8 <= h.len() {
@@ -1267,23 +1286,23 @@ mod x86 {
             if any_nan8(v) {
                 break;
             }
-            let o = w.as_mut_ptr().add(2 * i);
-            _mm_storeu_ps(o.cast(), h2f4(_mm_unpacklo_epi16(v, z)));
-            _mm_storeu_ps(o.add(8).cast(), h2f4(_mm_unpackhi_epi16(v, z)));
+            _mm_storeu_ps(o.add(i), h2f4(_mm_unpacklo_epi16(v, z)));
+            _mm_storeu_ps(o.add(i + 4), h2f4(_mm_unpackhi_epi16(v, z)));
             i += 8;
         }
         i
     }
 
+    /// `o` must be valid for `h.len()` unaligned f32 stores.
     #[target_feature(enable = "avx2,f16c")]
-    pub(super) unsafe fn dwa_f32_words_avx2(h: &[u16], w: &mut [u16]) -> usize {
+    pub(super) unsafe fn dwa_f32_avx2(h: &[u16], o: *mut f32) -> usize {
         let mut i = 0;
         while i + 8 <= h.len() {
             let v = _mm_loadu_si128(h.as_ptr().add(i).cast());
             if any_nan8(v) {
                 break;
             }
-            _mm256_storeu_ps(w.as_mut_ptr().add(2 * i).cast(), _mm256_cvtph_ps(v));
+            _mm256_storeu_ps(o.add(i), _mm256_cvtph_ps(v));
             i += 8;
         }
         i

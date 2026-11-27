@@ -872,9 +872,9 @@ impl<'a> Decoder<'a> {
         let geom = Self::geom(&p.info, x0, y0, w, lines)?;
         // DWA can decode HALF lossy channels straight into the band's rows
         // when the chunk spans whole plane rows (scanline parts).
-        let mut direct: Vec<Option<&mut [u16]>> = Vec::new();
+        let mut direct: Vec<Option<compression::Direct<'_>>> = Vec::new();
         if matches!(p.info.compression, Compression::Dwaa | Compression::Dwab)
-            && geom.chans.iter().any(|g| g.ty == SampleType::F16)
+            && geom.chans.iter().any(|g| g.ty != SampleType::U32)
         {
             let cols = chunk_cols(&p.info, &geom, x0, task);
             direct = task
@@ -883,9 +883,12 @@ impl<'a> Decoder<'a> {
                 .zip(&cols)
                 .zip(&geom.chans)
                 .map(|((plane, &(pw, col, row0)), g)| match plane {
-                    PlaneMut::F16(v) if col == 0 && g.width == pw => {
-                        v.get_mut(row0 * pw..(row0 + g.height) * pw)
-                    }
+                    PlaneMut::F16(v) if col == 0 && g.width == pw => v
+                        .get_mut(row0 * pw..(row0 + g.height) * pw)
+                        .map(compression::Direct::F16),
+                    PlaneMut::F32(v) if col == 0 && g.width == pw => v
+                        .get_mut(row0 * pw..(row0 + g.height) * pw)
+                        .map(compression::Direct::F32),
                     _ => None,
                 })
                 .collect();
