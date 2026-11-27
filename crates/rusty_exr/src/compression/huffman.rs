@@ -164,18 +164,18 @@ pub(crate) struct HufScratch {
 /// Index bits of the fast loop's pair table.
 const PAIR_BITS: u32 = 12;
 const PAIR_SIZE: usize = 1 << PAIR_BITS;
-/// Pair-table entry kinds (bits 8..10 of an entry).
+/// Pair-table entry kinds (bits 8..10 of an entry): the number of codes.
 const ONE: u64 = 1;
 const TWO: u64 = 2;
-const RUN: u64 = 3;
 
 /// The fast loop's table, indexed by the next `PAIR_BITS` bits: every
 /// prefix that holds a whole code, or two whole codes, of the stream. An
 /// entry is `bits | kind << 8 | s1 << 16 | s2 << 32`, where `bits` is how
 /// many bits the entry consumes (0: not decodable here, use the short
-/// table), `kind` is [`ONE`], [`TWO`] (`s1` then `s2`) or [`RUN`] (the
-/// run code, whose 8-bit count follows). Neither symbol of a pair is the
-/// run code, so both fit 16 bits. Codes are found by looking the prefix up
+/// table) and `kind` is [`ONE`] or [`TWO`] (`s1` then `s2`). The run code
+/// (whose 8-bit count follows) gets no entry: the short-table step handles
+/// it, so the fast path tests `bits` alone. Neither symbol is the run code,
+/// so both fit 16 bits. Codes are found by looking the prefix up
 /// in the short table, zero-padded: a code of `l <= PAIR_BITS` bits is
 /// decided by its first `l` bits, so the padding never changes it.
 ///
@@ -193,7 +193,6 @@ fn build_pair_table(short: &[u32; DEC_SIZE], rlc: u32, pair: &mut Vec<u64>) {
         }
         let s1 = u64::from(e1 >> 8);
         if e1 >> 8 == rlc {
-            *p = u64::from(l1) | RUN << 8;
             continue;
         }
         *p = u64::from(l1) | ONE << 8 | s1 << 16;
@@ -468,8 +467,8 @@ fn fast_prefix(
         // One or two whole codes from the pair table (the common case).
         let p = pair[bits.peek(PAIR_BITS) as usize];
         let pl = (p & 0xff) as u32;
-        let kind = (p >> 8) & 3;
-        if pl != 0 && kind != RUN {
+        if pl != 0 {
+            let kind = (p >> 8) & 3;
             let Some(d) = out.get_mut(pos..pos + 2) else {
                 // Within two of the end: the checked loop finishes.
                 break;
