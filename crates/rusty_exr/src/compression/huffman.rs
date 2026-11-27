@@ -479,6 +479,20 @@ fn fast_prefix(
             d[1] = (p >> 32) as u16;
             bits.consume(pl);
             pos += kind as usize;
+            // A second lookup without a refill test: at least 32 bits were
+            // there and one entry consumes at most `PAIR_BITS` (12).
+            let p = pair[bits.peek(PAIR_BITS) as usize];
+            let pl = (p & 0xff) as u32;
+            if pl != 0 {
+                let kind = (p >> 8) & 3;
+                let Some(d) = out.get_mut(pos..pos + 2) else {
+                    break;
+                };
+                d[0] = (p >> 16) as u16;
+                d[1] = (p >> 32) as u16;
+                bits.consume(pl);
+                pos += kind as usize;
+            }
             continue;
         }
         let e = short[bits.peek(DEC_BITS) as usize];
