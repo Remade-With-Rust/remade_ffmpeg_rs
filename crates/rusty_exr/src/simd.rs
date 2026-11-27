@@ -431,6 +431,40 @@ pub(crate) fn f24_4(isa: Isa, v: [u32; 4]) -> [u32; 4] {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RLE encode: run and literal scans.
+
+/// Advance `end` over `data[start]`'s repeat run 16 positions at a time
+/// while every position stays inside the data and the 128-byte cap; stop
+/// at the first differing byte or before a step that could cross either
+/// limit. `rle::run_end` finishes from the returned position (and is the
+/// oracle: it gives the same final end from any position this returns).
+pub(crate) fn rle_run_end(isa: Isa, data: &[u8], start: usize, end: usize) -> usize {
+    assert!(start < data.len() && end >= start && end <= data.len());
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SSE2 is part of x86-64; every 16-byte load is checked to
+        // end inside `data`.
+        Isa::Sse2 | Isa::Avx2 => unsafe { x86::rle_run_end_sse2(data, start, end) },
+        _ => end,
+    }
+}
+
+/// Advance `end` over a literal run 16 positions at a time while each
+/// position has two bytes after it and stays under the 127-byte cap; stop
+/// at the first position that starts three equal bytes. `rle::literal_end`
+/// finishes (and is the oracle).
+pub(crate) fn rle_literal_end(isa: Isa, data: &[u8], start: usize, end: usize) -> usize {
+    assert!(start < data.len() && end >= start && end <= data.len());
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SSE2 is part of x86-64; every load (up to end + 18) is
+        // checked to end inside `data`.
+        Isa::Sse2 | Isa::Avx2 => unsafe { x86::rle_literal_end_sse2(data, start, end) },
+        _ => end,
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::wildcard_imports)]
 mod x86 {
@@ -1738,6 +1772,39 @@ mod x86 {
                 dst[k * w + x] = dv[4 - planes + k];
             }
         }
+    }
+
+    // --- RLE encode -------------------------------------------------------------
+
+    pub(super) unsafe fn rle_run_end_sse2(data: &[u8], start: usize, mut end: usize) -> usize {
+        let p = data.as_ptr();
+        let v = _mm_set1_epi8(data[start] as i8);
+        // Positions end..end + 16 must satisfy `pos - start < 128`.
+        while end + 16 <= data.len() && end + 15 - start < 128 {
+            let m = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(p.add(end).cast()), v)) as u32;
+            if m != 0xffff {
+                return end + (!m).trailing_zeros() as usize;
+            }
+            end += 16;
+        }
+        end
+    }
+
+    pub(super) unsafe fn rle_literal_end_sse2(data: &[u8], start: usize, mut end: usize) -> usize {
+        let p = data.as_ptr();
+        // Positions end..end + 16 need two bytes after them and
+        // `pos - start < 127`.
+        while end + 18 <= data.len() && end + 15 - start < 127 {
+            let a = _mm_loadu_si128(p.add(end).cast());
+            let b = _mm_loadu_si128(p.add(end + 1).cast());
+            let c = _mm_loadu_si128(p.add(end + 2).cast());
+            let m = _mm_movemask_epi8(_mm_and_si128(_mm_cmpeq_epi8(a, b), _mm_cmpeq_epi8(b, c)));
+            if m != 0 {
+                return end + m.trailing_zeros() as usize;
+            }
+            end += 16;
+        }
+        end
     }
 
     // --- test hooks -------------------------------------------------------

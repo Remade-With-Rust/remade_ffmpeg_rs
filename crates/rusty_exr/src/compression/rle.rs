@@ -61,39 +61,60 @@ pub(crate) fn unpack_into(src: &[u8], out_len: usize, out: &mut Vec<u8>) -> Resu
 pub(crate) fn pack(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() + data.len() / 64 + 2);
     let n = data.len();
+    let isa = crate::simd::isa();
     let mut start = 0;
     let mut end = 1;
     while start < n {
-        // `end` may equal `start` here (after a repeat run), in which case
-        // the first step only re-reads `data[start]`; signed arithmetic
-        // keeps OpenEXR's bound (a repeat run may reach 128 bytes).
-        while end < n
-            && data[start] == data[end]
-            && (end as isize - start as isize - 1) < MAX_RUN as isize
-        {
-            end += 1;
-        }
+        end = run_end(data, start, crate::simd::rle_run_end(isa, data, start, end));
         if end - start >= MIN_RUN {
             out.push((end - start - 1) as u8);
             out.push(data[start]);
             start = end;
             continue;
         }
-        while end < n
-            && (end + 1 >= n
-                || data[end] != data[end + 1]
-                || end + 2 >= n
-                || data[end + 1] != data[end + 2])
-            && end - start < MAX_RUN
-        {
-            end += 1;
-        }
+        end = literal_end(
+            data,
+            start,
+            crate::simd::rle_literal_end(isa, data, start, end),
+        );
         out.push((start as isize - end as isize) as u8);
         out.extend_from_slice(&data[start..end]);
         start = end;
         end += 1;
     }
     out
+}
+
+/// The end of the repeat run of `data[start]` scanned from `end`: the first
+/// position that differs, at most 128 bytes after `start`. `end` may equal
+/// `start` (after a repeat run), in which case the first step only re-reads
+/// `data[start]`; signed arithmetic keeps OpenEXR's bound. The oracle of
+/// `simd::rle_run_end`, which advances `end` first.
+pub(crate) fn run_end(data: &[u8], start: usize, mut end: usize) -> usize {
+    while end < data.len()
+        && data[start] == data[end]
+        && (end as isize - start as isize - 1) < MAX_RUN as isize
+    {
+        end += 1;
+    }
+    end
+}
+
+/// The end of the literal run scanned from `end`: the first position that
+/// starts three equal bytes, at most 127 bytes after `start`, or the end of
+/// the data. The oracle of `simd::rle_literal_end`.
+pub(crate) fn literal_end(data: &[u8], start: usize, mut end: usize) -> usize {
+    let n = data.len();
+    while end < n
+        && (end + 1 >= n
+            || data[end] != data[end + 1]
+            || end + 2 >= n
+            || data[end + 1] != data[end + 2])
+        && end - start < MAX_RUN
+    {
+        end += 1;
+    }
+    end
 }
 
 /// Un-RLE and undo the predictor into `scratch.a` (even bytes, then odd).
@@ -114,6 +135,54 @@ pub(crate) fn compress(raw: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_twins_match_scalar() {
+        let mut seed = 0x0e1e_0e1eu32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for case in 0..300 {
+            let n = 1 + (next() % 700) as usize;
+            // Runs of random lengths over a small alphabet, so every run and
+            // literal length (and the 127/128 caps) shows up.
+            let mut data = Vec::with_capacity(n);
+            while data.len() < n {
+                let v = (next() % [2, 3, 256][case % 3]) as u8;
+                let len = 1 + (next() % [3, 40, 300][(case / 3) % 3]) as usize;
+                data.extend(std::iter::repeat_n(v, len.min(n - data.len())));
+            }
+            for start in 0..n {
+                for end in [start, start + 1, start + 2] {
+                    if end > n {
+                        continue;
+                    }
+                    let want_r = run_end(&data, start, end);
+                    let want_l = literal_end(&data, start, end.max(start + 1).min(n));
+                    for isa in crate::simd::available() {
+                        let r = crate::simd::rle_run_end(isa, &data, start, end);
+                        assert!(r <= want_r && r >= end);
+                        assert_eq!(
+                            run_end(&data, start, r),
+                            want_r,
+                            "{isa:?} run {start} {end}"
+                        );
+                        let e0 = end.max(start + 1).min(n);
+                        let l = crate::simd::rle_literal_end(isa, &data, start, e0);
+                        assert!(l <= want_l && l >= e0);
+                        assert_eq!(
+                            literal_end(&data, start, l),
+                            want_l,
+                            "{isa:?} lit {start} {end}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn round_trip() {
