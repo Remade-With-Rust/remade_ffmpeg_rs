@@ -372,6 +372,20 @@ pub(crate) fn apply_predictor(isa: Isa, t: &mut [u8]) -> usize {
     n - 16 * steps
 }
 
+// ---------------------------------------------------------------------------
+// B44 encode: the per-block shift search.
+
+/// The twin of `b44::search_scalar` (`None` when the AVX2 kernel is not
+/// in use; the search needs unsigned 16-bit max and 256-bit 32-bit lanes).
+pub(crate) fn b44_search(isa: Isa, s: &[u16; 16]) -> Option<crate::compression::b44::Search> {
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: AVX2 was detected; fixed-size arrays.
+        Isa::Avx2 => Some(unsafe { x86::b44_search_avx2(s) }),
+        _ => None,
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::wildcard_imports)]
 mod x86 {
@@ -1482,6 +1496,79 @@ mod x86 {
                 p.add(at).cast(),
                 _mm_add_epi8(_mm_sub_epi8(cur, prev), bias),
             );
+        }
+    }
+
+    // --- B44 encode -------------------------------------------------------------
+
+    /// `b44::search_scalar` on 16 lanes: the sortable transform, the
+    /// maximum, then per shift the rounded distances (32-bit lanes, one row
+    /// per 128-bit half) and a single test that every delta fits.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn b44_search_avx2(s: &[u16; 16]) -> crate::compression::b44::Search {
+        let v = _mm256_loadu_si256(s.as_ptr().cast());
+        let exp = _mm256_set1_epi16(0x7c00);
+        let top = _mm256_set1_epi16(-0x8000);
+        let infnan = _mm256_cmpeq_epi16(_mm256_and_si256(v, exp), exp);
+        let neg = _mm256_srai_epi16::<15>(v);
+        let fin = _mm256_or_si256(
+            _mm256_and_si256(neg, _mm256_xor_si256(v, _mm256_set1_epi16(-1))),
+            _mm256_andnot_si256(neg, _mm256_or_si256(v, top)),
+        );
+        let t = _mm256_or_si256(
+            _mm256_and_si256(infnan, top),
+            _mm256_andnot_si256(infnan, fin),
+        );
+        let mut tv = [0u16; 16];
+        _mm256_storeu_si256(tv.as_mut_ptr().cast(), t);
+        // Unsigned maximum, broadcast.
+        let mut m = _mm_max_epu16(_mm256_castsi256_si128(t), _mm256_extracti128_si256::<1>(t));
+        m = _mm_max_epu16(m, _mm_srli_si128::<8>(m));
+        m = _mm_max_epu16(m, _mm_srli_si128::<4>(m));
+        m = _mm_max_epu16(m, _mm_srli_si128::<2>(m));
+        let t_max = i32::from(_mm_extract_epi16::<0>(m) as u16);
+        let x = _mm256_sub_epi16(_mm256_set1_epi16(t_max as u16 as i16), t);
+        // Doubled distances, rows 0-1 and rows 2-3.
+        let x0 = _mm256_slli_epi32::<1>(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(x)));
+        let x1 = _mm256_slli_epi32::<1>(_mm256_cvtepu16_epi32(_mm256_extracti128_si256::<1>(x)));
+        let one = _mm256_set1_epi32(1);
+        let bias = _mm256_set1_epi32(32);
+        let col = _mm256_setr_epi32(-1, 0, 0, 0, -1, 0, 0, 0);
+        let outside = _mm256_set1_epi32(!63);
+        let mut shift = 0;
+        loop {
+            // shift_and_round(x, shift) = (2x + 2^shift - 1 + bit) >> (shift + 1).
+            let cnt = _mm_cvtsi32_si128(shift + 1);
+            let a = _mm256_set1_epi32((1 << shift) - 1);
+            let b0 = _mm256_and_si256(_mm256_srl_epi32(x0, cnt), one);
+            let b1 = _mm256_and_si256(_mm256_srl_epi32(x1, cnt), one);
+            let d0 = _mm256_srl_epi32(_mm256_add_epi32(_mm256_add_epi32(x0, a), b0), cnt);
+            let d1 = _mm256_srl_epi32(_mm256_add_epi32(_mm256_add_epi32(x1, a), b1), cnt);
+            // Along rows: d[c] - d[c + 1] (lane 3 of each row compares with
+            // itself: 0, harmless). Down column 0: row r - row r + 1.
+            let r0 = _mm256_sub_epi32(d0, _mm256_shuffle_epi32::<0b11_11_10_01>(d0));
+            let r1 = _mm256_sub_epi32(d1, _mm256_shuffle_epi32::<0b11_11_10_01>(d1));
+            let c0 = _mm256_sub_epi32(d0, _mm256_permute2x128_si256::<0x21>(d0, d1));
+            let c1 = _mm256_sub_epi32(d1, _mm256_permute2x128_si256::<0x11>(d1, d1));
+            let c0 = _mm256_and_si256(c0, col);
+            let c1 = _mm256_and_si256(c1, col);
+            // Every delta + 32 in 0..=63.
+            let all = _mm256_or_si256(
+                _mm256_or_si256(_mm256_add_epi32(r0, bias), _mm256_add_epi32(r1, bias)),
+                _mm256_or_si256(_mm256_add_epi32(c0, bias), _mm256_add_epi32(c1, bias)),
+            );
+            if _mm256_testz_si256(all, outside) != 0 || shift >= 30 {
+                let mut d = [0i32; 16];
+                _mm256_storeu_si256(d.as_mut_ptr().cast(), d0);
+                _mm256_storeu_si256(d.as_mut_ptr().add(8).cast(), d1);
+                return crate::compression::b44::Search {
+                    t: tv,
+                    t_max,
+                    shift,
+                    d,
+                };
+            }
+            shift += 1;
         }
     }
 
