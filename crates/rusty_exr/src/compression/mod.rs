@@ -297,8 +297,9 @@ pub(crate) fn decompress_layout<'a>(
             Ok(Layout::Raw(&scratch.a))
         }
         Compression::B44 | Compression::B44a => {
-            scratch.a = b44::decompress(geom, data)?;
-            Ok(Layout::Planar(&scratch.a))
+            // The worker's buffer, reused: every byte is written.
+            b44::decompress(geom, data, grow(&mut scratch.a, geom.raw_size))?;
+            Ok(Layout::Planar(&scratch.a[..geom.raw_size]))
         }
         Compression::Dwaa | Compression::Dwab => {
             scratch.a = dwa::decompress(geom, data)?;

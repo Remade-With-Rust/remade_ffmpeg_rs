@@ -50,9 +50,12 @@ fn unpack3(b: &[u8], s: &mut [u16; 16]) {
     finish(s);
 }
 
-pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
+/// Decode a B44 chunk into `planar` (channel-planar bytes, exactly
+/// `raw_size` long; every byte is written, so a reused buffer needs no
+/// clearing).
+pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8], planar: &mut [u8]) -> Result<()> {
+    assert_eq!(planar.len(), geom.raw_size);
     let log = &crate::luts::get().b44_log;
-    let mut planar = vec![0u8; geom.raw_size];
     let mut ip = 0usize;
     let mut op = 0usize;
     for ch in &geom.chans {
@@ -81,7 +84,7 @@ pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
         }
         op += n;
     }
-    Ok(planar)
+    Ok(())
 }
 
 /// Decode the block at `ip` into the 4x4 cell at (`x`, `y`) of a HALF
