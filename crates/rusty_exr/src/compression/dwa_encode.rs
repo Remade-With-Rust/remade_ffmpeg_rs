@@ -682,11 +682,18 @@ fn zlib9(data: &[u8]) -> Vec<u8> {
 
 /// Compress one chunk (raw layout in). `level` is the DWA compression level
 /// (OpenEXR's and `exr`'s default is 45).
-pub(crate) fn compress(geom: &BlockGeom<'_>, raw: &[u8], level: f32) -> Result<Vec<u8>> {
+pub(crate) fn compress(
+    geom: &BlockGeom<'_>,
+    raw: &[u8],
+    level: f32,
+    work: &mut super::Work,
+) -> Result<Vec<u8>> {
     let rules = default_rules();
     let rule_bytes = write_rules(&rules, geom);
     let (schemes, sets) = classify(&geom.chans, &rules);
-    let planar = geom.raw_to_planar(raw);
+    let planar = super::grow(&mut work.planar, geom.raw_size);
+    geom.raw_to_planar_into(raw, planar);
+    let planar = &*planar;
     let mut starts = Vec::with_capacity(geom.chans.len());
     let mut s = 0usize;
     for c in &geom.chans {

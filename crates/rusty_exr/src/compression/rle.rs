@@ -128,8 +128,8 @@ pub(crate) fn decompress_halves(
     Ok(())
 }
 
-pub(crate) fn compress(raw: &[u8]) -> Vec<u8> {
-    pack(&super::zip::prepare(raw))
+pub(crate) fn compress(raw: &[u8], work: &mut super::Work) -> Vec<u8> {
+    pack(super::zip::prepare_into(raw, &mut work.prep))
 }
 
 #[cfg(test)]
@@ -198,7 +198,7 @@ mod tests {
         for c in cases {
             let p = pack(&c);
             assert_eq!(unpack(&p, c.len()).unwrap(), c);
-            let z = compress(&c);
+            let z = compress(&c, &mut crate::compression::Work::default());
             let mut s = crate::compression::Scratch::default();
             decompress_halves(&z, c.len(), &mut s).unwrap();
             let mut back = vec![0; c.len()];

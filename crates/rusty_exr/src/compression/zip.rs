@@ -107,11 +107,11 @@ pub(crate) fn deinterleave_from(src: &[u8], dst: &mut [u8], pairs_done: usize) {
 }
 
 /// Byte-plane split, then the predictor: what the ZIP and RLE writers
-/// compress.
-pub(crate) fn prepare(raw: &[u8]) -> Vec<u8> {
-    let mut tmp = vec![0u8; raw.len()];
-    deinterleave(raw, &mut tmp);
-    apply_predictor(&mut tmp);
+/// compress, into a reused buffer (every byte is written).
+pub(crate) fn prepare_into<'a>(raw: &[u8], buf: &'a mut Vec<u8>) -> &'a [u8] {
+    let tmp = super::grow(buf, raw.len());
+    deinterleave(raw, tmp);
+    apply_predictor(tmp);
     tmp
 }
 
@@ -127,8 +127,8 @@ pub(crate) fn decompress_halves(
     Ok(())
 }
 
-pub(crate) fn compress(raw: &[u8], deflater: crate::Deflate) -> Vec<u8> {
-    super::deflate(&prepare(raw), deflater)
+pub(crate) fn compress(raw: &[u8], deflater: crate::Deflate, work: &mut super::Work) -> Vec<u8> {
+    super::deflate(prepare_into(raw, &mut work.prep), deflater)
 }
 
 #[cfg(test)]
@@ -195,7 +195,9 @@ mod tests {
                 apply_predictor_to(&mut d, from);
                 assert_eq!(d, want_p, "{isa:?} predictor n {n}");
             }
-            assert_eq!(prepare(&v), want_p);
+            // A reused buffer holding stale, longer data gives the same bytes.
+            let mut buf = vec![0xa5; n + 7];
+            assert_eq!(prepare_into(&v, &mut buf), &want_p[..]);
         }
     }
 

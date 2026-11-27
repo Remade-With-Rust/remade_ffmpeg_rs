@@ -245,10 +245,17 @@ fn pack(
 }
 
 /// Compress one chunk (raw layout in, B44 stream out). `flat` selects B44A.
-pub(crate) fn compress(geom: &BlockGeom<'_>, raw: &[u8], flat: bool) -> Vec<u8> {
+pub(crate) fn compress(
+    geom: &BlockGeom<'_>,
+    raw: &[u8],
+    flat: bool,
+    work: &mut super::Work,
+) -> Vec<u8> {
     let exp = &crate::luts::get().b44_exp;
     let isa = crate::simd::isa();
-    let planar = geom.raw_to_planar(raw);
+    let planar = super::grow(&mut work.planar, geom.raw_size);
+    geom.raw_to_planar_into(raw, planar);
+    let planar = &*planar;
     let mut out = Vec::with_capacity(raw.len());
     let mut ip = 0usize;
     let mut block = [0u8; 14];

@@ -403,12 +403,32 @@ fn wav_decode_level1<const W14: bool>(
 // ---------------------------------------------------------------------------
 // PIZ.
 
-fn planar_u16(geom: &BlockGeom<'_>, raw: &[u8]) -> Vec<u16> {
-    let planar = geom.raw_to_planar(raw);
-    planar
-        .chunks_exact(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-        .collect()
+/// The raw layout as channel-planar little-endian 16-bit words, written
+/// straight into `out` (exactly `raw_size / 2` words, every one written).
+fn planar_u16_into(geom: &BlockGeom<'_>, raw: &[u8], out: &mut [u16]) {
+    assert_eq!(out.len() * 2, geom.raw_size);
+    let mut starts = Vec::with_capacity(geom.chans.len());
+    let mut s = 0;
+    for c in &geom.chans {
+        starts.push(s);
+        s += c.bytes() / 2;
+    }
+    let mut o = 0;
+    for line in 0..geom.lines {
+        let y = geom.y0 + line as i32;
+        for (ci, c) in geom.chans.iter().enumerate() {
+            if !super::sampled(y, c.y_sampling) {
+                continue;
+            }
+            let n = c.row_bytes();
+            let dst = &mut out[starts[ci]..starts[ci] + n / 2];
+            for (d, b) in dst.iter_mut().zip(raw[o..o + n].chunks_exact(2)) {
+                *d = u16::from_le_bytes([b[0], b[1]]);
+            }
+            starts[ci] += n / 2;
+            o += n;
+        }
+    }
 }
 
 /// Decode a PIZ chunk into `scratch.w` (channel-planar 16-bit words).
@@ -489,13 +509,14 @@ pub(crate) fn decompress(
     Ok(())
 }
 
-pub(crate) fn compress(geom: &BlockGeom<'_>, raw: &[u8]) -> Vec<u8> {
+pub(crate) fn compress(geom: &BlockGeom<'_>, raw: &[u8], work: &mut super::Work) -> Vec<u8> {
     if raw.is_empty() {
         return Vec::new();
     }
-    let mut tmp = planar_u16(geom, raw);
+    let tmp = super::grow(&mut work.words, raw.len() / 2);
+    planar_u16_into(geom, raw, tmp);
     let mut bitmap = vec![0u8; BITMAP_SIZE];
-    for &v in &tmp {
+    for &v in tmp.iter() {
         bitmap[v as usize >> 3] |= 1 << (v & 7);
     }
     bitmap[0] &= !1;
@@ -513,7 +534,7 @@ pub(crate) fn compress(geom: &BlockGeom<'_>, raw: &[u8]) -> Vec<u8> {
         }
     }
     let max_value = k.wrapping_sub(1);
-    for v in &mut tmp {
+    for v in tmp.iter_mut() {
         *v = fwd[*v as usize];
     }
     let mut out = Vec::with_capacity(raw.len() / 2);
@@ -535,7 +556,7 @@ pub(crate) fn compress(geom: &BlockGeom<'_>, raw: &[u8]) -> Vec<u8> {
         }
         start += count;
     }
-    let huf = huffman::compress(&tmp).expect("bounded symbol counts");
+    let huf = huffman::compress(tmp).expect("bounded symbol counts");
     out.extend_from_slice(&(huf.len() as i32).to_le_bytes());
     out.extend_from_slice(&huf);
     out
