@@ -11,13 +11,25 @@ use crate::error::Result;
 /// lane, so one multiply by `0x0001_0001_0001_0001` forms all the lane
 /// prefix sums at once; the running byte from the previous word is added at
 /// the end. Only that final add sits on the loop-carried path.
+///
+/// The SIMD twin (`simd::undo_predictor`) handles a prefix of whole
+/// 16-byte steps; this word loop finishes the rest and is the oracle.
 pub(crate) fn undo_predictor(t: &mut [u8]) {
+    let done = crate::simd::undo_predictor(crate::simd::isa(), t);
+    undo_predictor_from(t, done);
+}
+
+/// [`undo_predictor`] over `t[start..]`, where `t[..start]` is already
+/// done (`start == 0` does the whole buffer).
+pub(crate) fn undo_predictor_from(t: &mut [u8], start: usize) {
     const M: u64 = 0x00ff_00ff_00ff_00ff;
     const SPLAT16: u64 = 0x0001_0001_0001_0001;
-    let Some((first, rest)) = t.split_first_mut() else {
+    if t.is_empty() {
         return;
-    };
-    let mut prev = *first;
+    }
+    let start = start.max(1);
+    let mut prev = t[start - 1];
+    let rest = &mut t[start..];
     let mut words = rest.chunks_exact_mut(8);
     for c in &mut words {
         // d_k - 128 (mod 256) in every byte.
@@ -120,6 +132,16 @@ mod tests {
             undo_predictor(&mut a);
             undo_scalar(&mut b);
             assert_eq!(a, b, "n = {n}");
+            let mut c = v.clone();
+            undo_predictor_from(&mut c, 0);
+            assert_eq!(c, b, "word loop, n = {n}");
+            for isa in crate::simd::available() {
+                let mut d = v.clone();
+                let done = crate::simd::undo_predictor(isa, &mut d);
+                assert!(done <= n);
+                undo_predictor_from(&mut d, done);
+                assert_eq!(d, b, "{isa:?}, n = {n}");
+            }
             apply_predictor(&mut a);
             assert_eq!(a, v);
         }

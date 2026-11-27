@@ -143,6 +143,58 @@ pub(crate) fn piz_wdec_rows(
     chunks * 16
 }
 
+// ---------------------------------------------------------------------------
+// Prefix sums: the ZIP/RLE/DWA byte predictor and PXR24's row deltas.
+
+/// Undo the ZIP predictor (`t[i] = t[i-1] + t[i] - 128`, mod 256) over a
+/// prefix of `t`: byte 0 plus whole 16-byte steps. Returns the prefix
+/// length (0 when no SIMD family is in use); the caller finishes with
+/// `zip::undo_predictor_from`.
+pub(crate) fn undo_predictor(isa: Isa, t: &mut [u8]) -> usize {
+    if t.len() < 17 {
+        return 0;
+    }
+    let steps = (t.len() - 1) / 16;
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SSE2 is part of x86-64; bytes 0..1 + 16 * steps are in `t`.
+        Isa::Sse2 | Isa::Avx2 => unsafe { x86::undo_predictor_sse2(t, steps) },
+        _ => return 0,
+    }
+    1 + 16 * steps
+}
+
+/// PXR24 HALF row: `out` (little-endian u16) is the running sum of the
+/// big-endian deltas whose high bytes are `hi` and low bytes `lo` (the
+/// twin of `pxr24::row_16`). Returns `false` when no SIMD family is in use.
+pub(crate) fn pxr24_row_16(isa: Isa, hi: &[u8], lo: &[u8], out: &mut [u8]) -> bool {
+    let w = hi.len();
+    assert!(lo.len() == w && out.len() == 2 * w);
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SSE2 is part of x86-64; lengths checked above.
+        Isa::Sse2 | Isa::Avx2 => unsafe { x86::pxr24_row_16_sse2(hi, lo, out) },
+        _ => return false,
+    }
+    true
+}
+
+/// PXR24 FLOAT/UINT row: the running sum of big-endian 32-bit deltas whose
+/// bytes, most significant first, are `p[0]`, `p[1]`, `p[2]` and `p3` (zero
+/// for FLOAT's 24-bit samples). The twin of `pxr24::row_32`.
+pub(crate) fn pxr24_row_32(isa: Isa, p: [&[u8]; 3], p3: Option<&[u8]>, out: &mut [u8]) -> bool {
+    let w = p[0].len();
+    assert!(p.iter().all(|q| q.len() == w) && p3.is_none_or(|q| q.len() == w));
+    assert!(out.len() == 4 * w);
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SSE2 is part of x86-64; lengths checked above.
+        Isa::Sse2 | Isa::Avx2 => unsafe { x86::pxr24_row_32_sse2(p, p3, out) },
+        _ => return false,
+    }
+    true
+}
+
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::wildcard_imports)]
 mod x86 {
@@ -758,6 +810,98 @@ mod x86 {
                 (false, 1) => wdec_sse2::<false, 1>(t, b, 1),
                 (false, _) => wdec_sse2::<false, 2>(t, b, 1),
             }
+        }
+    }
+
+    // --- prefix sums ---------------------------------------------------------
+
+    /// `zip::undo_predictor` over byte 0 and `steps` 16-byte steps: each
+    /// step is a 4-round log prefix sum of `d - 128` plus the previous byte.
+    pub(super) unsafe fn undo_predictor_sse2(t: &mut [u8], steps: usize) {
+        let p = t.as_mut_ptr();
+        let bias = _mm_set1_epi8(-128);
+        let mut prev = _mm_set1_epi8(t[0] as i8);
+        for s in 0..steps {
+            let q = p.add(1 + 16 * s);
+            let mut x = _mm_xor_si128(_mm_loadu_si128(q.cast()), bias);
+            x = _mm_add_epi8(x, _mm_slli_si128::<1>(x));
+            x = _mm_add_epi8(x, _mm_slli_si128::<2>(x));
+            x = _mm_add_epi8(x, _mm_slli_si128::<4>(x));
+            x = _mm_add_epi8(x, _mm_slli_si128::<8>(x));
+            let out = _mm_add_epi8(x, prev);
+            _mm_storeu_si128(q.cast(), out);
+            // Broadcast byte 15.
+            let hi = _mm_unpackhi_epi8(out, out);
+            prev = _mm_shuffle_epi32::<0xff>(_mm_shufflehi_epi16::<0xff>(hi));
+        }
+    }
+
+    /// `pxr24::row_16`: eight samples per step.
+    pub(super) unsafe fn pxr24_row_16_sse2(hi: &[u8], lo: &[u8], out: &mut [u8]) {
+        let w = hi.len();
+        let steps = w / 8;
+        let mut carry = _mm_setzero_si128();
+        for s in 0..steps {
+            let h = _mm_loadl_epi64(hi.as_ptr().add(8 * s).cast());
+            let l = _mm_loadl_epi64(lo.as_ptr().add(8 * s).cast());
+            let mut v = _mm_unpacklo_epi8(l, h);
+            v = _mm_add_epi16(v, _mm_slli_si128::<2>(v));
+            v = _mm_add_epi16(v, _mm_slli_si128::<4>(v));
+            v = _mm_add_epi16(v, _mm_slli_si128::<8>(v));
+            v = _mm_add_epi16(v, carry);
+            _mm_storeu_si128(out.as_mut_ptr().add(16 * s).cast(), v);
+            carry = _mm_shuffle_epi32::<0xff>(_mm_shufflehi_epi16::<0xff>(v));
+        }
+        let mut acc = if steps > 0 {
+            u16::from_le_bytes([out[16 * steps - 2], out[16 * steps - 1]])
+        } else {
+            0
+        };
+        for x in 8 * steps..w {
+            acc = acc.wrapping_add(u16::from_be_bytes([hi[x], lo[x]]));
+            out[2 * x..2 * x + 2].copy_from_slice(&acc.to_le_bytes());
+        }
+    }
+
+    /// `pxr24::row_32`: eight samples per step.
+    pub(super) unsafe fn pxr24_row_32_sse2(p: [&[u8]; 3], p3: Option<&[u8]>, out: &mut [u8]) {
+        let w = p[0].len();
+        let steps = w / 8;
+        let z = _mm_setzero_si128();
+        let mut carry = z;
+        let ld = |q: &[u8], s: usize| _mm_loadl_epi64(q.as_ptr().add(8 * s).cast());
+        for s in 0..steps {
+            let low = match p3 {
+                Some(q) => ld(q, s),
+                None => z,
+            };
+            // Words: (byte 1 | byte 0 << 8) and (byte 3 | byte 2 << 8).
+            let lo16 = _mm_unpacklo_epi8(low, ld(p[2], s));
+            let hi16 = _mm_unpacklo_epi8(ld(p[1], s), ld(p[0], s));
+            for (k, mut v) in [
+                _mm_unpacklo_epi16(lo16, hi16),
+                _mm_unpackhi_epi16(lo16, hi16),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                v = _mm_add_epi32(v, _mm_slli_si128::<4>(v));
+                v = _mm_add_epi32(v, _mm_slli_si128::<8>(v));
+                v = _mm_add_epi32(v, carry);
+                _mm_storeu_si128(out.as_mut_ptr().add(32 * s + 16 * k).cast(), v);
+                carry = _mm_shuffle_epi32::<0xff>(v);
+            }
+        }
+        let mut acc = if steps > 0 {
+            let o = 32 * steps;
+            u32::from_le_bytes([out[o - 4], out[o - 3], out[o - 2], out[o - 1]])
+        } else {
+            0
+        };
+        for x in 8 * steps..w {
+            let low = p3.map_or(0, |q| q[x]);
+            acc = acc.wrapping_add(u32::from_be_bytes([p[0][x], p[1][x], p[2][x], low]));
+            out[4 * x..4 * x + 4].copy_from_slice(&acc.to_le_bytes());
         }
     }
 
