@@ -522,6 +522,22 @@ fn decode_lossy(
                 let mut i = 0usize;
                 let mut k = 1usize;
                 let mut lnz = 0usize;
+                if let Some(win) = toks.first_chunk::<64>() {
+                    // At most 63 tokens fill a block, so with 64 left no
+                    // read can run out: no per-token length check.
+                    while k < 64 {
+                        let v = win[i & 63];
+                        i += 1;
+                        if v & 0xff00 == 0xff00 {
+                            let c = usize::from(v & 0xff);
+                            k += if c == 0 { 64 } else { c };
+                        } else {
+                            lnz = k;
+                            z[UNZIGZAG[k]] = v;
+                            k += 1;
+                        }
+                    }
+                }
                 while k < 64 {
                     let Some(&v) = toks.get(i) else {
                         return Err(Error::invalid("DWA AC data too short"));
