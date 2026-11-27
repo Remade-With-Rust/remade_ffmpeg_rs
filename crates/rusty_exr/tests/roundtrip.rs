@@ -328,9 +328,192 @@ fn rejects_bad_requests() {
         Err(rusty_exr::Error::Usage(_))
     ));
     let img = Image::new(2, 2).with_channel("R", Samples::F16(vec![0; 4]));
+    let usage =
+        |o: EncodeOptions| matches!(rusty_exr::encode(&img, &o), Err(rusty_exr::Error::Usage(_)));
+    assert!(usage(EncodeOptions {
+        line_order: LineOrder::Random,
+        ..EncodeOptions::default()
+    }));
+    assert!(usage(EncodeOptions {
+        tiles: Some((0, 64)),
+        ..EncodeOptions::default()
+    }));
+    assert!(usage(EncodeOptions {
+        dwa_level: Some(-1.0),
+        ..EncodeOptions::new(Compression::Dwaa)
+    }));
+    assert!(usage(EncodeOptions {
+        dwa_level: Some(f32::NAN),
+        ..EncodeOptions::new(Compression::Dwab)
+    }));
+    let mut sub = Image::new(2, 2).with_channel("Y", Samples::F16(vec![0; 4]));
+    sub = sub.with_channel("RY", Samples::F16(vec![0; 1]));
+    sub.channels[1].desc.x_sampling = 2;
+    sub.channels[1].desc.y_sampling = 2;
+    sub.channels[1].width = 1;
+    sub.channels[1].height = 1;
+    assert!(rusty_exr::encode(&sub, &EncodeOptions::default()).is_ok());
     assert!(matches!(
-        rusty_exr::encode(&img, &EncodeOptions::new(Compression::Dwaa)),
-        Err(rusty_exr::Error::Unsupported(_))
+        rusty_exr::encode(
+            &sub,
+            &EncodeOptions {
+                tiles: Some((64, 64)),
+                ..EncodeOptions::default()
+            }
+        ),
+        Err(rusty_exr::Error::Usage(_))
     ));
     assert!(rusty_exr::decode(b"not an exr").is_err());
+}
+
+fn smooth_rgba(w: u32, h: u32) -> Image {
+    let n = (w * h) as usize;
+    let v = |i: usize, k: usize| {
+        let (x, y) = ((i % w as usize) as f32, (i / w as usize) as f32);
+        ((x * 0.07 + k as f32).sin() * (y * 0.05).cos() + 1.2) * 0.8
+    };
+    let half = |k: usize| Samples::F16((0..n).map(|i| rusty_exr::f32_to_f16(v(i, k))).collect());
+    Image::new(w, h)
+        .with_channel("A", half(3))
+        .with_channel("B", half(2))
+        .with_channel("G", half(1))
+        .with_channel("R", half(0))
+        .with_channel("id", Samples::U32((0..n as u32).collect()))
+        .with_channel("Z", Samples::F32((0..n).map(|i| v(i, 4) * 10.0).collect()))
+}
+
+fn halves_close(a: &Image, b: &Image, name: &str, tol: f32) {
+    let (Samples::F16(p), Samples::F16(q)) = (
+        &a.channel(name).unwrap().samples,
+        &b.channel(name).unwrap().samples,
+    ) else {
+        panic!("half channel {name}");
+    };
+    let worst = p
+        .iter()
+        .zip(q)
+        .map(|(&x, &y)| (rusty_exr::f16_to_f32(x) - rusty_exr::f16_to_f32(y)).abs())
+        .fold(0.0f32, f32::max);
+    assert!(worst <= tol, "{name}: worst error {worst}");
+}
+
+#[test]
+fn lossy_round_trips() {
+    for (w, h) in [(1, 1), (5, 3), (67, 45), (300, 40)] {
+        let img = smooth_rgba(w, h);
+        for (c, tol) in [
+            (Compression::B44, 0.02),
+            (Compression::B44a, 0.02),
+            (Compression::Dwaa, 0.1),
+            (Compression::Dwab, 0.1),
+        ] {
+            for tiles in [None, Some((64, 64))] {
+                let opts = EncodeOptions {
+                    tiles,
+                    ..EncodeOptions::new(c)
+                };
+                let file = rusty_exr::encode(&img, &opts).unwrap();
+                let single = rusty_exr::encode(
+                    &img,
+                    &EncodeOptions {
+                        threads: Threads::Single,
+                        ..opts
+                    },
+                )
+                .unwrap();
+                assert_eq!(file, single, "{c:?} deterministic across threads");
+                let back = rusty_exr::decode(&file).unwrap();
+                assert_eq!(back.header.compression(), c);
+                for n in ["R", "G", "B"] {
+                    halves_close(&img, &back, n, tol);
+                }
+                // B44 stores non-half channels raw; DWA's alpha is lossless RLE.
+                halves_close(
+                    &img,
+                    &back,
+                    "A",
+                    if c == Compression::B44 || c == Compression::B44a {
+                        tol
+                    } else {
+                        0.0
+                    },
+                );
+                assert_eq!(
+                    img.channel("id").unwrap().samples,
+                    back.channel("id").unwrap().samples
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn dwa_level_attribute() {
+    let img = smooth_rgba(40, 40);
+    let level_of = |o: EncodeOptions| {
+        let f = rusty_exr::encode(&img, &o).unwrap();
+        let h = rusty_exr::read_headers(&f).unwrap().remove(0);
+        match h.get("dwaCompressionLevel") {
+            Some(rusty_exr::AttributeValue::Float(v)) => Some(*v),
+            _ => None,
+        }
+    };
+    assert_eq!(level_of(EncodeOptions::new(Compression::Dwaa)), None);
+    let o = EncodeOptions {
+        dwa_level: Some(120.0),
+        ..EncodeOptions::new(Compression::Dwab)
+    };
+    assert_eq!(level_of(o), Some(120.0));
+    // A coarser level makes a smaller file.
+    let size = |l: f32| {
+        rusty_exr::encode(
+            &img,
+            &EncodeOptions {
+                dwa_level: Some(l),
+                ..EncodeOptions::new(Compression::Dwaa)
+            },
+        )
+        .unwrap()
+        .len()
+    };
+    assert!(size(400.0) < size(5.0));
+}
+
+#[test]
+fn tiled_round_trips() {
+    for (w, h) in [(1, 1), (3, 2), (65, 70), (130, 64)] {
+        let img = image(w, h, u64::from(w * 7 + h));
+        for c in [
+            Compression::None,
+            Compression::Rle,
+            Compression::Zips,
+            Compression::Zip,
+            Compression::Piz,
+        ] {
+            for tiles in [(64, 64), (37, 19), (1, 1)] {
+                if tiles == (1, 1) && w * h > 100 {
+                    continue;
+                }
+                for order in [
+                    LineOrder::Random,
+                    LineOrder::Increasing,
+                    LineOrder::Decreasing,
+                ] {
+                    let opts = EncodeOptions {
+                        compression: c,
+                        line_order: order,
+                        tiles: Some(tiles),
+                        ..EncodeOptions::default()
+                    };
+                    let file = rusty_exr::encode(&img, &opts).unwrap();
+                    let d = rusty_exr::Decoder::new(&file).unwrap();
+                    assert_eq!(d.part_kind(0), Some(rusty_exr::PartKind::Tiled));
+                    let t = d.header(0).unwrap().tiles().unwrap();
+                    assert_eq!((t.x_size, t.y_size), tiles);
+                    assert_eq!(d.header(0).unwrap().line_order(), order);
+                    same_samples(&img, &d.decode_part(0).unwrap(), true);
+                }
+            }
+        }
+    }
 }

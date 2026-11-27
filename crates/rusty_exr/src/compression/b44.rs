@@ -1,6 +1,9 @@
 //! B44 / B44A: fixed-rate lossy compression of HALF channels in 4x4 blocks
 //! (14 bytes per block; B44A stores flat blocks in 3). Other sample types
 //! are stored raw.
+//!
+//! The encoder is OpenEXR's `pack` (and the `exr` crate's port of it):
+//! output is byte-identical to both.
 
 use super::BlockGeom;
 use crate::error::{Error, Result};
@@ -102,4 +105,134 @@ pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
         op += n;
     }
     Ok(planar)
+}
+
+/// OpenEXR's `shiftAndRound`: `x / 2^shift`, rounded to nearest, ties to even.
+#[inline]
+fn shift_and_round(x: i32, shift: i32) -> i32 {
+    let x = x << 1;
+    let a = (1 << shift) - 1;
+    let shift = shift + 1;
+    let b = (x >> shift) & 1;
+    (x + a + b) >> shift
+}
+
+const BIAS: i32 = 0x20;
+
+/// Pack one 4x4 block of halves; returns the bytes written (14, or 3 for
+/// a flat block when `flat` is set).
+fn pack(s: &[u16; 16], b: &mut [u8; 14], flat: bool, exact_max: bool) -> usize {
+    let mut t = [0u16; 16];
+    for (t, &v) in t.iter_mut().zip(s) {
+        *t = if v & 0x7c00 == 0x7c00 {
+            0x8000
+        } else if v & 0x8000 != 0 {
+            !v
+        } else {
+            v | 0x8000
+        };
+    }
+    let t_max = i32::from(*t.iter().max().expect("16 values"));
+    let mut shift = -1;
+    let mut d = [0i32; 16];
+    let mut r = [0i32; 15];
+    loop {
+        shift += 1;
+        for (d, &t) in d.iter_mut().zip(&t) {
+            *d = shift_and_round(t_max - i32::from(t), shift);
+        }
+        r[0] = d[0] - d[4] + BIAS;
+        r[1] = d[4] - d[8] + BIAS;
+        r[2] = d[8] - d[12] + BIAS;
+        r[3] = d[0] - d[1] + BIAS;
+        r[4] = d[4] - d[5] + BIAS;
+        r[5] = d[8] - d[9] + BIAS;
+        r[6] = d[12] - d[13] + BIAS;
+        r[7] = d[1] - d[2] + BIAS;
+        r[8] = d[5] - d[6] + BIAS;
+        r[9] = d[9] - d[10] + BIAS;
+        r[10] = d[13] - d[14] + BIAS;
+        r[11] = d[2] - d[3] + BIAS;
+        r[12] = d[6] - d[7] + BIAS;
+        r[13] = d[10] - d[11] + BIAS;
+        r[14] = d[14] - d[15] + BIAS;
+        let (lo, hi) = r
+            .iter()
+            .fold((r[0], r[0]), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        if lo >= 0 && hi <= 0x3f {
+            if flat && lo == BIAS && hi == BIAS {
+                b[0] = (t[0] >> 8) as u8;
+                b[1] = t[0] as u8;
+                b[2] = 0xfc;
+                return 3;
+            }
+            break;
+        }
+    }
+    if exact_max {
+        t[0] = (t_max - (d[0] << shift)) as u16;
+    }
+    b[0] = (t[0] >> 8) as u8;
+    b[1] = t[0] as u8;
+    let r = r.map(|v| v as u32);
+    let shift = shift as u32;
+    b[2] = ((shift << 2) | (r[0] >> 4)) as u8;
+    b[3] = ((r[0] << 4) | (r[1] >> 2)) as u8;
+    b[4] = ((r[1] << 6) | r[2]) as u8;
+    b[5] = ((r[3] << 2) | (r[4] >> 4)) as u8;
+    b[6] = ((r[4] << 4) | (r[5] >> 2)) as u8;
+    b[7] = ((r[5] << 6) | r[6]) as u8;
+    b[8] = ((r[7] << 2) | (r[8] >> 4)) as u8;
+    b[9] = ((r[8] << 4) | (r[9] >> 2)) as u8;
+    b[10] = ((r[9] << 6) | r[10]) as u8;
+    b[11] = ((r[11] << 2) | (r[12] >> 4)) as u8;
+    b[12] = ((r[12] << 4) | (r[13] >> 2)) as u8;
+    b[13] = ((r[13] << 6) | r[14]) as u8;
+    14
+}
+
+/// Compress one chunk (raw layout in, B44 stream out). `flat` selects B44A.
+pub(crate) fn compress(geom: &BlockGeom<'_>, raw: &[u8], flat: bool) -> Vec<u8> {
+    let exp = &crate::luts::get().b44_exp;
+    let planar = geom.raw_to_planar(raw);
+    let mut out = Vec::with_capacity(raw.len());
+    let mut ip = 0usize;
+    let mut block = [0u8; 14];
+    for ch in &geom.chans {
+        let n = ch.bytes();
+        let src = &planar[ip..ip + n];
+        ip += n;
+        if n == 0 {
+            continue;
+        }
+        if ch.ty != SampleType::F16 {
+            out.extend_from_slice(src);
+            continue;
+        }
+        let (nx, ny) = (ch.width, ch.height);
+        let at = |x: usize, y: usize| {
+            let o = (y * nx + x) * 2;
+            u16::from_le_bytes([src[o], src[o + 1]])
+        };
+        let mut s = [0u16; 16];
+        for y in (0..ny).step_by(4) {
+            for x in (0..nx).step_by(4) {
+                // Edge blocks repeat the last row / column.
+                for r in 0..4 {
+                    let yy = (y + r).min(ny - 1);
+                    for k in 0..4 {
+                        s[r * 4 + k] = at((x + k).min(nx - 1), yy);
+                    }
+                }
+                if ch.p_linear {
+                    for v in &mut s {
+                        *v = exp[*v as usize];
+                    }
+                }
+                let len = pack(&s, &mut block, flat, !ch.p_linear);
+                out.extend_from_slice(&block[..len]);
+            }
+        }
+    }
+    out
 }
