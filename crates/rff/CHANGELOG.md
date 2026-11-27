@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.5](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/remade-ffmpeg-v0.9.4...remade-ffmpeg-v0.9.5) - 2026-11-27
+
+### Other
+
+- updated the following local packages: rff-codec-exr, rff-format-exr
+
 ## [0.9.3](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/remade-ffmpeg-v0.9.2...remade-ffmpeg-v0.9.3) - 2026-11-26
 
 ### Added

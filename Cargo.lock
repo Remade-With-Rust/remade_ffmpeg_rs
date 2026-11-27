@@ -5180,7 +5180,7 @@ dependencies = [
 
 [[package]]
 name = "rff-cli"
-version = "0.4.21"
+version = "0.4.22"
 dependencies = [
  "remade-ffmpeg",
  "rff-core",
@@ -5656,7 +5656,7 @@ version = "0.9.4"
 
 [[package]]
 name = "rff-server"
-version = "0.3.38"
+version = "0.3.39"
 dependencies = [
  "axum",
  "remade-ffmpeg",
@@ -5985,7 +5985,7 @@ checksum = "0c41a66390f96c0ee0bc0ee83a2bbef7990fd3144cb9d0e56f60396ac5f7fae7"
 
 [[package]]
 name = "rusty_exr"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "flate2",
  "miniz_oxide 0.8.9",
