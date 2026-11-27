@@ -564,7 +564,11 @@ thread_local! {
 /// `length | code << 6` entries. `s.used` ends up holding every symbol with
 /// an entry, ascending. Returns the symbol range `(im, iM)`.
 fn build_enc_table(s: &mut EncScratch, data: &[u16]) -> Result<(usize, usize)> {
-    let (t, links, used) = (&mut s.table, &mut s.links, &mut s.used);
+    // Fixed-size views: every u16 symbol indexes them without a bounds
+    // check, and their pointers stay in registers across the pushes.
+    let t: &mut [u64; ENC_SIZE] = s.table.as_mut_slice().try_into().expect("ENC_SIZE table");
+    let links: &mut [u32; ENC_SIZE] = s.links.as_mut_slice().try_into().expect("ENC_SIZE links");
+    let used = &mut s.used;
     used.clear();
     for &v in data {
         let e = &mut t[v as usize];
@@ -638,13 +642,16 @@ fn build_enc_table(s: &mut EncScratch, data: &[u16]) -> Result<(usize, usize)> {
     Ok((im, imax))
 }
 
-struct BitOut {
-    out: Vec<u8>,
+/// The bit writer. It holds the output by reference, so that appending
+/// (which may grow the vector) does not take the writer's own address and
+/// the accumulator stays in registers.
+struct BitOut<'a> {
+    out: &'a mut Vec<u8>,
     bits: u64,
     count: u64,
 }
 
-impl BitOut {
+impl BitOut<'_> {
     /// Append the low `n` bits of `v`, writing whole bytes as soon as they
     /// are complete (the reference formulation, and the oracle of
     /// [`Self::put`]). With more than 56 bits pending the top bits fall off
@@ -698,7 +705,7 @@ impl BitOut {
 
 fn pack_table(enc: &[u64], im: usize, imax: usize, out: &mut Vec<u8>) {
     let mut w = BitOut {
-        out: std::mem::take(out),
+        out,
         bits: 0,
         count: 0,
     };
@@ -729,11 +736,10 @@ fn pack_table(enc: &[u64], im: usize, imax: usize, out: &mut Vec<u8>) {
         i += 1;
     }
     w.flush();
-    *out = w.out;
 }
 
 #[inline(always)]
-fn send(w: &mut BitOut, sc: u64, run: u64, rc: u64) {
+fn send(w: &mut BitOut<'_>, sc: u64, run: u64, rc: u64) {
     if run == 0 {
         w.code(sc);
     } else if hlen(sc) + hlen(rc) + 8 < hlen(sc) * run {
@@ -765,17 +771,17 @@ pub(crate) fn compress(data: &[u16]) -> Result<Vec<u8>> {
 
 fn compress_with(s: &mut EncScratch, data: &[u16]) -> Result<Vec<u8>> {
     let (im, imax) = build_enc_table(s, data)?;
-    let enc = &s.table;
+    let enc: &[u64; ENC_SIZE] = s.table.as_slice().try_into().expect("ENC_SIZE table");
     let mut out = vec![0u8; 20];
     pack_table(enc, im, imax, &mut out);
     let table_len = out.len() - 20;
     let data_start = out.len();
+    out.reserve(data.len() + data.len() / 2);
     let mut w = BitOut {
-        out,
+        out: &mut out,
         bits: 0,
         count: 0,
     };
-    w.out.reserve(data.len() + data.len() / 2);
     let rc = enc[imax];
     let mut sym = data[0];
     let mut run = 0u64;
@@ -791,7 +797,6 @@ fn compress_with(s: &mut EncScratch, data: &[u16]) -> Result<Vec<u8>> {
     send(&mut w, enc[sym as usize], run, rc);
     let n_bits = (w.out.len() - data_start) as u64 * 8 + w.count;
     w.flush();
-    let mut out = w.out;
     for (k, v) in [im as u32, imax as u32, table_len as u32, n_bits as u32, 0]
         .into_iter()
         .enumerate()
@@ -946,13 +951,14 @@ mod tests {
     fn bit_writer_matches_bytewise() {
         let mut seed = 77;
         for case in 0..400 {
+            let (mut oa, mut ob) = (Vec::new(), Vec::new());
             let mut a = BitOut {
-                out: Vec::new(),
+                out: &mut oa,
                 bits: 0,
                 count: 0,
             };
             let mut b = BitOut {
-                out: Vec::new(),
+                out: &mut ob,
                 bits: 0,
                 count: 0,
             };
