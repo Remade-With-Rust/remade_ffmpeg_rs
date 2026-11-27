@@ -195,6 +195,35 @@ pub(crate) fn pxr24_row_32(isa: Isa, p: [&[u8]; 3], p3: Option<&[u8]>, out: &mut
     true
 }
 
+// ---------------------------------------------------------------------------
+// Image::to_rgba_f32 for HALF planes.
+
+/// Interleave HALF planes as RGBA floats (alpha 1.0 when `a` is `None`):
+/// `out[4 i + k] = f16_to_f32(plane_k[i])`. Returns `false` when no SIMD
+/// family is in use.
+pub(crate) fn rgba_f16(
+    isa: Isa,
+    r: &[u16],
+    g: &[u16],
+    b: &[u16],
+    a: Option<&[u16]>,
+    out: &mut [f32],
+) -> bool {
+    let n = r.len();
+    assert!(g.len() == n && b.len() == n && a.is_none_or(|a| a.len() == n));
+    assert!(out.len() == 4 * n);
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SSE2 is part of x86-64; lengths checked above.
+        Isa::Sse2 => unsafe { x86::rgba_f16_sse2(r, g, b, a, out) },
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: as above, and AVX2 + F16C were detected.
+        Isa::Avx2 => unsafe { x86::rgba_f16_avx2(r, g, b, a, out) },
+        _ => return false,
+    }
+    true
+}
+
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::wildcard_imports)]
 mod x86 {
@@ -903,6 +932,92 @@ mod x86 {
             acc = acc.wrapping_add(u32::from_be_bytes([p[0][x], p[1][x], p[2][x], low]));
             out[4 * x..4 * x + 4].copy_from_slice(&acc.to_le_bytes());
         }
+    }
+
+    // --- RGBA interleave -----------------------------------------------------
+
+    /// Scalar tail of the RGBA kernels.
+    fn rgba_tail(r: &[u16], g: &[u16], b: &[u16], a: Option<&[u16]>, out: &mut [f32], from: usize) {
+        for i in from..r.len() {
+            out[4 * i] = crate::half::f16_to_f32(r[i]);
+            out[4 * i + 1] = crate::half::f16_to_f32(g[i]);
+            out[4 * i + 2] = crate::half::f16_to_f32(b[i]);
+            out[4 * i + 3] = a.map_or(1.0, |a| crate::half::f16_to_f32(a[i]));
+        }
+    }
+
+    pub(super) unsafe fn rgba_f16_sse2(
+        r: &[u16],
+        g: &[u16],
+        b: &[u16],
+        a: Option<&[u16]>,
+        out: &mut [f32],
+    ) {
+        let n = r.len();
+        let z = _mm_setzero_si128();
+        let ld = |p: &[u16], i: usize| {
+            h2f4(_mm_unpacklo_epi16(
+                _mm_loadl_epi64(p.as_ptr().add(i).cast()),
+                z,
+            ))
+        };
+        let one = _mm_set1_ps(1.0);
+        let mut i = 0;
+        while i + 4 <= n {
+            let (rv, gv, bv) = (ld(r, i), ld(g, i), ld(b, i));
+            let av = match a {
+                Some(a) => ld(a, i),
+                None => one,
+            };
+            let t0 = _mm_unpacklo_ps(rv, gv);
+            let t1 = _mm_unpackhi_ps(rv, gv);
+            let t2 = _mm_unpacklo_ps(bv, av);
+            let t3 = _mm_unpackhi_ps(bv, av);
+            let o = out.as_mut_ptr().add(4 * i);
+            _mm_storeu_ps(o, _mm_movelh_ps(t0, t2));
+            _mm_storeu_ps(o.add(4), _mm_movehl_ps(t2, t0));
+            _mm_storeu_ps(o.add(8), _mm_movelh_ps(t1, t3));
+            _mm_storeu_ps(o.add(12), _mm_movehl_ps(t3, t1));
+            i += 4;
+        }
+        rgba_tail(r, g, b, a, out, i);
+    }
+
+    #[target_feature(enable = "avx2,f16c")]
+    pub(super) unsafe fn rgba_f16_avx2(
+        r: &[u16],
+        g: &[u16],
+        b: &[u16],
+        a: Option<&[u16]>,
+        out: &mut [f32],
+    ) {
+        let n = r.len();
+        let one = _mm256_set1_ps(1.0);
+        let mut i = 0;
+        while i + 8 <= n {
+            let rv = _mm256_cvtph_ps(_mm_loadu_si128(r.as_ptr().add(i).cast()));
+            let gv = _mm256_cvtph_ps(_mm_loadu_si128(g.as_ptr().add(i).cast()));
+            let bv = _mm256_cvtph_ps(_mm_loadu_si128(b.as_ptr().add(i).cast()));
+            let av = match a {
+                Some(a) => _mm256_cvtph_ps(_mm_loadu_si128(a.as_ptr().add(i).cast())),
+                None => one,
+            };
+            let t0 = _mm256_unpacklo_ps(rv, gv);
+            let t1 = _mm256_unpackhi_ps(rv, gv);
+            let t2 = _mm256_unpacklo_ps(bv, av);
+            let t3 = _mm256_unpackhi_ps(bv, av);
+            let u0 = _mm256_shuffle_ps::<0x44>(t0, t2);
+            let u1 = _mm256_shuffle_ps::<0xee>(t0, t2);
+            let u2 = _mm256_shuffle_ps::<0x44>(t1, t3);
+            let u3 = _mm256_shuffle_ps::<0xee>(t1, t3);
+            let o = out.as_mut_ptr().add(4 * i);
+            _mm256_storeu_ps(o, _mm256_permute2f128_ps::<0x20>(u0, u1));
+            _mm256_storeu_ps(o.add(8), _mm256_permute2f128_ps::<0x20>(u2, u3));
+            _mm256_storeu_ps(o.add(16), _mm256_permute2f128_ps::<0x31>(u0, u1));
+            _mm256_storeu_ps(o.add(24), _mm256_permute2f128_ps::<0x31>(u2, u3));
+            i += 8;
+        }
+        rgba_tail(r, g, b, a, out, i);
     }
 
     // --- test hooks -------------------------------------------------------
