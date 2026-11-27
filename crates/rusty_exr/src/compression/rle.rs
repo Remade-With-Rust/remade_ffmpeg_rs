@@ -108,10 +108,7 @@ pub(crate) fn decompress_halves(
 }
 
 pub(crate) fn compress(raw: &[u8]) -> Vec<u8> {
-    let mut tmp = vec![0u8; raw.len()];
-    super::zip::deinterleave(raw, &mut tmp);
-    super::zip::apply_predictor(&mut tmp);
-    pack(&tmp)
+    pack(&super::zip::prepare(raw))
 }
 
 #[cfg(test)]

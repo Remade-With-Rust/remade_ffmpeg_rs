@@ -53,8 +53,17 @@ pub(crate) fn undo_predictor_from(t: &mut [u8], start: usize) {
 }
 
 /// Apply the predictor in place (the inverse of [`undo_predictor`]).
+/// The SIMD twin handles a suffix of 16-byte steps; this loop does the
+/// rest and is the oracle.
 pub(crate) fn apply_predictor(t: &mut [u8]) {
-    for i in (1..t.len()).rev() {
+    let from = crate::simd::apply_predictor(crate::simd::isa(), t);
+    apply_predictor_to(t, from);
+}
+
+/// [`apply_predictor`] over `t[..end]` (`t[end..]` already done; `end`
+/// at most `t.len()`).
+pub(crate) fn apply_predictor_to(t: &mut [u8], end: usize) {
+    for i in (1..end).rev() {
         t[i] = t[i].wrapping_sub(t[i - 1]).wrapping_add(128);
     }
 }
@@ -74,18 +83,36 @@ pub(crate) fn interleave(src: &[u8], dst: &mut [u8]) {
     }
 }
 
-/// Split `src` into its even bytes followed by its odd bytes.
+/// Split `src` into its even bytes followed by its odd bytes. The SIMD
+/// twin handles a prefix of 16-pair steps; this loop does the rest and is
+/// the oracle.
 pub(crate) fn deinterleave(src: &[u8], dst: &mut [u8]) {
+    let done = crate::simd::deinterleave(crate::simd::isa(), src, dst);
+    deinterleave_from(src, dst, done);
+}
+
+/// [`deinterleave`] from byte pair `pairs_done` on.
+pub(crate) fn deinterleave_from(src: &[u8], dst: &mut [u8], pairs_done: usize) {
     let n = src.len();
     let half = n.div_ceil(2);
     let (a, b) = dst.split_at_mut(half);
-    for ((s, x), y) in src.chunks_exact(2).zip(a.iter_mut()).zip(b.iter_mut()) {
+    let pairs = src.chunks_exact(2).zip(a.iter_mut()).zip(b.iter_mut());
+    for ((s, x), y) in pairs.skip(pairs_done) {
         *x = s[0];
         *y = s[1];
     }
     if n % 2 == 1 {
         a[half - 1] = src[n - 1];
     }
+}
+
+/// Byte-plane split, then the predictor: what the ZIP and RLE writers
+/// compress.
+pub(crate) fn prepare(raw: &[u8]) -> Vec<u8> {
+    let mut tmp = vec![0u8; raw.len()];
+    deinterleave(raw, &mut tmp);
+    apply_predictor(&mut tmp);
+    tmp
 }
 
 /// Inflate and undo the predictor into `scratch.a`, which then holds the
@@ -101,10 +128,7 @@ pub(crate) fn decompress_halves(
 }
 
 pub(crate) fn compress(raw: &[u8], deflater: crate::Deflate) -> Vec<u8> {
-    let mut tmp = vec![0u8; raw.len()];
-    deinterleave(raw, &mut tmp);
-    apply_predictor(&mut tmp);
-    super::deflate(&tmp, deflater)
+    super::deflate(&prepare(raw), deflater)
 }
 
 #[cfg(test)]
@@ -144,6 +168,34 @@ mod tests {
             }
             apply_predictor(&mut a);
             assert_eq!(a, v);
+        }
+    }
+
+    #[test]
+    fn encoder_twins_match_scalar() {
+        let mut seed = 0x7777_1111u32;
+        for n in (0..200).chain([255, 256, 257, 1000, 4097]) {
+            let v: Vec<u8> = (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    (seed >> 16) as u8
+                })
+                .collect();
+            let mut want_d = vec![0u8; n];
+            deinterleave_from(&v, &mut want_d, 0);
+            let mut want_p = want_d.clone();
+            apply_predictor_to(&mut want_p, n);
+            for isa in crate::simd::available() {
+                let mut d = vec![0u8; n];
+                let done = crate::simd::deinterleave(isa, &v, &mut d);
+                deinterleave_from(&v, &mut d, done);
+                assert_eq!(d, want_d, "{isa:?} deinterleave n {n}");
+                let from = crate::simd::apply_predictor(isa, &mut d);
+                assert!(from <= n.max(1));
+                apply_predictor_to(&mut d, from);
+                assert_eq!(d, want_p, "{isa:?} predictor n {n}");
+            }
+            assert_eq!(prepare(&v), want_p);
         }
     }
 

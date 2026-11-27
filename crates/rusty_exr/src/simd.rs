@@ -331,6 +331,47 @@ pub(crate) fn b44_channel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// ZIP/RLE encode: byte-plane split and predictor.
+
+/// `zip::deinterleave` over a prefix of whole 16-pair (32-byte) steps:
+/// even bytes to `dst[..half]`, odd bytes to `dst[half..]`. Returns the
+/// byte pairs done (0 when no SIMD family is in use).
+pub(crate) fn deinterleave(isa: Isa, src: &[u8], dst: &mut [u8]) -> usize {
+    let n = src.len();
+    assert!(dst.len() == n);
+    let steps = n / 32;
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SSE2 is part of x86-64; reads `src[..32 * steps]`, writes
+        // `dst[..16 * steps]` and `dst[half..half + 16 * steps]`, all in
+        // bounds (half = ceil(n / 2) and 16 * steps <= n / 2).
+        Isa::Sse2 | Isa::Avx2 => unsafe { x86::deinterleave_sse2(src, dst, steps) },
+        _ => return 0,
+    }
+    16 * steps
+}
+
+/// `zip::apply_predictor` over a suffix of `t` in 16-byte steps taken from
+/// the end (each step reads the original bytes just before it, which no
+/// earlier step has changed). Returns where the scalar loop must stop
+/// (`t.len()` when no SIMD family is in use).
+pub(crate) fn apply_predictor(isa: Isa, t: &mut [u8]) -> usize {
+    let n = t.len();
+    if n < 17 {
+        return n;
+    }
+    let steps = (n - 1) / 16;
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SSE2 is part of x86-64; steps start at n - 16 k >= 1, so
+        // every read (one byte before the step) and write is inside `t`.
+        Isa::Sse2 | Isa::Avx2 => unsafe { x86::apply_predictor_sse2(t, steps) },
+        _ => return n,
+    }
+    n - 16 * steps
+}
+
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::wildcard_imports)]
 mod x86 {
@@ -1411,6 +1452,37 @@ mod x86 {
             b += 1;
         }
         (b, ip)
+    }
+
+    // --- ZIP/RLE encode -------------------------------------------------------
+
+    pub(super) unsafe fn deinterleave_sse2(src: &[u8], dst: &mut [u8], steps: usize) {
+        let half = src.len().div_ceil(2);
+        let lo = _mm_set1_epi16(0x00ff);
+        let (s, d) = (src.as_ptr(), dst.as_mut_ptr());
+        for k in 0..steps {
+            let v0 = _mm_loadu_si128(s.add(32 * k).cast());
+            let v1 = _mm_loadu_si128(s.add(32 * k + 16).cast());
+            let even = _mm_packus_epi16(_mm_and_si128(v0, lo), _mm_and_si128(v1, lo));
+            let odd = _mm_packus_epi16(_mm_srli_epi16::<8>(v0), _mm_srli_epi16::<8>(v1));
+            _mm_storeu_si128(d.add(16 * k).cast(), even);
+            _mm_storeu_si128(d.add(half + 16 * k).cast(), odd);
+        }
+    }
+
+    pub(super) unsafe fn apply_predictor_sse2(t: &mut [u8], steps: usize) {
+        let n = t.len();
+        let p = t.as_mut_ptr();
+        let bias = _mm_set1_epi8(-128);
+        for k in 1..=steps {
+            let at = n - 16 * k;
+            let cur = _mm_loadu_si128(p.add(at).cast());
+            let prev = _mm_loadu_si128(p.add(at - 1).cast());
+            _mm_storeu_si128(
+                p.add(at).cast(),
+                _mm_add_epi8(_mm_sub_epi8(cur, prev), bias),
+            );
+        }
     }
 
     // --- test hooks -------------------------------------------------------
