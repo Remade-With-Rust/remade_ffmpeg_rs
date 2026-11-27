@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.4](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-exr-v0.9.3...rff-codec-exr-v0.9.4) - 2026-11-27
+
+### Added
+
+- *(exr)* B44/B44A/DWAA/DWAB and tiled encoding, byte-identical to exr ([#241](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/241))
+
 ## [0.9.3](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-exr-v0.9.2...rff-codec-exr-v0.9.3) - 2026-11-26
 
 ### Added
