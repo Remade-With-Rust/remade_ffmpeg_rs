@@ -270,12 +270,24 @@ pub(crate) fn compress(geom: &BlockGeom<'_>, raw: &[u8], flat: bool) -> Vec<u8> 
         };
         let mut s = [0u16; 16];
         for y in (0..ny).step_by(4) {
+            // Byte offsets of the block row's four lines (edge blocks repeat
+            // the last line), computed once per block row.
+            let lines: [usize; 4] = std::array::from_fn(|r| (y + r).min(ny - 1) * nx * 2);
             for x in (0..nx).step_by(4) {
-                // Edge blocks repeat the last row / column.
-                for r in 0..4 {
-                    let yy = (y + r).min(ny - 1);
-                    for k in 0..4 {
-                        s[r * 4 + k] = at((x + k).min(nx - 1), yy);
+                if x + 4 <= nx {
+                    for (r, &l) in lines.iter().enumerate() {
+                        let row = &src[l + 2 * x..l + 2 * x + 8];
+                        for k in 0..4 {
+                            s[r * 4 + k] = u16::from_le_bytes([row[2 * k], row[2 * k + 1]]);
+                        }
+                    }
+                } else {
+                    // Edge blocks repeat the last column.
+                    for r in 0..4 {
+                        let yy = (y + r).min(ny - 1);
+                        for k in 0..4 {
+                            s[r * 4 + k] = at((x + k).min(nx - 1), yy);
+                        }
                     }
                 }
                 if ch.p_linear {
