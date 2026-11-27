@@ -242,6 +242,7 @@ fn build_dec_table<'a>(
 }
 
 /// Decode a Huffman stream into exactly `out_len` u16 values.
+#[cfg(test)]
 pub(crate) fn decompress(data: &[u8], out_len: usize) -> Result<Vec<u16>> {
     let mut out = Vec::new();
     decompress_into(data, out_len, &mut out, &mut HufScratch::default())?;

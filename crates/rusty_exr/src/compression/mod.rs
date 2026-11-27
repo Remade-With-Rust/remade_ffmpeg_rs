@@ -158,6 +158,7 @@ pub(crate) struct Scratch {
     pub w: Vec<u16>,
     pub lut: Vec<u16>,
     pub huf: huffman::HufScratch,
+    pub dwa: dwa::DwaScratch,
     inflater: Option<flate2::Decompress>,
 }
 
@@ -213,6 +214,36 @@ impl Scratch {
     pub fn inflate_b(&mut self, src: &[u8], n: usize) -> Result<()> {
         inflate_vec(&mut self.inflater, src, &mut self.b, n)
     }
+}
+
+/// [`inflate_exact`] with the worker's reused inflater, into the first `n`
+/// bytes of `out` (grown, never re-zeroed: every byte is written on
+/// success). Same checks and error text as [`inflate_exact`].
+pub(crate) fn inflate_exact_reuse(
+    inflater: &mut Option<flate2::Decompress>,
+    src: &[u8],
+    out: &mut Vec<u8>,
+    n: usize,
+) -> Result<()> {
+    let d = match inflater {
+        Some(d) => {
+            d.reset(true);
+            d
+        }
+        None => inflater.insert(flate2::Decompress::new(true)),
+    };
+    let out = grow(out, n);
+    let status = d
+        .decompress(src, out, flate2::FlushDecompress::Finish)
+        .map_err(|e| Error::invalid(format!("zlib data: {e}")))?;
+    if status != flate2::Status::StreamEnd || d.total_out() != n as u64 {
+        return Err(Error::invalid(format!(
+            "zlib data inflates to {} bytes, expected {}",
+            d.total_out(),
+            n
+        )));
+    }
+    Ok(())
 }
 
 /// Inflate a zlib stream into exactly `out.len()` bytes.
@@ -302,8 +333,8 @@ pub(crate) fn decompress_layout<'a>(
             Ok(Layout::Planar(&scratch.a[..geom.raw_size]))
         }
         Compression::Dwaa | Compression::Dwab => {
-            scratch.a = dwa::decompress(geom, data)?;
-            Ok(Layout::Planar(&scratch.a))
+            dwa::decompress(geom, data, scratch)?;
+            Ok(Layout::Planar(&scratch.a[..geom.raw_size]))
         }
     }
 }

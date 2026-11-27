@@ -574,7 +574,23 @@ fn u64_at(c: &mut crate::header::Cursor<'_>) -> Result<u64> {
     c.u64()
 }
 
-pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
+/// Buffers one worker reuses from one DWA chunk to the next.
+#[derive(Default)]
+pub(crate) struct DwaScratch {
+    unknown: Vec<u8>,
+    bytes: Vec<u8>,
+    ac: Vec<u16>,
+    dc: Vec<u16>,
+    rle: Vec<u8>,
+    bufs: [Vec<u16>; 3],
+}
+
+/// Decode one DWA chunk into `scratch.a[..geom.raw_size]` (channel-planar).
+pub(crate) fn decompress(
+    geom: &BlockGeom<'_>,
+    data: &[u8],
+    scratch: &mut super::Scratch,
+) -> Result<()> {
     const HEADER: usize = 11 * 8;
     if data.len() < HEADER {
         return Err(Error::invalid("DWA header truncated"));
@@ -642,70 +658,85 @@ pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
         .map(|(ch, _)| 2 * pixels * ch.ty.bytes() as u64)
         .sum();
 
-    let unknown = if unk_comp > 0 {
-        let mut v = vec![0u8; unk_unc as usize];
-        super::inflate_exact(sec_unk, &mut v)?;
-        v
+    let super::Scratch {
+        a: planar_buf,
+        huf,
+        dwa: ds,
+        inflater,
+        ..
+    } = scratch;
+    let unknown: &[u8] = if unk_comp > 0 {
+        super::inflate_exact_reuse(inflater, sec_unk, &mut ds.unknown, unk_unc as usize)?;
+        &ds.unknown[..unk_unc as usize]
     } else {
-        Vec::new()
+        &[]
     };
-    let ac: Vec<u16> = if ac_comp > 0 {
+    let ac: &[u16] = if ac_comp > 0 {
         if ac_count > blocks * 63 * nlossy {
             return Err(Error::invalid("DWA AC count"));
         }
         match ac_compression {
-            0 => huffman::decompress(sec_ac, ac_count as usize)?,
+            0 => huffman::decompress_into(sec_ac, ac_count as usize, &mut ds.ac, huf)?,
             1 => {
-                let mut b = vec![0u8; ac_count as usize * 2];
-                super::inflate_exact(sec_ac, &mut b)?;
-                b.chunks_exact(2)
-                    .map(|x| u16::from_le_bytes([x[0], x[1]]))
-                    .collect()
+                let n = ac_count as usize * 2;
+                super::inflate_exact_reuse(inflater, sec_ac, &mut ds.bytes, n)?;
+                ds.ac.clear();
+                ds.ac.extend(
+                    ds.bytes[..n]
+                        .chunks_exact(2)
+                        .map(|x| u16::from_le_bytes([x[0], x[1]])),
+                );
             }
             _ => return Err(Error::invalid("DWA AC compression")),
         }
+        &ds.ac
     } else {
-        Vec::new()
+        &[]
     };
-    let dc: Vec<u16> = if dc_comp > 0 {
+    let dc: &[u16] = if dc_comp > 0 {
         if dc_count > blocks * nlossy {
             return Err(Error::invalid("DWA DC count"));
         }
-        let mut b = vec![0u8; dc_count as usize * 2];
-        super::inflate_exact(sec_dc, &mut b)?;
-        super::zip::undo_predictor(&mut b);
-        let mut o = vec![0u8; b.len()];
-        super::zip::interleave(&b, &mut o);
-        o.chunks_exact(2)
-            .map(|x| u16::from_le_bytes([x[0], x[1]]))
-            .collect()
+        let n = dc_count as usize;
+        super::inflate_exact_reuse(inflater, sec_dc, &mut ds.bytes, 2 * n)?;
+        let b = &mut ds.bytes[..2 * n];
+        super::zip::undo_predictor(b);
+        // The predicted bytes hold every value's low byte, then every high
+        // byte (the ZIP byte split of 2n bytes, whose halves are n each).
+        let (lo, hi) = b.split_at(n);
+        ds.dc.clear();
+        ds.dc.extend(lo.iter().zip(hi).map(|(&l, &h)| u16::from_le_bytes([l, h])));
+        &ds.dc
     } else {
         if dc_count != 0 {
             return Err(Error::invalid("DWA DC count without data"));
         }
-        Vec::new()
+        &[]
     };
-    let rle = if rle_raw > 0 {
+    let rle: &[u8] = if rle_raw > 0 {
         if rle_unc > rle_buf || rle_raw > rle_buf {
             return Err(Error::invalid("DWA RLE sizes"));
         }
-        let mut t = vec![0u8; rle_unc as usize];
-        super::inflate_exact(sec_rle, &mut t)?;
-        super::rle::unpack(&t, rle_raw as usize)?
+        let n = rle_unc as usize;
+        super::inflate_exact_reuse(inflater, sec_rle, &mut ds.bytes, n)?;
+        super::rle::unpack_into(&ds.bytes[..n], rle_raw as usize, &mut ds.rle)?;
+        &ds.rle
     } else {
-        Vec::new()
+        &[]
     };
 
-    // Output, channel-planar.
+    // Output, channel-planar, in the worker's reused buffer: every byte of
+    // it is written below (lossy, RLE and unknown channels cover the whole
+    // chunk; lossy UINT rows zero their tails), so it is not re-zeroed.
     let mut offs = Vec::with_capacity(chans.len());
     let mut o = 0usize;
     for ch in chans {
         offs.push(o);
         o += ch.bytes();
     }
-    let mut planar = vec![0u8; geom.raw_size];
+    let planar = super::grow(planar_buf, geom.raw_size);
     let mut done = vec![false; chans.len()];
-    let mut acr = AcReader { ac: &ac, pos: 0 };
+    let mut acr = AcReader { ac, pos: 0 };
     let mut dc_pos = 0usize;
     let luts = crate::luts::get();
 
@@ -734,13 +765,15 @@ pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
                 // OpenEXR writes the halves at the start of each row and
                 // leaves the rest of the row zeroed.
                 for y in 0..ch.height {
-                    let row = &mut planar[base + y * rb..base + y * rb + 2 * ch.width];
+                    let (row, tail) =
+                        planar[base + y * rb..base + (y + 1) * rb].split_at_mut(2 * ch.width);
                     for (d, h) in row
                         .chunks_exact_mut(2)
                         .zip(&halves[y * ch.width..(y + 1) * ch.width])
                     {
                         d.copy_from_slice(&h.to_le_bytes());
                     }
+                    tail.fill(0);
                 }
             }
         }
@@ -752,10 +785,13 @@ pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
         }
         let ch = &chans[set[0]];
         let (w, h) = (ch.width, ch.height);
-        let mut bufs = [vec![0u16; w * h], vec![0u16; w * h], vec![0u16; w * h]];
         {
-            let [b0, b1, b2] = &mut bufs;
-            let mut outs: [&mut [u16]; 3] = [b0, b1, b2];
+            let [b0, b1, b2] = &mut ds.bufs;
+            let mut outs: [&mut [u16]; 3] = [
+                super::grow(b0, w * h),
+                super::grow(b1, w * h),
+                super::grow(b2, w * h),
+            ];
             decode_lossy(
                 &mut acr,
                 &dc,
@@ -768,7 +804,7 @@ pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
         }
         for (k, &ci) in set.iter().enumerate() {
             // Channels in a set share geometry (checked in `classify`).
-            store(&mut planar, ci, &bufs[k]);
+            store(planar, ci, &ds.bufs[k][..w * h]);
             done[ci] = true;
         }
     }
@@ -785,7 +821,7 @@ pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
         }
         match schemes[ci] {
             Scheme::Lossy => {
-                let mut buf = vec![0u16; ch.width * ch.height];
+                let buf = super::grow(&mut ds.bufs[0], ch.width * ch.height);
                 let lin = if ch.p_linear {
                     None
                 } else {
@@ -798,9 +834,9 @@ pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
                     ch.width,
                     ch.height,
                     lin,
-                    &mut [&mut buf],
+                    &mut [&mut *buf],
                 )?;
-                store(&mut planar, ci, &buf);
+                store(planar, ci, buf);
             }
             Scheme::Rle => {
                 let bpe = ch.ty.bytes();
@@ -822,7 +858,7 @@ pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
             }
         }
     }
-    Ok(planar)
+    Ok(())
 }
 
 /// Rebuild `dst.len() / plane`-byte samples from byte planes: byte `k` of
@@ -842,13 +878,7 @@ fn unsplit_planes(src: &[u8], plane: usize, dst: &mut [u8]) {
             let (a, r) = src.split_at(plane);
             let (b, r) = r.split_at(plane);
             let (c, e) = r.split_at(plane);
-            for ((((d, &x), &y), &z), &w) in dst
-                .chunks_exact_mut(4)
-                .zip(a)
-                .zip(b)
-                .zip(c)
-                .zip(&e[..plane])
-            {
+            for ((((d, &x), &y), &z), &w) in dst.chunks_exact_mut(4).zip(a).zip(b).zip(c).zip(&e[..plane]) {
                 d.copy_from_slice(&[x, y, z, w]);
             }
         }
