@@ -44,6 +44,34 @@ pub(crate) fn unpack_into(src: &[u8], out_len: usize, out: &mut Vec<u8>) -> Resu
 fn unpack_slice(src: &[u8], out: &mut [u8]) -> Result<usize> {
     let mut i = 0;
     let mut o = 0;
+    // Fast loop while a whole 128-byte window fits after the count byte in
+    // `src` and at the write position in `out`: a token decodes to at most
+    // 128 bytes, so it is copied or filled in whole 16-byte blocks without
+    // any check (a call to `memcpy`/`memset` per short token was most of
+    // the cost). The bytes a block writes past the token's end are before
+    // `out`'s end and are overwritten by the tokens that follow; a stream
+    // that stops short is an error, so they are never returned.
+    while i + 129 <= src.len() && o + 128 <= out.len() {
+        let n = src[i] as i8;
+        let s: &[u8; 128] = src[i + 1..i + 129].try_into().expect("128 bytes");
+        let d: &mut [u8; 128] = (&mut out[o..o + 128]).try_into().expect("128 bytes");
+        if n < 0 {
+            let n = usize::from(n.unsigned_abs());
+            for (dc, sc) in d.chunks_exact_mut(16).zip(s.chunks_exact(16)).take(n.div_ceil(16)) {
+                dc.copy_from_slice(sc);
+            }
+            i += 1 + n;
+            o += n;
+        } else {
+            let n = n as usize + 1;
+            let v = [s[0]; 16];
+            for dc in d.chunks_exact_mut(16).take(n.div_ceil(16)) {
+                dc.copy_from_slice(&v);
+            }
+            i += 2;
+            o += n;
+        }
+    }
     while i < src.len() {
         let n = src[i] as i8;
         i += 1;
