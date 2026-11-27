@@ -20,23 +20,23 @@ use crate::error::{Error, Result};
 use crate::header::SampleType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Scheme {
+pub(super) enum Scheme {
     Unknown,
     Lossy,
     Rle,
 }
 
 #[derive(Debug, Clone)]
-struct Rule {
-    suffix: Vec<u8>,
-    scheme: Scheme,
-    ty: SampleType,
-    csc: i32,
-    case_insensitive: bool,
+pub(super) struct Rule {
+    pub(super) suffix: Vec<u8>,
+    pub(super) scheme: Scheme,
+    pub(super) ty: SampleType,
+    pub(super) csc: i32,
+    pub(super) case_insensitive: bool,
 }
 
 impl Rule {
-    fn matches(&self, suffix: &[u8], ty: SampleType) -> bool {
+    pub(super) fn matches(&self, suffix: &[u8], ty: SampleType) -> bool {
         if self.ty != ty {
             return false;
         }
@@ -48,7 +48,7 @@ impl Rule {
     }
 }
 
-fn rule(suffix: &str, scheme: Scheme, ty: SampleType, csc: i32, ci: bool) -> Rule {
+pub(super) fn rule(suffix: &str, scheme: Scheme, ty: SampleType, csc: i32, ci: bool) -> Rule {
     Rule {
         suffix: suffix.as_bytes().to_vec(),
         scheme,
@@ -136,7 +136,7 @@ fn read_rules(c: &mut crate::header::Cursor<'_>) -> Result<Vec<Rule>> {
     Ok(rules)
 }
 
-fn suffix_of(name: &str) -> (&[u8], &[u8]) {
+pub(super) fn suffix_of(name: &str) -> (&[u8], &[u8]) {
     let b = name.as_bytes();
     match b.iter().rposition(|&c| c == b'.') {
         Some(i) => (&b[..=i], &b[i + 1..]),
@@ -145,7 +145,7 @@ fn suffix_of(name: &str) -> (&[u8], &[u8]) {
 }
 
 /// Classify channels; returns per-channel schemes and the CSC triples.
-fn classify(chans: &[ChanGeom<'_>], rules: &[Rule]) -> (Vec<Scheme>, Vec<[usize; 3]>) {
+pub(super) fn classify(chans: &[ChanGeom<'_>], rules: &[Rule]) -> (Vec<Scheme>, Vec<[usize; 3]>) {
     let mut schemes = vec![Scheme::Unknown; chans.len()];
     let mut prefixes: Vec<(&[u8], [i32; 3])> = Vec::new();
     for (ci, ch) in chans.iter().enumerate() {
@@ -197,39 +197,81 @@ const F: f32 = 1.913422e-01;
 const G: f32 = 9.754573e-02;
 
 /// `dst[i] = src[ZIGZAG[i]]`.
-const ZIGZAG: [usize; 64] = [
+pub(super) const ZIGZAG: [usize; 64] = [
     0, 1, 5, 6, 14, 15, 27, 28, 2, 4, 7, 13, 16, 26, 29, 42, 3, 8, 12, 17, 25, 30, 41, 43, 9, 11,
     18, 24, 31, 40, 44, 53, 10, 19, 23, 32, 39, 45, 52, 54, 20, 22, 33, 38, 46, 51, 55, 60, 21, 34,
     37, 47, 50, 56, 59, 61, 35, 36, 48, 49, 57, 58, 62, 63,
 ];
 
+/// Addition and subtraction as an AVX `vaddps` / `vsubps` computes them
+/// for `src1 op src2`. Finite inputs give finite sums, and then the order
+/// of operands cannot matter. With NaNs (only possible when a coefficient
+/// is infinite or NaN) the hardware returns `src1`'s NaN when both operands
+/// are NaN; `NAN` selects that exact rule, so even NaN signs and payloads
+/// match OpenEXR's assembly.
+#[inline(always)]
+fn vadd<const NAN: bool>(s1: f32, s2: f32) -> f32 {
+    if NAN && s1.is_nan() {
+        s1
+    } else {
+        s1 + s2
+    }
+}
+
+#[inline(always)]
+fn vsub<const NAN: bool>(s1: f32, s2: f32) -> f32 {
+    if NAN && s1.is_nan() {
+        s1
+    } else {
+        s1 - s2
+    }
+}
+
 /// One row of OpenEXR's AVX row pass (full 8-point transform).
 #[inline(always)]
-fn row_pass(r: &[f32]) -> [f32; 8] {
+fn row_pass<const NAN: bool>(r: &[f32]) -> [f32; 8] {
     const M1: [[f32; 4]; 4] = [[A, A, A, A], [C, F, -F, -C], [A, -A, -A, A], [F, -C, C, -F]];
     const M2: [[f32; 4]; 4] = [[B, D, E, G], [D, -G, -B, -E], [E, -B, G, D], [G, -E, D, -B]];
+    let add = vadd::<NAN>;
     let mut out = [0f32; 8];
     for k in 0..4 {
-        let e = (r[0] * M1[0][k] + r[2] * M1[1][k]) + (r[4] * M1[2][k] + r[6] * M1[3][k]);
-        let o = (r[1] * M2[0][k] + r[3] * M2[1][k]) + (r[5] * M2[2][k] + r[7] * M2[3][k]);
-        out[k] = e + o;
-        out[7 - k] = e - o;
+        let e = add(
+            add(r[0] * M1[0][k], r[2] * M1[1][k]),
+            add(r[4] * M1[2][k], r[6] * M1[3][k]),
+        );
+        let o = add(
+            add(r[1] * M2[0][k], r[3] * M2[1][k]),
+            add(r[5] * M2[2][k], r[7] * M2[3][k]),
+        );
+        out[k] = add(e, o);
+        out[7 - k] = vsub::<NAN>(e, o);
     }
     out
 }
 
 /// OpenEXR's `dctInverse8x8_avx_{zr}`: an inverse DCT where the last `zr`
 /// rows of the (row-major, frequency-domain) block are known to be zero.
-/// Operation order follows the AVX assembly instruction by instruction.
 fn idct_avx(data: &mut [f32; 64], zr: usize) {
+    if data.iter().all(|v| v.is_finite()) {
+        idct_avx_impl::<false>(data, zr);
+    } else {
+        idct_avx_impl::<true>(data, zr);
+    }
+}
+
+/// Operation order, and the operand order of every addition and
+/// subtraction, follow the AVX assembly instruction by instruction.
+fn idct_avx_impl<const NAN: bool>(data: &mut [f32; 64], zr: usize) {
+    let add = vadd::<NAN>;
+    let sub = vsub::<NAN>;
     let present = 8 - zr;
     let mut rows = [[0f32; 8]; 8];
     // Row pass over processed row pairs.
     let mut pair = 0;
     while pair < 8 {
         if pair < present {
-            rows[pair] = row_pass(&data[pair * 8..pair * 8 + 8]);
-            rows[pair + 1] = row_pass(&data[pair * 8 + 8..pair * 8 + 16]);
+            rows[pair] = row_pass::<NAN>(&data[pair * 8..pair * 8 + 8]);
+            rows[pair + 1] = row_pass::<NAN>(&data[pair * 8 + 8..pair * 8 + 16]);
         }
         pair += 2;
     }
@@ -247,54 +289,54 @@ fn idct_avx(data: &mut [f32; 64], zr: usize) {
         // Odd outputs.
         let mut o0 = B * r(1);
         if p(3) {
-            o0 += D * r(3);
+            o0 = add(D * r(3), o0);
             if p(5) {
                 let mut t = E * r(5);
                 if p(7) {
-                    t += G * r(7);
+                    t = add(G * r(7), t);
                 }
-                o0 += t;
+                o0 = add(t, o0);
             }
         }
         let mut o1 = D * r(1);
         if p(3) {
             let mut t = G * r(3);
             if p(5) {
-                t += B * r(5);
+                t = add(B * r(5), t);
             }
-            o1 -= t;
+            o1 = sub(o1, t);
         }
         if p(7) {
-            o1 -= E * r(7);
+            o1 = sub(o1, E * r(7));
         }
         let mut o2 = E * r(1);
         if p(3) {
-            o2 -= B * r(3);
+            o2 = sub(o2, B * r(3));
         }
         if p(5) {
-            o2 += G * r(5);
+            o2 = add(o2, G * r(5));
         }
         if p(7) {
-            o2 += D * r(7);
+            o2 = add(o2, D * r(7));
         }
         let mut o3 = G * r(1);
         if p(5) {
-            o3 += D * r(5);
+            o3 = add(D * r(5), o3);
         }
         if p(3) {
             let mut t = E * r(3);
             if p(7) {
-                t += B * r(7);
+                t = add(B * r(7), t);
             }
-            o3 -= t;
+            o3 = sub(o3, t);
         }
         // Even outputs.
         let mut t11 = A * r(0);
         let mut t1 = t11;
         if p(4) {
             let a4 = A * r(4);
-            t11 += a4;
-            t1 -= a4;
+            t11 = add(t11, a4);
+            t1 = sub(t1, a4);
         }
         let mut e0 = t11;
         let mut e3 = t11;
@@ -303,25 +345,25 @@ fn idct_avx(data: &mut [f32; 64], zr: usize) {
         if p(2) {
             let mut t7 = C * r(2);
             if p(6) {
-                t7 += F * r(6);
+                t7 = add(t7, F * r(6));
             }
-            e0 = t11 + t7;
-            e3 = t11 - t7;
+            e0 = add(t11, t7);
+            e3 = sub(t11, t7);
             let mut t7 = F * r(2);
             if p(6) {
-                t7 -= C * r(6);
+                t7 = sub(t7, C * r(6));
             }
-            e1 = t1 + t7;
-            e2 = t1 - t7;
+            e1 = add(t1, t7);
+            e2 = sub(t1, t7);
         }
-        data[j] = e0 + o0;
-        data[8 + j] = e1 + o1;
-        data[16 + j] = e2 + o2;
-        data[24 + j] = e3 + o3;
-        data[32 + j] = e3 - o3;
-        data[40 + j] = e2 - o2;
-        data[48 + j] = e1 - o1;
-        data[56 + j] = e0 - o0;
+        data[j] = add(e0, o0);
+        data[8 + j] = add(e1, o1);
+        data[16 + j] = add(e2, o2);
+        data[24 + j] = add(e3, o3);
+        data[32 + j] = sub(e3, o3);
+        data[40 + j] = sub(e2, o2);
+        data[48 + j] = sub(e1, o1);
+        data[56 + j] = sub(e0, o0);
     }
 }
 

@@ -28,31 +28,6 @@ fn hcode(c: u64) -> u64 {
     c >> 6
 }
 
-/// Turn code lengths (one per symbol) into `length | code << 6` entries.
-fn canonical(table: &mut [u64]) -> Result<()> {
-    let mut n = [0u64; 59];
-    for &l in table.iter() {
-        if l > 58 {
-            return Err(Error::invalid("Huffman code length over 58"));
-        }
-        n[l as usize] += 1;
-    }
-    let mut c = 0u64;
-    for i in (1..=58).rev() {
-        let nc = (c + n[i]) >> 1;
-        n[i] = c;
-        c = nc;
-    }
-    for e in table.iter_mut() {
-        let l = *e as usize;
-        if l > 0 {
-            *e = l as u64 | (n[l] << 6);
-            n[l] += 1;
-        }
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Decoding.
 
@@ -459,23 +434,54 @@ impl PartialOrd for HeapItem {
     }
 }
 
-/// Build code lengths (then canonical codes) in place of `freq`.
-/// Returns the symbol range `(im, iM)`.
-fn build_enc_table(freq: &mut [u64]) -> Result<(usize, usize)> {
-    let mut links: Vec<usize> = (0..ENC_SIZE).collect();
-    let im = freq.iter().position(|&f| f != 0).unwrap_or(0);
-    let mut imax = 0;
-    let mut heap = BinaryHeap::new();
-    for (i, &f) in freq.iter().enumerate().skip(im) {
-        if f != 0 {
-            heap.push(HeapItem { pos: i, freq: f });
-            imax = i;
+/// Encoder tables kept per thread. `table` is all zeros between calls (only
+/// the entries of symbols that occurred are touched, and they are cleared
+/// afterwards), so no call pays for the 64K-entry tables.
+struct EncScratch {
+    table: Vec<u64>,
+    links: Vec<u32>,
+    used: Vec<u32>,
+}
+
+impl EncScratch {
+    fn new() -> Self {
+        Self {
+            table: vec![0; ENC_SIZE],
+            links: vec![0; ENC_SIZE],
+            used: Vec::new(),
         }
     }
-    imax += 1;
-    freq[imax] = 1;
-    heap.push(HeapItem { pos: imax, freq: 1 });
-    let mut lens = vec![0u64; ENC_SIZE];
+}
+
+thread_local! {
+    static ENC: std::cell::RefCell<EncScratch> = std::cell::RefCell::new(EncScratch::new());
+}
+
+/// Count `data` into `s.table`, then replace the counts with
+/// `length | code << 6` entries. `s.used` ends up holding every symbol with
+/// an entry, ascending. Returns the symbol range `(im, iM)`.
+fn build_enc_table(s: &mut EncScratch, data: &[u16]) -> Result<(usize, usize)> {
+    let (t, links, used) = (&mut s.table, &mut s.links, &mut s.used);
+    used.clear();
+    for &v in data {
+        let e = &mut t[v as usize];
+        if *e == 0 {
+            used.push(u32::from(v));
+        }
+        *e += 1;
+    }
+    used.sort_unstable();
+    let im = used[0] as usize;
+    let imax = *used.last().expect("data is not empty") as usize + 1;
+    t[imax] = 1;
+    used.push(imax as u32);
+    let mut heap = BinaryHeap::with_capacity(used.len());
+    for &u in used.iter() {
+        let u = u as usize;
+        heap.push(HeapItem { pos: u, freq: t[u] });
+        links[u] = u as u32;
+        t[u] = 0; // from here on: the code length
+    }
     let mut count = heap.len();
     while count > 1 {
         let low = heap.pop().expect("heap holds two or more");
@@ -487,24 +493,45 @@ fn build_enc_table(freq: &mut [u64]) -> Result<(usize, usize)> {
         };
         let mut i = high;
         loop {
-            lens[i] += 1;
-            if links[i] == i {
-                links[i] = low.pos;
+            t[i] += 1;
+            if links[i] as usize == i {
+                links[i] = low.pos as u32;
                 break;
             }
-            i = links[i];
+            i = links[i] as usize;
         }
         let mut i = low.pos;
         loop {
-            lens[i] += 1;
-            if links[i] == i {
+            t[i] += 1;
+            if links[i] as usize == i {
                 break;
             }
-            i = links[i];
+            i = links[i] as usize;
         }
     }
-    canonical(&mut lens)?;
-    freq.copy_from_slice(&lens);
+    // Canonical codes (symbols in ascending order, as over the full table).
+    let mut n = [0u64; 59];
+    for &u in used.iter() {
+        let l = t[u as usize];
+        if l > 58 {
+            return Err(Error::invalid("Huffman code length over 58"));
+        }
+        n[l as usize] += 1;
+    }
+    let mut c = 0u64;
+    for i in (1..=58).rev() {
+        let nc = (c + n[i]) >> 1;
+        n[i] = c;
+        c = nc;
+    }
+    for &u in used.iter() {
+        let e = &mut t[u as usize];
+        let l = *e as usize;
+        if l > 0 {
+            *e = l as u64 | (n[l] << 6);
+            n[l] += 1;
+        }
+    }
     Ok((im, imax))
 }
 
@@ -515,7 +542,7 @@ struct BitOut {
 }
 
 impl BitOut {
-    #[inline]
+    #[inline(always)]
     fn put(&mut self, n: u64, v: u64) {
         self.bits = (self.bits << n) | v;
         self.count += n;
@@ -524,7 +551,7 @@ impl BitOut {
             self.out.push((self.bits >> self.count) as u8);
         }
     }
-    #[inline]
+    #[inline(always)]
     fn code(&mut self, e: u64) {
         self.put(hlen(e), hcode(e));
     }
@@ -571,9 +598,11 @@ fn pack_table(enc: &[u64], im: usize, imax: usize, out: &mut Vec<u8>) {
     *out = w.out;
 }
 
-#[inline]
+#[inline(always)]
 fn send(w: &mut BitOut, sc: u64, run: u64, rc: u64) {
-    if hlen(sc) + hlen(rc) + 8 < hlen(sc) * run {
+    if run == 0 {
+        w.code(sc);
+    } else if hlen(sc) + hlen(rc) + 8 < hlen(sc) * run {
         w.code(sc);
         w.code(rc);
         w.put(8, run);
@@ -589,13 +618,22 @@ pub(crate) fn compress(data: &[u16]) -> Result<Vec<u8>> {
     if data.is_empty() {
         return Ok(Vec::new());
     }
-    let mut enc = vec![0u64; ENC_SIZE];
-    for &v in data {
-        enc[v as usize] += 1;
-    }
-    let (im, imax) = build_enc_table(&mut enc)?;
+    ENC.with(|s| {
+        let mut s = s.borrow_mut();
+        let r = compress_with(&mut s, data);
+        let s = &mut *s;
+        for &u in &s.used {
+            s.table[u as usize] = 0;
+        }
+        r
+    })
+}
+
+fn compress_with(s: &mut EncScratch, data: &[u16]) -> Result<Vec<u8>> {
+    let (im, imax) = build_enc_table(s, data)?;
+    let enc = &s.table;
     let mut out = vec![0u8; 20];
-    pack_table(&enc, im, imax, &mut out);
+    pack_table(enc, im, imax, &mut out);
     let table_len = out.len() - 20;
     let data_start = out.len();
     let mut w = BitOut {
@@ -603,19 +641,20 @@ pub(crate) fn compress(data: &[u16]) -> Result<Vec<u8>> {
         bits: 0,
         count: 0,
     };
+    w.out.reserve(data.len() + data.len() / 2);
     let rc = enc[imax];
-    let mut s = data[0];
+    let mut sym = data[0];
     let mut run = 0u64;
     for &v in &data[1..] {
-        if s == v && run < 255 {
+        if sym == v && run < 255 {
             run += 1;
         } else {
-            send(&mut w, enc[s as usize], run, rc);
+            send(&mut w, enc[sym as usize], run, rc);
             run = 0;
         }
-        s = v;
+        sym = v;
     }
-    send(&mut w, enc[s as usize], run, rc);
+    send(&mut w, enc[sym as usize], run, rc);
     let n_bits = (w.out.len() - data_start) as u64 * 8 + w.count;
     w.flush();
     let mut out = w.out;

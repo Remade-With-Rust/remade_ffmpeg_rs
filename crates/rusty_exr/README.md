@@ -33,16 +33,36 @@ set, on 460 more files OpenEXR wrote in all ten compressions (scanline,
 64x64 and 37x19 tiles; half, float and uint; subsampled), and on 48 files
 the `exr` crate wrote, its B44/B44A/DWAA/DWAB output included. That covers
 the lossy codecs: DWA's inverse DCT reproduces the operation order of
-OpenEXR's AVX routine, and B44/DWA use OpenEXR's own transfer tables.
+OpenEXR's AVX routine — down to which NaN survives when a block holds
+infinities or NaNs — and B44/DWA use OpenEXR's own transfer tables.
 
 ## What it writes
 
-Single-part scanline files with None, RLE, ZIPS, ZIP, PIZ or PXR24
-compression; HALF, FLOAT and UINT channels; any channel names (sorted for
-you, as the format requires); your header attributes. By default files are
-**byte-identical to the `exr` crate's** for the same image and settings
-(the one exception: for channel names longer than 31 bytes this crate sets
-the long-names flag the format requires and `exr` leaves clear).
+Single-part files, scanline or tiled (`EncodeOptions::tiles`, one
+resolution level, any line order including `Random`, which the `exr`
+crate calls `Unspecified`), with **every compression**: None, RLE, ZIPS,
+ZIP, PIZ, PXR24, B44, B44A, DWAA and DWAB (`EncodeOptions::dwa_level`,
+default 45). HALF, FLOAT and UINT channels; any channel names (sorted for
+you, as the format requires); your header attributes.
+
+By default files are **byte-identical to the `exr` crate's** for the same
+image and settings, the lossy codecs included: the DWA writer reproduces
+`exr`'s encoder operation for operation (its colour transform, its forward
+DCT as `exr` runs it on x86-64, including which NaN survives in a block
+holding infinities or NaNs), and B44 is OpenEXR's packer. Two exceptions:
+for channel names longer than 31 bytes this crate sets the long-names flag
+the format requires and `exr` leaves clear, and `exr`'s multi-threaded
+writer stores `Unspecified`-order chunks in whatever order its threads
+finish (this crate, and `exr` single-threaded, store them in order). `exr`
+derives three of its DWA DCT constants from the platform's `cosf`, which
+differs in the last bit between glibc and the Windows CRT; this crate
+computes them the same way, so it matches `exr` on each platform.
+
+OpenEXR's own DWA encoder transforms colour and frequency slightly
+differently, so its bytes differ, but OpenEXR (and `exr`) decode every file
+this crate writes, and decode it to exactly the samples this crate's
+decoder produces.
+
 `EncodeOptions { deflate: Deflate::Fast, .. }` swaps miniz_oxide for
 zlib-rs on ZIP/ZIPS/PXR24: about twice the deflate speed and slightly
 smaller files, with different bytes.
@@ -67,6 +87,16 @@ same-binary noise floor was up to about 10% per row.
   within 1.03-1.3x of OpenEXR single-threaded and 1.6-2x faster than
   `exr`. PIZ is 1.2x behind OpenEXR single-threaded; RLE and uncompressed
   are faster than OpenEXR.
+- **Lossy and tiled encode, one thread:** B44/B44A 1.0-1.15x faster than
+  OpenEXR on half images (2.3x on float layers, which B44 stores raw), DWA
+  within 0.89-1.10x of OpenEXR (inside the noise band on most rows), tiled
+  RLE 1.02-1.14x faster; B44 and DWA 1.05-1.6x faster than `exr`, tiled
+  RLE 3-9% behind it. With 24 threads OpenEXR leads on all but one row, by
+  up to 1.5x, most on the small image.
+- **DWA decode** is 1.7-2.3x behind OpenEXR single-threaded (its inverse
+  DCT is hand-written AVX assembly; this crate reproduces its arithmetic in
+  scalar code) and 1.06-1.33x behind with 24 threads; it is 1.1-1.3x ahead
+  of `exr`.
 
 What remains is mostly deflate: OpenEXR links libdeflate, this crate uses
 pure-Rust zlib-rs (inflate, and `Deflate::Fast`) and miniz_oxide (the
@@ -107,12 +137,13 @@ std::fs::write("out.exr", rusty_exr::encode(&out, &EncodeOptions::new(Compressio
 | custom `ChannelsReader` over `UncompressedBlock` | `d.decode_chunk(part, index)` → `Block { pos, x0, y0, width, height, data }`, rows via `Block::rows()` / `Block::row(channel, y)` |
 | `meta::MetaData::read_from_file` | `rusty_exr::read_headers(&bytes)` |
 | `write_rgba_file(path, w, h, f)` | `Image::new(w, h).with_channel("R", ..)...`, then `rusty_exr::encode(&img, &EncodeOptions::new(Compression::Zip))` |
-| `Image::from_channels(size, SpecificChannels/AnyChannels).write().to_file(path)` with `Encoding { compression, .. }` | `Image { channels: vec![Channel::new(name, w, h, samples), ..], .. }` + `EncodeOptions { compression, line_order, threads }`; byte-identical output for scanline ZIP/ZIPS/PIZ/RLE/PXR24/None |
+| `Image::from_channels(size, SpecificChannels/AnyChannels).write().to_file(path)` with `Encoding { compression, .. }` | `Image { channels: vec![Channel::new(name, w, h, samples), ..], .. }` + `EncodeOptions { compression, line_order, threads, .. }`; byte-identical output for every compression |
+| `Compression::DWAA(Some(level))` / `DWAB(..)` | `EncodeOptions { compression: Compression::Dwaa, dwa_level: Some(level), .. }` (`None` = 45, no attribute, as `exr`) |
+| `Encoding { blocks: Blocks::Tiles(Vec2(64, 64)), line_order: LineOrder::Unspecified, .. }` | `EncodeOptions { tiles: Some((64, 64)), line_order: LineOrder::Random, .. }` |
 | `layer_attributes.other` / `shared_attributes.chromaticities` | `image.header.set("chromaticities", AttributeValue::Chromaticities(..))`; any attribute via `header.get(name)` / `header.set(name, value)` |
 | `f16::from_f32(v)` for output prep | `rusty_exr::f32_to_f16(v)` (round to nearest even, NaN kept); `f32_to_f16_clamped` saturates at ±65504 |
 
-Not yet: writing tiled files and B44/B44A/DWAA/DWAB (planned next), deep
-data and multi-part output.
+Not yet: deep data, multi-part output, and writing mipmap/ripmap levels.
 
 ## License
 

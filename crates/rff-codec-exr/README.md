@@ -11,7 +11,7 @@ the pure-Rust [`rusty_exr`](https://crates.io/crates/rusty_exr) crate.
   B44A, DWAA, DWAB), scanline or tiled, to 8-bit RGB/RGBA over the display
   window (linear values clamped to [0, 1], as FFmpeg does by default).
 - **Encode** RGB/RGBA as half (default) or float channels:
-  `-exr_compression none|rle|zip1|zip16|piz|pxr24`, `-exr_format half|float`.
+  `-exr_compression none|rle|zip1|zip16|piz|pxr24|b44|b44a|dwaa|dwab`, `-exr_format half|float`.
 
 ```sh
 rff -i render.exr out.png

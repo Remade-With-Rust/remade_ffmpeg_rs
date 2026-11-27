@@ -13,10 +13,11 @@
 //! are reported as [`Error::Unsupported`]; other parts of the same file
 //! still decode.
 //!
-//! **Encode:** single-part scanline files with None, RLE, ZIPS, ZIP, PIZ or
-//! PXR24 compression, HALF/FLOAT/UINT channels, any channel names, and
-//! header attributes. Output is byte-identical to the `exr` crate's for
-//! the same image and settings.
+//! **Encode:** single-part files, scanline or tiled (one resolution level),
+//! with every compression (None, RLE, ZIPS, ZIP, PIZ, PXR24, B44, B44A,
+//! DWAA, DWAB), HALF/FLOAT/UINT channels, any channel names, and header
+//! attributes. Output is byte-identical to the `exr` crate's for the same
+//! image and settings, the lossy codecs included.
 //!
 //! Hostile input returns an error, never panics, and every allocation is
 //! bounded by [`Limits`] before it is made.

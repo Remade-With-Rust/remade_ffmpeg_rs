@@ -5,18 +5,30 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::compression::{self, count_sampled, sampled, BlockGeom, ChanGeom};
 use crate::decode::Threads;
 use crate::error::{Error, Result};
-use crate::header::{write_attribute, AttributeValue, Box2i, Compression, LineOrder};
+use crate::header::{
+    write_attribute, AttributeValue, Box2i, Compression, LevelMode, LineOrder, RoundingMode,
+    TileDesc,
+};
 use crate::image::{Image, Samples};
 
 /// Options for [`encode`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EncodeOptions {
     pub compression: Compression,
-    /// Scanline order; `Increasing` (the default) or `Decreasing`.
+    /// Chunk order: `Increasing` (the default) or `Decreasing`; tiled files
+    /// also accept `Random` (the `exr` crate's `LineOrder::Unspecified`),
+    /// whose chunks this writer stores in increasing order.
     pub line_order: LineOrder,
     pub threads: Threads,
     /// Deflate implementation for ZIP, ZIPS and PXR24.
     pub deflate: Deflate,
+    /// DWAA/DWAB compression level. `None` uses the default (45) and
+    /// writes no attribute; `Some(level)` also stores a
+    /// `dwaCompressionLevel` attribute (as the `exr` crate does).
+    pub dwa_level: Option<f32>,
+    /// `Some((width, height))` writes a tiled file (one resolution level)
+    /// with tiles of this size; `None` (the default) writes scanlines.
+    pub tiles: Option<(u32, u32)>,
 }
 
 /// Which deflate implementation the ZIP, ZIPS and PXR24 writers use (both
@@ -40,6 +52,8 @@ impl Default for EncodeOptions {
             line_order: LineOrder::Increasing,
             threads: Threads::Auto,
             deflate: Deflate::ExrCompatible,
+            dwa_level: None,
+            tiles: None,
         }
     }
 }
@@ -114,28 +128,27 @@ const KNOWN: &[(&str, &str)] = &[
     ("software", "string"),
 ];
 
-/// Encode an image as a single-part scanline EXR file.
+/// Encode an image as a single-part EXR file: scanlines, or one-level tiles
+/// when [`EncodeOptions::tiles`] is set. Every compression can be written.
 ///
 /// Channels are written in name order (the file format requires it),
 /// whatever their order in `image.channels`. Header attributes other than
 /// the structural ones are copied from `image.header`.
 pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
     let comp = opts.compression;
-    if !matches!(
-        comp,
-        Compression::None
-            | Compression::Rle
-            | Compression::Zips
-            | Compression::Zip
-            | Compression::Piz
-            | Compression::Pxr24
-    ) {
-        return Err(Error::unsupported(format!("writing {comp:?} compression")));
-    }
-    if opts.line_order == LineOrder::Random {
+    if opts.tiles.is_none() && opts.line_order == LineOrder::Random {
         return Err(Error::usage(
             "scanline files need increasing or decreasing line order",
         ));
+    }
+    let dwa_level = opts.dwa_level.unwrap_or(45.0);
+    if !dwa_level.is_finite() || dwa_level < 0.0 {
+        return Err(Error::usage(format!("DWA level {dwa_level}")));
+    }
+    if let Some((tw, th)) = opts.tiles {
+        if tw == 0 || th == 0 || tw > i32::MAX as u32 || th > i32::MAX as u32 {
+            return Err(Error::usage(format!("tile size {tw}x{th}")));
+        }
     }
     let dw = image.data_window;
     let (w, h) = (dw.width(), dw.height());
@@ -167,6 +180,12 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
             return Err(Error::usage(format!("channel {} type mismatch", d.name)));
         }
         let (xs, ys) = (d.x_sampling, d.y_sampling);
+        if opts.tiles.is_some() && (xs != 1 || ys != 1) {
+            return Err(Error::usage(format!(
+                "channel {}: tiled files cannot hold subsampled channels",
+                d.name
+            )));
+        }
         if xs < 1
             || ys < 1
             || dw.x_min.rem_euclid(xs) != 0
@@ -194,8 +213,16 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
         }
     }
     let channels: Vec<&crate::image::Channel> = order.iter().map(|&i| &image.channels[i]).collect();
-    let lpb = comp.lines_per_block() as usize;
-    let nchunks = h.div_ceil(lpb);
+    // Chunk grid: a scanline block is a tile as wide as the image.
+    let (tw, th) = match opts.tiles {
+        Some((x, y)) => (x as usize, y as usize),
+        None => (w, comp.lines_per_block() as usize),
+    };
+    let ntx = w.div_ceil(tw);
+    let nchunks = ntx * h.div_ceil(th);
+    if nchunks > i32::MAX as usize {
+        return Err(Error::usage("too many chunks"));
+    }
 
     // Header.
     let display = match image.header.get("displayWindow") {
@@ -236,9 +263,27 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
         ("dataWindow".into(), AttributeValue::Box2i(dw)),
         (
             "type".into(),
-            AttributeValue::Text(b"scanlineimage".to_vec()),
+            AttributeValue::Text(if opts.tiles.is_some() {
+                b"tiledimage".to_vec()
+            } else {
+                b"scanlineimage".to_vec()
+            }),
         ),
     ];
+    if let Some((x, y)) = opts.tiles {
+        attrs.push((
+            "tiles".into(),
+            AttributeValue::TileDesc(TileDesc {
+                x_size: x,
+                y_size: y,
+                level_mode: LevelMode::One,
+                rounding: RoundingMode::Down,
+            }),
+        ));
+    }
+    if let (Some(level), Compression::Dwaa | Compression::Dwab) = (opts.dwa_level, comp) {
+        attrs.push(("dwaCompressionLevel".into(), AttributeValue::Float(level)));
+    }
     let is_known = |a: &crate::header::Attribute| {
         KNOWN
             .iter()
@@ -272,7 +317,9 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
 
     let mut out = Vec::new();
     out.extend_from_slice(&20_000_630u32.to_le_bytes());
-    out.extend_from_slice(&(2u32 | if long { 0x400 } else { 0 }).to_le_bytes());
+    let tiled_flag = if opts.tiles.is_some() { 0x200 } else { 0 };
+    let long_flag = if long { 0x400 } else { 0 };
+    out.extend_from_slice(&(2u32 | tiled_flag | long_flag).to_le_bytes());
     for (n, v) in &attrs {
         write_attribute(&mut out, n, v);
     }
@@ -281,13 +328,19 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
     out.resize(table_pos + nchunks * 8, 0);
 
     // Chunks.
+    let tiled = opts.tiles.is_some();
     let compress_one = |i: usize| -> Result<Vec<u8>> {
-        let y0 = dw.y_min + (i * lpb) as i32;
-        let lines = lpb.min(h - i * lpb);
+        let (tx, ty) = (i % ntx, i / ntx);
+        let x_off = tx * tw;
+        let width = tw.min(w - x_off);
+        let y0 = dw.y_min + (ty * th) as i32;
+        let lines = th.min(h - ty * th);
         let mut chans = Vec::with_capacity(channels.len());
         let mut raw_size = 0usize;
         for c in &channels {
-            let cw = c.width;
+            // Tiled channels are never subsampled, so the tile width is the
+            // sample count; a scanline block spans the whole row.
+            let cw = if tiled { width } else { c.width };
             let ch = count_sampled(y0, lines, c.desc.y_sampling);
             raw_size += cw * ch * c.desc.sample_type.bytes();
             chans.push(ChanGeom {
@@ -303,7 +356,7 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
         let geom = BlockGeom {
             y0,
             lines,
-            width: w,
+            width,
             chans,
             raw_size,
         };
@@ -317,8 +370,9 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
                     continue;
                 }
                 let row = ((i64::from(y) - i64::from(dw.y_min)) / i64::from(ys)) as usize;
-                let (a, b) = (row * c.width, (row + 1) * c.width);
-                let n = c.width * c.desc.sample_type.bytes();
+                let (cx, cw) = if tiled { (x_off, width) } else { (0, c.width) };
+                let (a, b) = (row * c.width + cx, row * c.width + cx + cw);
+                let n = cw * c.desc.sample_type.bytes();
                 let dst = &mut raw[o..o + n];
                 o += n;
                 match &c.samples {
@@ -340,7 +394,7 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
                 }
             }
         }
-        compression::compress(comp, &geom, raw, opts.deflate)
+        compression::compress(comp, &geom, raw, opts.deflate, dwa_level)
     };
 
     let nthreads = opts.threads.resolve().min(nchunks).max(1);
@@ -387,8 +441,14 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
     for i in order {
         let data = packed[i].take().expect("every chunk compressed");
         offsets[i] = out.len() as u64;
-        let y0 = dw.y_min + (i * lpb) as i32;
-        out.extend_from_slice(&y0.to_le_bytes());
+        if tiled {
+            for v in [(i % ntx) as i32, (i / ntx) as i32, 0, 0] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        } else {
+            let y0 = dw.y_min + ((i / ntx) * th) as i32;
+            out.extend_from_slice(&y0.to_le_bytes());
+        }
         out.extend_from_slice(&(data.len() as i32).to_le_bytes());
         out.extend_from_slice(&data);
     }

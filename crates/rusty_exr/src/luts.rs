@@ -7,14 +7,14 @@
 //! some platforms and not others. Instead the tables are the exact output
 //! of OpenEXR 3.5.5 on glibc x86-64 (its reference build), stored as
 //! delta-coded byte planes under zlib (10 KB) and expanded once on first
-//! use. A test pins their checksum.
+//! use. A test pins their checksum. (The `exr` crate ships the B44 tables
+//! as static arrays and builds the DWA encode table at run time; all of
+//! them equal these, the latter with glibc and the Windows CRT.)
 
 use std::sync::OnceLock;
 
 static BLOB: &[u8] = include_bytes!("luts.z");
 
-// The encode-side tables are used by the B44/DWA writers.
-#[allow(dead_code)]
 pub(crate) struct Luts {
     /// B44 decode: `convertToLinear` (8 * log(x)).
     pub b44_log: Vec<u16>,

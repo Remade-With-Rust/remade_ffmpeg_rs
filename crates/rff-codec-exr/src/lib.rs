@@ -14,7 +14,7 @@
 //!
 //! **Encode** writes `R`,`G`,`B`(,`A`) as half floats (or 32-bit floats with
 //! `-exr_format float`), value / 255, ZIP compressed by default
-//! (`-exr_compression none|rle|zip1|zips|zip16|zip|piz|pxr24`).
+//! (`-exr_compression none|rle|zip1|zips|zip16|zip|piz|pxr24|b44|b44a|dwaa|dwab`).
 
 use rff_codec::{Codec, CodecRegistry, Decoder, Encoder};
 use rff_core::{Dictionary, Error, Frame, MediaType, Packet, PixelFormat, Result, VideoFrame};
@@ -182,6 +182,10 @@ fn compression_from_name(s: &str) -> Option<Compression> {
         "zip16" | "zip" => Compression::Zip,
         "piz" => Compression::Piz,
         "pxr24" => Compression::Pxr24,
+        "b44" => Compression::B44,
+        "b44a" => Compression::B44a,
+        "dwaa" => Compression::Dwaa,
+        "dwab" => Compression::Dwab,
         _ => return None,
     })
 }
@@ -191,7 +195,7 @@ impl Encoder for ExrEncoder {
         if let Some(v) = options.get("exr_compression") {
             self.settings.compression = compression_from_name(v).ok_or_else(|| {
                 Error::unsupported(format!(
-                    "exr encode: unknown -exr_compression `{v}` (want none/rle/zip1/zip16/piz/pxr24)"
+                    "exr encode: unknown -exr_compression `{v}` (want none/rle/zip1/zip16/piz/pxr24/b44/b44a/dwaa/dwab)"
                 ))
             })?;
         }
@@ -281,6 +285,39 @@ fn encode_exr(vf: &VideoFrame, settings: Settings) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lossy_compressions_round_trip_closely() {
+        let (w, h) = (37u32, 21u32);
+        let px: Vec<u8> = (0..w * h * 3)
+            .map(|i| ((i % (w * 3)) * 255 / (w * 3)) as u8)
+            .collect();
+        let vf = VideoFrame {
+            width: w,
+            height: h,
+            format: PixelFormat::Rgb24,
+            planes: vec![px.clone()],
+            strides: vec![w as usize * 3],
+            pts: None,
+        };
+        for c in ["b44", "b44a", "dwaa", "dwab"] {
+            let s = Settings {
+                compression: compression_from_name(c).unwrap(),
+                float: false,
+            };
+            let file = encode_exr(&vf, s).unwrap();
+            let Frame::Video(back) = decode_exr(&file).unwrap() else {
+                panic!("video");
+            };
+            let worst = back.planes[0]
+                .iter()
+                .zip(&px)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(worst <= 8, "{c}: worst 8-bit error {worst}");
+        }
+    }
 
     #[test]
     fn rgba_round_trip_is_exact_in_8_bits() {

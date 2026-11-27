@@ -8,6 +8,7 @@
 
 pub(crate) mod b44;
 pub(crate) mod dwa;
+pub(crate) mod dwa_encode;
 pub(crate) mod huffman;
 pub(crate) mod piz;
 pub(crate) mod pxr24;
@@ -314,6 +315,7 @@ pub(crate) fn compress(
     geom: &BlockGeom<'_>,
     raw: Vec<u8>,
     deflater: crate::Deflate,
+    dwa_level: f32,
 ) -> Result<Vec<u8>> {
     debug_assert_eq!(raw.len(), geom.raw_size);
     let packed = match compression {
@@ -322,7 +324,9 @@ pub(crate) fn compress(
         Compression::Zips | Compression::Zip => zip::compress(&raw, deflater),
         Compression::Piz => piz::compress(geom, &raw),
         Compression::Pxr24 => pxr24::compress(geom, &raw, deflater),
-        c => return Err(Error::unsupported(format!("writing {c:?} compression"))),
+        Compression::B44 => b44::compress(geom, &raw, false),
+        Compression::B44a => b44::compress(geom, &raw, true),
+        Compression::Dwaa | Compression::Dwab => dwa_encode::compress(geom, &raw, dwa_level)?,
     };
     if packed.len() < raw.len() {
         Ok(packed)
