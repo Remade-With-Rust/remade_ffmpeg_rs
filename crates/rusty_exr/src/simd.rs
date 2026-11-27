@@ -87,7 +87,9 @@ pub(crate) fn available() -> Vec<Isa> {
 // DWA decode: one block (1 component, or an R/G/B triple).
 
 /// The SIMD twin of [`crate::compression::dwa::block_scalar`] for a block
-/// that is not flat in every component. Returns `false`, writing nothing,
+/// that is not flat in every component. `work` is caller-owned float
+/// scratch (any contents: every element read is written first), so no
+/// block pays for zeroing it. Returns `false`, writing nothing,
 /// when a coefficient is infinite or NaN (the scalar path then handles the
 /// block) or when no SIMD family is in use.
 pub(crate) fn dwa_block(
@@ -96,16 +98,17 @@ pub(crate) fn dwa_block(
     zr: [u8; 3],
     n: usize,
     out: &mut [[u16; 64]; 3],
+    work: &mut [[f32; 64]; 3],
 ) -> bool {
     assert!((1..=3).contains(&n) && zr.iter().all(|&z| z <= 8));
     match isa {
         #[cfg(target_arch = "x86_64")]
         // SAFETY: SSE2 is part of x86-64; the arrays are fixed-size and the
         // kernel indexes only within them (n <= 3, zr <= 8 checked above).
-        Isa::Sse2 => unsafe { x86::dwa_block_sse2(raster, zr, n, out) },
+        Isa::Sse2 => unsafe { x86::dwa_block_sse2(raster, zr, n, out, work) },
         #[cfg(target_arch = "x86_64")]
         // SAFETY: `Isa::Avx2` is only selected after detecting AVX2 and F16C.
-        Isa::Avx2 => unsafe { x86::dwa_block_avx2(raster, zr, n, out) },
+        Isa::Avx2 => unsafe { x86::dwa_block_avx2(raster, zr, n, out, work) },
         _ => false,
     }
 }
@@ -765,11 +768,11 @@ mod x86 {
         zr: [u8; 3],
         n: usize,
         out: &mut [[u16; 64]; 3],
+        d: &mut [[f32; 64]; 3],
     ) -> bool {
         if raster[..n].iter().any(|z| any_nonfinite(z)) {
             return false;
         }
-        let mut d = [[0f32; 64]; 3];
         for c in 0..n {
             if zr[c] == ZR_CONSTANT {
                 d[c] = flat(raster[c][0]);
@@ -779,7 +782,7 @@ mod x86 {
             }
         }
         if n == 3 {
-            csc_sse2(&mut d);
+            csc_sse2(d);
         }
         for c in 0..n {
             f2h64_sse2(&d[c], &mut out[c]);
@@ -869,11 +872,11 @@ mod x86 {
         zr: [u8; 3],
         n: usize,
         out: &mut [[u16; 64]; 3],
+        d: &mut [[f32; 64]; 3],
     ) -> bool {
         if raster[..n].iter().any(|z| any_nonfinite(z)) {
             return false;
         }
-        let mut d = [[0f32; 64]; 3];
         for c in 0..n {
             if zr[c] == ZR_CONSTANT {
                 d[c] = flat(raster[c][0]);
@@ -883,7 +886,7 @@ mod x86 {
             }
         }
         if n == 3 {
-            csc_avx2(&mut d);
+            csc_avx2(d);
         }
         for c in 0..n {
             f2h64_f16c(&d[c], &mut out[c]);
@@ -1962,7 +1965,14 @@ mod tests {
             }
             for &isa in &isas {
                 let mut got = [[0u16; 64]; 3];
-                assert!(dwa_block(isa, &raster, zr, n, &mut got));
+                assert!(dwa_block(
+                    isa,
+                    &raster,
+                    zr,
+                    n,
+                    &mut got,
+                    &mut [[f32::NAN; 64]; 3]
+                ));
                 assert_eq!(
                     got[..n],
                     want[..n],
@@ -1999,7 +2009,14 @@ mod tests {
                         block_scalar(&raster, zr, 1, false, &mut want);
                         for &isa in &isas {
                             let mut got = [[0u16; 64]; 3];
-                            assert!(dwa_block(isa, &raster, zr, 1, &mut got));
+                            assert!(dwa_block(
+                                isa,
+                                &raster,
+                                zr,
+                                1,
+                                &mut got,
+                                &mut [[-1e30; 64]; 3]
+                            ));
                             assert_eq!(got[0], want[0], "{isa:?} pos {pos} zr {z} v {v:04x}");
                         }
                     }
@@ -2016,7 +2033,14 @@ mod tests {
                 raster[1][9] = bad;
                 raster[0][3] = 0x3c00;
                 let mut got = [[0u16; 64]; 3];
-                assert!(!dwa_block(isa, &raster, [0, 0, 0], 3, &mut got));
+                assert!(!dwa_block(
+                    isa,
+                    &raster,
+                    [0, 0, 0],
+                    3,
+                    &mut got,
+                    &mut [[0.0; 64]; 3]
+                ));
                 assert_eq!(got, [[0u16; 64]; 3]);
             }
         }
@@ -2025,7 +2049,8 @@ mod tests {
             &[[0; 64]; 3],
             [0; 3],
             1,
-            &mut [[0; 64]; 3]
+            &mut [[0; 64]; 3],
+            &mut [[0.0; 64]; 3]
         ));
     }
 }

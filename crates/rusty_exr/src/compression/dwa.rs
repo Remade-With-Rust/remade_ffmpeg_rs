@@ -504,6 +504,9 @@ fn decode_lossy(
     let mut raster = [[0u16; 64]; 3];
     let mut zr = [ZR_CONSTANT; 3];
     let mut halves = [[0u16; 64]; 3];
+    // Float scratch for the SIMD block kernel, owned here so no block pays
+    // for zeroing it.
+    let mut work = [[0f32; 64]; 3];
     let isa = crate::simd::isa();
     for by in 0..nby {
         for bx in 0..nbx {
@@ -539,7 +542,7 @@ fn decode_lossy(
                     constant = false;
                 }
             }
-            if constant || !crate::simd::dwa_block(isa, &raster, zr, n, &mut halves) {
+            if constant || !crate::simd::dwa_block(isa, &raster, zr, n, &mut halves, &mut work) {
                 block_scalar(&raster, zr, n, constant, &mut halves);
             }
             let max_y = (height - by * 8).min(8);
