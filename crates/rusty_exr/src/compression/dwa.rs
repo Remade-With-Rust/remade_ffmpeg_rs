@@ -512,14 +512,18 @@ fn decode_lossy(
                 let z = &mut raster[comp];
                 *z = [0; 64];
                 z[0] = dc[dc_base + comp * nbx * nby + by * nbx + bx];
-                // Un-RLE the AC coefficients.
+                // Un-RLE the AC coefficients (over a local view of the
+                // remaining tokens: as a field update through `&mut`, the
+                // read position kept several induction variables live).
+                let toks = &ac.ac[ac.pos..];
+                let mut i = 0usize;
                 let mut k = 1usize;
                 let mut lnz = 0usize;
                 while k < 64 {
-                    let Some(&v) = ac.ac.get(ac.pos) else {
+                    let Some(&v) = toks.get(i) else {
                         return Err(Error::invalid("DWA AC data too short"));
                     };
-                    ac.pos += 1;
+                    i += 1;
                     if v & 0xff00 == 0xff00 {
                         let c = usize::from(v & 0xff);
                         k += if c == 0 { 64 } else { c };
@@ -529,6 +533,7 @@ fn decode_lossy(
                         k += 1;
                     }
                 }
+                ac.pos += i;
                 zr[comp] = zero_rows(lnz);
                 if lnz != 0 {
                     constant = false;
