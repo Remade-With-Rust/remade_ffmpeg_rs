@@ -188,13 +188,13 @@ pub(super) fn classify(chans: &[ChanGeom<'_>], rules: &[Rule]) -> (Vec<Scheme>, 
 // ---------------------------------------------------------------------------
 // The lossy DCT decoder.
 
-const A: f32 = 3.535536e-01;
-const B: f32 = 4.903927e-01;
-const C: f32 = 4.619398e-01;
-const D: f32 = 4.157349e-01;
-const E: f32 = 2.777855e-01;
-const F: f32 = 1.913422e-01;
-const G: f32 = 9.754573e-02;
+pub(crate) const A: f32 = 3.535536e-01;
+pub(crate) const B: f32 = 4.903927e-01;
+pub(crate) const C: f32 = 4.619398e-01;
+pub(crate) const D: f32 = 4.157349e-01;
+pub(crate) const E: f32 = 2.777855e-01;
+pub(crate) const F: f32 = 1.913422e-01;
+pub(crate) const G: f32 = 9.754573e-02;
 
 /// `dst[i] = src[ZIGZAG[i]]`.
 pub(super) const ZIGZAG: [usize; 64] = [
@@ -395,6 +395,85 @@ fn f16c_f2h(f: f32) -> u16 {
     crate::half::f32_to_f16(f)
 }
 
+/// `UNZIGZAG[k]` is the raster position of zig-zag index `k`
+/// (`ZIGZAG[UNZIGZAG[k]] == k`).
+pub(crate) const UNZIGZAG: [usize; 64] = {
+    let mut t = [0usize; 64];
+    let mut i = 0;
+    while i < 64 {
+        t[ZIGZAG[i]] = i;
+        i += 1;
+    }
+    t
+};
+
+/// `zr` value marking a component whose block has no AC coefficient (a
+/// flat block: every sample is the DC term times `A * A`).
+pub(crate) const ZR_CONSTANT: u8 = 8;
+
+/// Trailing all-zero rows of a block whose last non-zero AC coefficient
+/// is zig-zag index `lnz` (OpenEXR's choice of IDCT variant), or
+/// [`ZR_CONSTANT`] when there is none.
+fn zero_rows(lnz: usize) -> u8 {
+    match lnz {
+        0 => ZR_CONSTANT,
+        1 => 7,
+        2 => 6,
+        3..=8 => 5,
+        9 => 4,
+        10..=19 => 3,
+        20 => 2,
+        21..=34 => 1,
+        _ => 0,
+    }
+}
+
+/// The scalar block pipeline (and the oracle of `simd::dwa_block`): per
+/// component dequantize (`raster` holds half coefficients in raster order),
+/// inverse DCT, then the inverse colour transform for a triple, then
+/// rounding to halves. `constant` is true when every component is flat.
+pub(crate) fn block_scalar(
+    raster: &[[u16; 64]; 3],
+    zr: [u8; 3],
+    n: usize,
+    constant: bool,
+    halves: &mut [[u16; 64]; 3],
+) {
+    let mut dct = [[0f32; 64]; 3];
+    for comp in 0..n {
+        let d = &mut dct[comp];
+        let z = &raster[comp];
+        if zr[comp] == ZR_CONSTANT {
+            let v = crate::half::f16_to_f32(z[0]) * A * A;
+            *d = [v; 64];
+        } else {
+            for i in 0..64 {
+                d[i] = crate::half::f16_to_f32(z[i]);
+            }
+            idct_avx(d, usize::from(zr[comp]));
+        }
+    }
+    if n == 3 {
+        let count = if constant { 1 } else { 64 };
+        let [d0, d1, d2] = &mut dct;
+        for i in 0..count {
+            let (s0, s1, s2) = (d0[i], d1[i], d2[i]);
+            d0[i] = s0 + 1.5747 * s2;
+            d1[i] = s0 - 0.1873 * s1 - 0.4682 * s2;
+            d2[i] = s0 + 1.8556 * s1;
+        }
+    }
+    for comp in 0..n {
+        if constant {
+            halves[comp] = [imath_f2h(dct[comp][0]); 64];
+        } else {
+            for i in 0..64 {
+                halves[comp][i] = f16c_f2h(dct[comp][i]);
+            }
+        }
+    }
+}
+
 struct AcReader<'a> {
     ac: &'a [u16],
     pos: usize,
@@ -420,14 +499,17 @@ fn decode_lossy(
     }
     let dc_base = *dc_pos;
     *dc_pos += need;
-    let mut zig = [[0u16; 64]; 3];
-    let mut dct = [[0f32; 64]; 3];
+    // Coefficients in raster (de-zig-zagged) order: the un-RLE scatters each
+    // AC value straight to its raster slot.
+    let mut raster = [[0u16; 64]; 3];
+    let mut zr = [ZR_CONSTANT; 3];
     let mut halves = [[0u16; 64]; 3];
+    let isa = crate::simd::isa();
     for by in 0..nby {
         for bx in 0..nbx {
             let mut constant = true;
             for comp in 0..n {
-                let z = &mut zig[comp];
+                let z = &mut raster[comp];
                 *z = [0; 64];
                 z[0] = dc[dc_base + comp * nbx * nby + by * nbx + bx];
                 // Un-RLE the AC coefficients.
@@ -443,50 +525,17 @@ fn decode_lossy(
                         k += if c == 0 { 64 } else { c };
                     } else {
                         lnz = k;
-                        z[k] = v;
+                        z[UNZIGZAG[k]] = v;
                         k += 1;
                     }
                 }
-                let d = &mut dct[comp];
-                if lnz == 0 {
-                    let v = crate::half::f16_to_f32(z[0]) * A * A;
-                    *d = [v; 64];
-                } else {
+                zr[comp] = zero_rows(lnz);
+                if lnz != 0 {
                     constant = false;
-                    for i in 0..64 {
-                        d[i] = crate::half::f16_to_f32(z[ZIGZAG[i]]);
-                    }
-                    let zr = match lnz {
-                        0..=1 => 7,
-                        2 => 6,
-                        3..=8 => 5,
-                        9 => 4,
-                        10..=19 => 3,
-                        20 => 2,
-                        21..=34 => 1,
-                        _ => 0,
-                    };
-                    idct_avx(d, zr);
                 }
             }
-            if n == 3 {
-                let count = if constant { 1 } else { 64 };
-                let [d0, d1, d2] = &mut dct;
-                for i in 0..count {
-                    let (s0, s1, s2) = (d0[i], d1[i], d2[i]);
-                    d0[i] = s0 + 1.5747 * s2;
-                    d1[i] = s0 - 0.1873 * s1 - 0.4682 * s2;
-                    d2[i] = s0 + 1.8556 * s1;
-                }
-            }
-            for comp in 0..n {
-                if constant {
-                    halves[comp] = [imath_f2h(dct[comp][0]); 64];
-                } else {
-                    for i in 0..64 {
-                        halves[comp][i] = f16c_f2h(dct[comp][i]);
-                    }
-                }
+            if constant || !crate::simd::dwa_block(isa, &raster, zr, n, &mut halves) {
+                block_scalar(&raster, zr, n, constant, &mut halves);
             }
             let max_y = (height - by * 8).min(8);
             let max_x = (width - bx * 8).min(8);
