@@ -612,10 +612,40 @@ struct BitOut {
 }
 
 impl BitOut {
+    /// Append the low `n` bits of `v`, writing whole bytes as soon as they
+    /// are complete (the reference formulation, and the oracle of
+    /// [`Self::put`]). With more than 56 bits pending the top bits fall off
+    /// the 64-bit accumulator, exactly as in the `exr` crate.
     #[inline(always)]
-    fn put(&mut self, n: u64, v: u64) {
+    fn put_bytewise(&mut self, n: u64, v: u64) {
         self.bits = (self.bits << n) | v;
         self.count += n;
+        while self.count >= 8 {
+            self.count -= 8;
+            self.out.push((self.bits >> self.count) as u8);
+        }
+    }
+    /// [`Self::put_bytewise`], writing 32 bits at a time. Codes of up to 32
+    /// bits accumulate in up to 63 bits (no loss); longer codes first drain
+    /// to under 8 pending bits and then take the bytewise path, so even the
+    /// accumulator overflow of 57- and 58-bit codes matches.
+    #[inline(always)]
+    fn put(&mut self, n: u64, v: u64) {
+        if n > 32 {
+            self.drain();
+            self.put_bytewise(n, v);
+            return;
+        }
+        self.bits = (self.bits << n) | v;
+        self.count += n;
+        if self.count >= 32 {
+            self.count -= 32;
+            self.out
+                .extend_from_slice(&((self.bits >> self.count) as u32).to_be_bytes());
+        }
+    }
+    /// Write the complete pending bytes (leaving under 8 bits pending).
+    fn drain(&mut self) {
         while self.count >= 8 {
             self.count -= 8;
             self.out.push((self.bits >> self.count) as u8);
@@ -626,6 +656,7 @@ impl BitOut {
         self.put(hlen(e), hcode(e));
     }
     fn flush(&mut self) {
+        self.drain();
         if self.count > 0 {
             self.out.push((self.bits << (8 - self.count)) as u8);
         }
@@ -875,6 +906,38 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn bit_writer_matches_bytewise() {
+        let mut seed = 77;
+        for case in 0..400 {
+            let mut a = BitOut {
+                out: Vec::new(),
+                bits: 0,
+                count: 0,
+            };
+            let mut b = BitOut {
+                out: Vec::new(),
+                bits: 0,
+                count: 0,
+            };
+            let max = [8u64, 20, 32, 58][case % 4];
+            for _ in 0..(lcg(&mut seed) % 300) {
+                let n = 1 + u64::from(lcg(&mut seed)) % max;
+                let v = (u64::from(lcg(&mut seed)) << 32 | u64::from(lcg(&mut seed)))
+                    & ((1u64 << n) - 1);
+                a.put(n, v);
+                b.put_bytewise(n, v);
+                assert_eq!(
+                    a.out.len() as u64 * 8 + a.count,
+                    b.out.len() as u64 * 8 + b.count
+                );
+            }
+            a.flush();
+            b.flush();
+            assert_eq!(a.out, b.out, "case {case}");
         }
     }
 
