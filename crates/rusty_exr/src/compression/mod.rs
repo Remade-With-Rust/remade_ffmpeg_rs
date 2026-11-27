@@ -334,7 +334,7 @@ pub(crate) fn decompress_layout<'a>(
         }
         Compression::Dwaa | Compression::Dwab => {
             dwa::decompress(geom, data, scratch)?;
-            Ok(Layout::Planar(&scratch.a[..geom.raw_size]))
+            Ok(Layout::PlanarU16(&scratch.w[..geom.raw_size / 2]))
         }
     }
 }

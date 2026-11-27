@@ -585,7 +585,8 @@ pub(crate) struct DwaScratch {
     bufs: [Vec<u16>; 3],
 }
 
-/// Decode one DWA chunk into `scratch.a[..geom.raw_size]` (channel-planar).
+/// Decode one DWA chunk into `scratch.w[..geom.raw_size / 2]` (channel-planar
+/// little-endian words).
 pub(crate) fn decompress(
     geom: &BlockGeom<'_>,
     data: &[u8],
@@ -659,7 +660,7 @@ pub(crate) fn decompress(
         .sum();
 
     let super::Scratch {
-        a: planar_buf,
+        w: words_buf,
         huf,
         dwa: ds,
         inflater,
@@ -725,59 +726,22 @@ pub(crate) fn decompress(
         &[]
     };
 
-    // Output, channel-planar, in the worker's reused buffer: every byte of
-    // it is written below (lossy, RLE and unknown channels cover the whole
-    // chunk; lossy UINT rows zero their tails), so it is not re-zeroed.
+    // Output: channel-planar 16-bit words (a 32-bit sample is its low word
+    // then its high word) in the worker's reused buffer. Every word of it is
+    // written below (lossy, RLE and unknown channels cover the whole chunk;
+    // lossy UINT rows zero their tails), so it is not re-zeroed. HALF lossy
+    // channels are decoded straight into it.
     let mut offs = Vec::with_capacity(chans.len());
     let mut o = 0usize;
     for ch in chans {
         offs.push(o);
-        o += ch.bytes();
+        o += ch.bytes() / 2;
     }
-    let planar = super::grow(planar_buf, geom.raw_size);
+    let words = super::grow(words_buf, geom.raw_size / 2);
     let mut done = vec![false; chans.len()];
     let mut acr = AcReader { ac, pos: 0 };
     let mut dc_pos = 0usize;
     let luts = crate::luts::get();
-
-    let store = |planar: &mut [u8], ci: usize, halves: &[u16]| {
-        let ch = &chans[ci];
-        let base = offs[ci];
-        let rb = ch.row_bytes();
-        match ch.ty {
-            SampleType::F16 => {
-                for (d, h) in planar[base..base + ch.bytes()]
-                    .chunks_exact_mut(2)
-                    .zip(halves)
-                {
-                    d.copy_from_slice(&h.to_le_bytes());
-                }
-            }
-            SampleType::F32 => {
-                for (d, h) in planar[base..base + ch.bytes()]
-                    .chunks_exact_mut(4)
-                    .zip(halves)
-                {
-                    d.copy_from_slice(&imath_h2f_bits(*h).to_le_bytes());
-                }
-            }
-            SampleType::U32 => {
-                // OpenEXR writes the halves at the start of each row and
-                // leaves the rest of the row zeroed.
-                for y in 0..ch.height {
-                    let (row, tail) =
-                        planar[base + y * rb..base + (y + 1) * rb].split_at_mut(2 * ch.width);
-                    for (d, h) in row
-                        .chunks_exact_mut(2)
-                        .zip(&halves[y * ch.width..(y + 1) * ch.width])
-                    {
-                        d.copy_from_slice(&h.to_le_bytes());
-                    }
-                    tail.fill(0);
-                }
-            }
-        }
-    };
 
     for set in &sets {
         if set.iter().any(|&i| schemes[i] != Scheme::Lossy) {
@@ -785,7 +749,24 @@ pub(crate) fn decompress(
         }
         let ch = &chans[set[0]];
         let (w, h) = (ch.width, ch.height);
-        {
+        let direct = set.iter().all(|&i| chans[i].ty == SampleType::F16)
+            && set[0] != set[1]
+            && set[0] != set[2]
+            && set[1] != set[2];
+        if direct {
+            // Channels in a set share geometry (checked in `classify`), and
+            // distinct channels own disjoint word ranges.
+            let mut outs = disjoint3(words, set.map(|i| (offs[i], w * h)));
+            decode_lossy(
+                &mut acr,
+                dc,
+                &mut dc_pos,
+                w,
+                h,
+                Some(&luts.dwa_to_linear),
+                &mut outs,
+            )?;
+        } else {
             let [b0, b1, b2] = &mut ds.bufs;
             let mut outs: [&mut [u16]; 3] = [
                 super::grow(b0, w * h),
@@ -794,17 +775,18 @@ pub(crate) fn decompress(
             ];
             decode_lossy(
                 &mut acr,
-                &dc,
+                dc,
                 &mut dc_pos,
                 w,
                 h,
                 Some(&luts.dwa_to_linear),
                 &mut outs,
             )?;
+            for (k, &ci) in set.iter().enumerate() {
+                store_words(words, &chans[ci], offs[ci], &ds.bufs[k][..w * h]);
+            }
         }
-        for (k, &ci) in set.iter().enumerate() {
-            // Channels in a set share geometry (checked in `classify`).
-            store(planar, ci, &ds.bufs[k][..w * h]);
+        for &ci in set {
             done[ci] = true;
         }
     }
@@ -821,29 +803,42 @@ pub(crate) fn decompress(
         }
         match schemes[ci] {
             Scheme::Lossy => {
-                let buf = super::grow(&mut ds.bufs[0], ch.width * ch.height);
                 let lin = if ch.p_linear {
                     None
                 } else {
                     Some(&luts.dwa_to_linear[..])
                 };
-                decode_lossy(
-                    &mut acr,
-                    &dc,
-                    &mut dc_pos,
-                    ch.width,
-                    ch.height,
-                    lin,
-                    &mut [&mut *buf],
-                )?;
-                store(planar, ci, buf);
+                let n = ch.width * ch.height;
+                if ch.ty == SampleType::F16 {
+                    let out = &mut words[offs[ci]..offs[ci] + n];
+                    decode_lossy(
+                        &mut acr,
+                        dc,
+                        &mut dc_pos,
+                        ch.width,
+                        ch.height,
+                        lin,
+                        &mut [out],
+                    )?;
+                } else {
+                    let buf = super::grow(&mut ds.bufs[0], n);
+                    decode_lossy(
+                        &mut acr,
+                        dc,
+                        &mut dc_pos,
+                        ch.width,
+                        ch.height,
+                        lin,
+                        &mut [&mut *buf],
+                    )?;
+                    store_words(words, ch, offs[ci], buf);
+                }
             }
             Scheme::Rle => {
                 let bpe = ch.ty.bytes();
                 let plane = ch.width * ch.height;
-                let base = offs[ci];
                 let src = &rle[rle_planes..rle_planes + bpe * plane];
-                let dst = &mut planar[base..base + bpe * plane];
+                let dst = &mut words[offs[ci]..offs[ci] + bpe * plane / 2];
                 unsplit_planes(src, plane, dst);
                 rle_planes += bpe * plane;
             }
@@ -852,8 +847,13 @@ pub(crate) fn decompress(
                 if unk_pos + n > unknown.len() {
                     return Err(Error::invalid("DWA unknown data too short"));
                 }
-                let base = offs[ci];
-                planar[base..base + n].copy_from_slice(&unknown[unk_pos..unk_pos + n]);
+                let dst = &mut words[offs[ci]..offs[ci] + n / 2];
+                for (d, s) in dst
+                    .iter_mut()
+                    .zip(unknown[unk_pos..unk_pos + n].chunks_exact(2))
+                {
+                    *d = u16::from_le_bytes([s[0], s[1]]);
+                }
                 unk_pos += n;
             }
         }
@@ -861,40 +861,103 @@ pub(crate) fn decompress(
     Ok(())
 }
 
-/// Rebuild `dst.len() / plane`-byte samples from byte planes: byte `k` of
-/// sample `i` is `src[k * plane + i]`. The fixed-width arms (2 and 4: every
-/// sample type) are zipped loops the compiler vectorizes; the indexed loop
-/// is the general form and their oracle.
-fn unsplit_planes(src: &[u8], plane: usize, dst: &mut [u8]) {
-    match dst.len().checked_div(plane) {
+/// Three disjoint `len`-word ranges of `words` starting at the given
+/// (pairwise distinct, non-overlapping) offsets, in argument order.
+fn disjoint3(words: &mut [u16], r: [(usize, usize); 3]) -> [&mut [u16]; 3] {
+    let mut order = [0usize, 1, 2];
+    order.sort_by_key(|&k| r[k].0);
+    let mut rest = words;
+    let mut base = 0usize;
+    let mut got: [Option<&mut [u16]>; 3] = [None, None, None];
+    for k in order {
+        let (off, len) = r[k];
+        let tail = std::mem::take(&mut rest);
+        let (_, tail) = tail.split_at_mut(off - base);
+        let (mine, tail) = tail.split_at_mut(len);
+        got[k] = Some(mine);
+        rest = tail;
+        base = off + len;
+    }
+    got.map(|g| g.expect("all three ranges assigned"))
+}
+
+/// Store a lossy channel's decoded halves (`width * height`, row-major) as
+/// its planar words at `off`: HALF as is, FLOAT as Imath's half-to-float,
+/// UINT as OpenEXR leaves it (each row's halves in the first half of the
+/// row's words, the rest zero).
+fn store_words(words: &mut [u16], ch: &ChanGeom<'_>, off: usize, halves: &[u16]) {
+    let n = ch.width * ch.height;
+    match ch.ty {
+        SampleType::F16 => words[off..off + n].copy_from_slice(&halves[..n]),
+        SampleType::F32 => {
+            for (d, &h) in words[off..off + 2 * n]
+                .chunks_exact_mut(2)
+                .zip(&halves[..n])
+            {
+                let b = imath_h2f_bits(h);
+                d[0] = b as u16;
+                d[1] = (b >> 16) as u16;
+            }
+        }
+        SampleType::U32 => {
+            let w = ch.width;
+            if w == 0 {
+                return;
+            }
+            for (row, src) in words[off..off + 2 * n]
+                .chunks_exact_mut(2 * w)
+                .zip(halves.chunks_exact(w))
+            {
+                let (head, tail) = row.split_at_mut(w);
+                head.copy_from_slice(src);
+                tail.fill(0);
+            }
+        }
+    }
+}
+
+/// Rebuild samples of `bpe = src.len() / plane` bytes from byte planes
+/// (byte `k` of sample `i` is `src[k * plane + i]`) as little-endian words
+/// (a 4-byte sample is two words, low first). The fixed-width arms (2 and 4:
+/// every sample type) are zipped loops the compiler vectorizes; the indexed
+/// loop is the general form and their oracle.
+fn unsplit_planes(src: &[u8], plane: usize, dst: &mut [u16]) {
+    match src.len().checked_div(plane) {
         Some(2) => {
             let (a, b) = src.split_at(plane);
-            for ((d, &x), &y) in dst.chunks_exact_mut(2).zip(a).zip(&b[..plane]) {
-                d[0] = x;
-                d[1] = y;
+            for ((d, &x), &y) in dst.iter_mut().zip(a).zip(&b[..plane]) {
+                *d = u16::from_le_bytes([x, y]);
             }
         }
         Some(4) => {
             let (a, r) = src.split_at(plane);
             let (b, r) = r.split_at(plane);
             let (c, e) = r.split_at(plane);
-            for ((((d, &x), &y), &z), &w) in dst.chunks_exact_mut(4).zip(a).zip(b).zip(c).zip(&e[..plane]) {
-                d.copy_from_slice(&[x, y, z, w]);
+            for ((((d, &x), &y), &z), &w) in dst
+                .chunks_exact_mut(2)
+                .zip(a)
+                .zip(b)
+                .zip(c)
+                .zip(&e[..plane])
+            {
+                d[0] = u16::from_le_bytes([x, y]);
+                d[1] = u16::from_le_bytes([z, w]);
             }
         }
         _ => unsplit_planes_indexed(src, plane, dst),
     }
 }
 
-/// The indexed form of [`unsplit_planes`].
-fn unsplit_planes_indexed(src: &[u8], plane: usize, dst: &mut [u8]) {
+/// The indexed form of [`unsplit_planes`] (even `bpe`).
+fn unsplit_planes_indexed(src: &[u8], plane: usize, dst: &mut [u16]) {
     if plane == 0 {
         return;
     }
-    let bpe = dst.len() / plane;
-    for (i, d) in dst.chunks_exact_mut(bpe).enumerate() {
-        for (k, b) in d.iter_mut().enumerate() {
-            *b = src[k * plane + i];
+    let bpe = src.len() / plane;
+    for i in 0..plane {
+        for k in (0..bpe).step_by(2) {
+            dst[i * bpe / 2 + k / 2] =
+                u16::from_le_bytes([src[k * plane + i], src[(k + 1) * plane + i]]);
         }
     }
 }
@@ -929,11 +992,11 @@ mod tests {
     #[test]
     fn unsplit_planes_matches_indexed() {
         let mut seed = 7u32;
-        for bpe in [1usize, 2, 3, 4, 8] {
+        for bpe in [2usize, 4, 6, 8] {
             for plane in [0usize, 1, 2, 15, 16, 17, 33, 1000] {
                 let src: Vec<u8> = (0..bpe * plane).map(|_| lcg(&mut seed) as u8).collect();
-                let mut a = vec![0u8; bpe * plane];
-                let mut b = vec![1u8; bpe * plane];
+                let mut a = vec![0u16; bpe * plane / 2];
+                let mut b = vec![1u16; bpe * plane / 2];
                 unsplit_planes(&src, plane, &mut a);
                 unsplit_planes_indexed(&src, plane, &mut b);
                 assert_eq!(a, b, "bpe {bpe} plane {plane}");
