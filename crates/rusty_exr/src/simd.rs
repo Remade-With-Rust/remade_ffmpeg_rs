@@ -128,16 +128,41 @@ pub(crate) fn piz_wdec_rows(
     unit: usize,
     w14: bool,
 ) -> usize {
+    piz_wav_rows(isa, top, bot, len, unit, w14, false)
+}
+
+/// The forward twin of [`piz_wdec_rows`]: `piz`'s `wenc14`/`wenc16` group
+/// step of forward level 1 (each pair across, then each column down).
+pub(crate) fn piz_wenc_rows(
+    isa: Isa,
+    top: &mut [u16],
+    bot: &mut [u16],
+    len: usize,
+    unit: usize,
+    w14: bool,
+) -> usize {
+    piz_wav_rows(isa, top, bot, len, unit, w14, true)
+}
+
+fn piz_wav_rows(
+    isa: Isa,
+    top: &mut [u16],
+    bot: &mut [u16],
+    len: usize,
+    unit: usize,
+    w14: bool,
+    enc: bool,
+) -> usize {
     assert!(len <= top.len() && len <= bot.len() && (unit == 1 || unit == 2));
     let chunks = len / 16;
     match isa {
         #[cfg(target_arch = "x86_64")]
         // SAFETY: SSE2 is part of x86-64; the kernel touches words
         // `0..chunks * 16`, inside both slices (checked above).
-        Isa::Sse2 => unsafe { x86::wdec_rows_sse2(top, bot, chunks, unit, w14) },
+        Isa::Sse2 => unsafe { x86::wdec_rows_sse2(top, bot, chunks, unit, w14, enc) },
         #[cfg(target_arch = "x86_64")]
         // SAFETY: as above, and AVX2 was detected before `Isa::Avx2` is chosen.
-        Isa::Avx2 => unsafe { x86::wdec_rows_avx2(top, bot, chunks, unit, w14) },
+        Isa::Avx2 => unsafe { x86::wdec_rows_avx2(top, bot, chunks, unit, w14, enc) },
         _ => return 0,
     }
     chunks * 16
@@ -739,10 +764,12 @@ mod x86 {
     /// interleaves them back.
     macro_rules! wdec_kernel {
         ($name:ident, $feat:literal, $V:ty, $n:literal, $load:ident, $store:ident,
-         $add:ident, $sub:ident, $and:ident, $srai:ident, $srli:ident, $set1:ident,
-         $de1:ident, $il1:ident, $de2:ident, $il2:ident) => {
+         $add:ident, $sub:ident, $and:ident, $xor:ident, $cmpgt:ident, $srai:ident,
+         $srli:ident, $set1:ident, $de1:ident, $il1:ident, $de2:ident, $il2:ident) => {
+            /// One 2x2 group step per lane: the inverse transform
+            /// (`ENC == false`) or the forward one.
             #[target_feature(enable = $feat)]
-            unsafe fn $name<const W14: bool, const UNIT: usize>(
+            unsafe fn $name<const W14: bool, const UNIT: usize, const ENC: bool>(
                 top: *mut u16,
                 bot: *mut u16,
                 chunks: usize,
@@ -758,6 +785,24 @@ mod x86 {
                         ($sub($add(h, bb), $set1(-0x8000)), bb)
                     }
                 }
+                // `piz::wenc14` / `wenc16` (floor halving without a 17th bit:
+                // (a >> 1) + (b >> 1) + (a & b & 1)).
+                #[inline]
+                #[target_feature(enable = $feat)]
+                unsafe fn enc<const W14: bool>(a: $V, b: $V) -> ($V, $V) {
+                    let one = $set1(1);
+                    if W14 {
+                        let m = $add($add($srai::<1>(a), $srai::<1>(b)), $and($and(a, b), one));
+                        (m, $sub(a, b))
+                    } else {
+                        let top = $set1(-0x8000);
+                        let ao = $xor(a, top);
+                        let m = $add($add($srli::<1>(ao), $srli::<1>(b)), $and($and(ao, b), one));
+                        // ao < b (unsigned) <=> a < b ^ 0x8000 (signed).
+                        let lt = $cmpgt($xor(b, top), a);
+                        ($add(m, $and(lt, top)), $sub(ao, b))
+                    }
+                }
                 for c in 0..chunks {
                     let (t, b) = (top.add(c * $n), bot.add(c * $n));
                     let lanes = $n / 2;
@@ -768,10 +813,19 @@ mod x86 {
                     } else {
                         ($de2(t0, t1), $de2(b0, b1))
                     };
-                    let (i00, i10) = dec::<W14>(ta, ba);
-                    let (i01, i11) = dec::<W14>(tb, bb);
-                    let (a, bv) = dec::<W14>(i00, i01);
-                    let (cv, dv) = dec::<W14>(i10, i11);
+                    let (a, bv, cv, dv) = if ENC {
+                        let (i00, i01) = enc::<W14>(ta, tb);
+                        let (i10, i11) = enc::<W14>(ba, bb);
+                        let (a, cv) = enc::<W14>(i00, i10);
+                        let (bv, dv) = enc::<W14>(i01, i11);
+                        (a, bv, cv, dv)
+                    } else {
+                        let (i00, i10) = dec::<W14>(ta, ba);
+                        let (i01, i11) = dec::<W14>(tb, bb);
+                        let (a, bv) = dec::<W14>(i00, i01);
+                        let (cv, dv) = dec::<W14>(i10, i11);
+                        (a, bv, cv, dv)
+                    };
                     let ((o0, o1), (o2, o3)) = if UNIT == 1 {
                         ($il1(a, bv), $il1(cv, dv))
                     } else {
@@ -853,6 +907,8 @@ mod x86 {
         _mm_add_epi16,
         _mm_sub_epi16,
         _mm_and_si128,
+        _mm_xor_si128,
+        _mm_cmpgt_epi16,
         _mm_srai_epi16,
         _mm_srli_epi16,
         _mm_set1_epi16,
@@ -871,6 +927,8 @@ mod x86 {
         _mm256_add_epi16,
         _mm256_sub_epi16,
         _mm256_and_si256,
+        _mm256_xor_si256,
+        _mm256_cmpgt_epi16,
         _mm256_srai_epi16,
         _mm256_srli_epi16,
         _mm256_set1_epi16,
@@ -880,20 +938,32 @@ mod x86 {
         il2_256
     );
 
+    /// Pick the monomorphised kernel for (forward?, 14-bit?, unit).
+    macro_rules! wav_call {
+        ($k:ident, $enc:expr, $w14:expr, $unit:expr, $t:expr, $b:expr, $n:expr) => {
+            match ($enc, $w14, $unit) {
+                (false, true, 1) => $k::<true, 1, false>($t, $b, $n),
+                (false, true, _) => $k::<true, 2, false>($t, $b, $n),
+                (false, false, 1) => $k::<false, 1, false>($t, $b, $n),
+                (false, false, _) => $k::<false, 2, false>($t, $b, $n),
+                (true, true, 1) => $k::<true, 1, true>($t, $b, $n),
+                (true, true, _) => $k::<true, 2, true>($t, $b, $n),
+                (true, false, 1) => $k::<false, 1, true>($t, $b, $n),
+                (true, false, _) => $k::<false, 2, true>($t, $b, $n),
+            }
+        };
+    }
+
     pub(super) unsafe fn wdec_rows_sse2(
         top: &mut [u16],
         bot: &mut [u16],
         chunks: usize,
         unit: usize,
         w14: bool,
+        enc: bool,
     ) {
         let (t, b) = (top.as_mut_ptr(), bot.as_mut_ptr());
-        match (w14, unit) {
-            (true, 1) => wdec_sse2::<true, 1>(t, b, chunks),
-            (true, _) => wdec_sse2::<true, 2>(t, b, chunks),
-            (false, 1) => wdec_sse2::<false, 1>(t, b, chunks),
-            (false, _) => wdec_sse2::<false, 2>(t, b, chunks),
-        }
+        wav_call!(wdec_sse2, enc, w14, unit, t, b, chunks);
     }
 
     #[target_feature(enable = "avx2")]
@@ -903,24 +973,15 @@ mod x86 {
         chunks: usize,
         unit: usize,
         w14: bool,
+        enc: bool,
     ) {
         // 32-word chunks, then at most one 16-word chunk.
         let (t, b) = (top.as_mut_ptr(), bot.as_mut_ptr());
         let wide = chunks / 2;
-        match (w14, unit) {
-            (true, 1) => wdec_avx2::<true, 1>(t, b, wide),
-            (true, _) => wdec_avx2::<true, 2>(t, b, wide),
-            (false, 1) => wdec_avx2::<false, 1>(t, b, wide),
-            (false, _) => wdec_avx2::<false, 2>(t, b, wide),
-        }
+        wav_call!(wdec_avx2, enc, w14, unit, t, b, wide);
         if chunks % 2 == 1 {
             let (t, b) = (t.add(wide * 32), b.add(wide * 32));
-            match (w14, unit) {
-                (true, 1) => wdec_sse2::<true, 1>(t, b, 1),
-                (true, _) => wdec_sse2::<true, 2>(t, b, 1),
-                (false, 1) => wdec_sse2::<false, 1>(t, b, 1),
-                (false, _) => wdec_sse2::<false, 2>(t, b, 1),
-            }
+            wav_call!(wdec_sse2, enc, w14, unit, t, b, 1);
         }
     }
 

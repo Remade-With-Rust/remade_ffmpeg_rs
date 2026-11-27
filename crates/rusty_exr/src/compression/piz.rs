@@ -77,11 +77,28 @@ fn wav_encode(buf: &mut [u16], nx: usize, ox: usize, ny: usize, oy: usize, max: 
 }
 
 fn wav_encode_impl<const W14: bool>(buf: &mut [u16], nx: usize, ox: usize, ny: usize, oy: usize) {
-    let enc = if W14 { wenc14 } else { wenc16 };
     let n = nx.min(ny);
     let mut p = 1;
     let mut p2 = 2;
     while p2 <= n {
+        wav_encode_level::<W14>(buf, nx, ox, ny, oy, p, p2);
+        p = p2;
+        p2 <<= 1;
+    }
+}
+
+/// One level (step `p`) of the forward wavelet.
+fn wav_encode_level<const W14: bool>(
+    buf: &mut [u16],
+    nx: usize,
+    ox: usize,
+    ny: usize,
+    oy: usize,
+    p: usize,
+    p2: usize,
+) {
+    let enc = if W14 { wenc14 } else { wenc16 };
+    {
         let oy1 = oy * p;
         let oy2 = oy * p2;
         let ox1 = ox * p;
@@ -124,8 +141,90 @@ fn wav_encode_impl<const W14: bool>(buf: &mut [u16], nx: usize, ox: usize, ny: u
                 px += ox2;
             }
         }
+    }
+}
+
+/// Forward wavelet of one channel plane of `spp` interleaved word planes:
+/// the same result as [`wav_encode`] per word plane, with level 1 through
+/// the SIMD row kernel (the mirror of [`wav_decode_plane`]).
+fn wav_encode_plane(s: &mut [u16], nx: usize, ny: usize, spp: usize, max: u16) {
+    let isa = crate::simd::isa();
+    if isa == crate::simd::Isa::Scalar {
+        for off in 0..spp {
+            wav_encode(&mut s[off..], nx, spp, ny, nx * spp, max);
+        }
+    } else if max < (1 << 14) {
+        wav_encode_plane_impl::<true>(s, nx, ny, spp, isa);
+    } else {
+        wav_encode_plane_impl::<false>(s, nx, ny, spp, isa);
+    }
+}
+
+fn wav_encode_plane_impl<const W14: bool>(
+    s: &mut [u16],
+    nx: usize,
+    ny: usize,
+    spp: usize,
+    isa: crate::simd::Isa,
+) {
+    let (ox, oy) = (spp, nx * spp);
+    let n = nx.min(ny);
+    let mut p = 1;
+    let mut p2 = 2;
+    while p2 <= n {
+        if p == 1 {
+            wav_encode_level1::<W14>(s, nx, ny, spp, isa);
+        } else {
+            for off in 0..spp {
+                wav_encode_level::<W14>(&mut s[off..], nx, ox, ny, oy, p, p2);
+            }
+        }
         p = p2;
         p2 <<= 1;
+    }
+}
+
+/// Level 1 of [`wav_encode_level`] for every word plane at once.
+fn wav_encode_level1<const W14: bool>(
+    s: &mut [u16],
+    nx: usize,
+    ny: usize,
+    spp: usize,
+    isa: crate::simd::Isa,
+) {
+    let enc = if W14 { wenc14 } else { wenc16 };
+    let row = nx * spp;
+    let groups = nx / 2;
+    let mut py = 0;
+    while py + 2 * row <= ny * row {
+        let (top, bot) = s[py..py + 2 * row].split_at_mut(row);
+        let done = crate::simd::piz_wenc_rows(isa, top, bot, groups * 2 * spp, spp, W14);
+        for g in done / (2 * spp)..groups {
+            for off in 0..spp {
+                let x = g * 2 * spp + off;
+                let y = x + spp;
+                let (i00, i01) = enc(top[x], top[y]);
+                let (i10, i11) = enc(bot[x], bot[y]);
+                (top[x], bot[x]) = enc(i00, i10);
+                (top[y], bot[y]) = enc(i01, i11);
+            }
+        }
+        if nx & 1 != 0 {
+            for off in 0..spp {
+                let x = groups * 2 * spp + off;
+                (top[x], bot[x]) = enc(top[x], bot[x]);
+            }
+        }
+        py += 2 * row;
+    }
+    if ny & 1 != 0 {
+        let last = &mut s[py..py + row];
+        for g in 0..groups {
+            for off in 0..spp {
+                let x = g * 2 * spp + off;
+                (last[x], last[x + spp]) = enc(last[x], last[x + spp]);
+            }
+        }
     }
 }
 
@@ -426,17 +525,13 @@ pub(crate) fn compress(geom: &BlockGeom<'_>, raw: &[u8]) -> Vec<u8> {
         let spp = ch.ty.bytes() / 2;
         let count = ch.width * ch.height * spp;
         if count > 0 {
-            let s = &mut tmp[start..start + count];
-            for off in 0..spp {
-                wav_encode(
-                    &mut s[off..],
-                    ch.width,
-                    spp,
-                    ch.height,
-                    ch.width * spp,
-                    max_value,
-                );
-            }
+            wav_encode_plane(
+                &mut tmp[start..start + count],
+                ch.width,
+                ch.height,
+                spp,
+                max_value,
+            );
         }
         start += count;
     }
@@ -506,6 +601,23 @@ mod tests {
                     let mut got = orig.clone();
                     wav_decode_plane(&mut got, nx, ny, spp, max);
                     assert_eq!(got, want, "dispatch {nx}x{ny} spp {spp} max {max}");
+                    // Forward transform.
+                    let mut want = orig.clone();
+                    for off in 0..spp {
+                        wav_encode(&mut want[off..], nx, spp, ny, nx * spp, max);
+                    }
+                    for isa in crate::simd::available() {
+                        let mut got = orig.clone();
+                        if max < (1 << 14) {
+                            wav_encode_plane_impl::<true>(&mut got, nx, ny, spp, isa);
+                        } else {
+                            wav_encode_plane_impl::<false>(&mut got, nx, ny, spp, isa);
+                        }
+                        assert_eq!(got, want, "enc {isa:?} {nx}x{ny} spp {spp} max {max}");
+                    }
+                    let mut got = orig.clone();
+                    wav_encode_plane(&mut got, nx, ny, spp, max);
+                    assert_eq!(got, want, "enc dispatch {nx}x{ny} spp {spp} max {max}");
                 }
             }
         }
