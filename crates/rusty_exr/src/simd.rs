@@ -224,6 +224,59 @@ pub(crate) fn rgba_f16(
     true
 }
 
+// ---------------------------------------------------------------------------
+// DWA encode: block load (+ colour transform) and coefficient rounding.
+
+/// Load an 8x8 block of each component in `comps` (1 or 3; rows start at
+/// `row_starts[r]`, columns `x0..x0 + 8` contiguous) as floats, then for a
+/// triple apply the forward colour transform: the twin of
+/// `dwa_encode::gather_scalar`. Triples must hold finite halves (they come
+/// from the perceptual transfer table, whose outputs all are).
+pub(crate) fn dwa_enc_gather(
+    isa: Isa,
+    comps: &[Vec<u16>],
+    row_starts: &[usize; 8],
+    x0: usize,
+    blk: &mut [[f32; 64]; 3],
+) -> bool {
+    let n = comps.len();
+    assert!(n == 1 || n == 3);
+    for c in comps {
+        assert!(row_starts.iter().all(|&s| s + x0 + 8 <= c.len()));
+    }
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SSE2 is part of x86-64; every read is inside a component
+        // (checked above) and every write inside `blk`.
+        Isa::Sse2 => unsafe { x86::dwa_enc_gather_sse2(comps, row_starts, x0, blk) },
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: as above, and AVX2 + F16C were detected.
+        Isa::Avx2 => unsafe { x86::dwa_enc_gather_avx2(comps, row_starts, x0, blk) },
+        _ => return false,
+    }
+    true
+}
+
+/// `src[i] = f32_to_f16(d[i])`, `src_f[i] = f16_to_f32(src[i])`: the twin
+/// of `dwa_encode::round_scalar` (exact for every input, NaN included).
+pub(crate) fn dwa_enc_round(
+    isa: Isa,
+    d: &[f32; 64],
+    src: &mut [u16; 64],
+    src_f: &mut [f32; 64],
+) -> bool {
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SSE2 is part of x86-64; fixed-size arrays.
+        Isa::Sse2 => unsafe { x86::dwa_enc_round_sse2(d, src, src_f) },
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: AVX2 + F16C were detected; fixed-size arrays.
+        Isa::Avx2 => unsafe { x86::dwa_enc_round_avx2(d, src, src_f) },
+        _ => return false,
+    }
+    true
+}
+
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::wildcard_imports)]
 mod x86 {
@@ -1018,6 +1071,115 @@ mod x86 {
             i += 8;
         }
         rgba_tail(r, g, b, a, out, i);
+    }
+
+    // --- DWA encode ------------------------------------------------------------
+
+    macro_rules! enc_csc {
+        ($blk:expr, $n:literal, $load:ident, $store:ident, $add:ident, $sub:ident, $mul:ident,
+         $div:ident, $set1:ident) => {{
+            let blk = $blk;
+            for k in 0..64 / $n {
+                let r = $load(blk[0].as_ptr().add(k * $n));
+                let g = $load(blk[1].as_ptr().add(k * $n));
+                let b = $load(blk[2].as_ptr().add(k * $n));
+                let y = $add(
+                    $add($mul($set1(0.2126), r), $mul($set1(0.7152), g)),
+                    $mul($set1(0.0722), b),
+                );
+                $store(blk[0].as_mut_ptr().add(k * $n), y);
+                $store(
+                    blk[1].as_mut_ptr().add(k * $n),
+                    $div($sub(b, y), $set1(1.8556)),
+                );
+                $store(
+                    blk[2].as_mut_ptr().add(k * $n),
+                    $div($sub(r, y), $set1(1.5747)),
+                );
+            }
+        }};
+    }
+
+    pub(super) unsafe fn dwa_enc_gather_sse2(
+        comps: &[Vec<u16>],
+        row_starts: &[usize; 8],
+        x0: usize,
+        blk: &mut [[f32; 64]; 3],
+    ) {
+        let z = _mm_setzero_si128();
+        for (c, comp) in comps.iter().enumerate() {
+            for (r, &s) in row_starts.iter().enumerate() {
+                let v = _mm_loadu_si128(comp.as_ptr().add(s + x0).cast());
+                _mm_storeu_ps(
+                    blk[c].as_mut_ptr().add(r * 8),
+                    h2f4(_mm_unpacklo_epi16(v, z)),
+                );
+                _mm_storeu_ps(
+                    blk[c].as_mut_ptr().add(r * 8 + 4),
+                    h2f4(_mm_unpackhi_epi16(v, z)),
+                );
+            }
+        }
+        if comps.len() == 3 {
+            enc_csc!(
+                blk,
+                4,
+                _mm_loadu_ps,
+                _mm_storeu_ps,
+                _mm_add_ps,
+                _mm_sub_ps,
+                _mm_mul_ps,
+                _mm_div_ps,
+                _mm_set1_ps
+            );
+        }
+    }
+
+    #[target_feature(enable = "avx2,f16c")]
+    pub(super) unsafe fn dwa_enc_gather_avx2(
+        comps: &[Vec<u16>],
+        row_starts: &[usize; 8],
+        x0: usize,
+        blk: &mut [[f32; 64]; 3],
+    ) {
+        for (c, comp) in comps.iter().enumerate() {
+            for (r, &s) in row_starts.iter().enumerate() {
+                let v = _mm_loadu_si128(comp.as_ptr().add(s + x0).cast());
+                _mm256_storeu_ps(blk[c].as_mut_ptr().add(r * 8), _mm256_cvtph_ps(v));
+            }
+        }
+        if comps.len() == 3 {
+            enc_csc!(
+                blk,
+                8,
+                _mm256_loadu_ps,
+                _mm256_storeu_ps,
+                _mm256_add_ps,
+                _mm256_sub_ps,
+                _mm256_mul_ps,
+                _mm256_div_ps,
+                _mm256_set1_ps
+            );
+        }
+    }
+
+    pub(super) unsafe fn dwa_enc_round_sse2(
+        d: &[f32; 64],
+        src: &mut [u16; 64],
+        src_f: &mut [f32; 64],
+    ) {
+        f2h64_sse2(d, src);
+        h2f64_sse2(src, src_f);
+    }
+
+    #[target_feature(enable = "avx2,f16c")]
+    pub(super) unsafe fn dwa_enc_round_avx2(
+        d: &[f32; 64],
+        src: &mut [u16; 64],
+        src_f: &mut [f32; 64],
+    ) {
+        f2h64_f16c(d, src);
+        h2f64_f16c(src, src_f);
     }
 
     // --- test hooks -------------------------------------------------------

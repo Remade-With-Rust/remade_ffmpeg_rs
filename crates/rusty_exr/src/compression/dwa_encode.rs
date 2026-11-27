@@ -550,6 +550,44 @@ fn mirror(index: usize, len: usize) -> usize {
     v as usize
 }
 
+/// Load one 8x8 block of every component (`rows`/`cols`: mirrored sample
+/// indices) as floats, then for a triple apply `exr`'s forward colour
+/// transform. The oracle of `simd::dwa_enc_gather`.
+pub(crate) fn gather_scalar(
+    comps: &[Vec<u16>],
+    width: usize,
+    rows: &[usize; 8],
+    cols: &[usize; 8],
+    blk: &mut [[f32; 64]; 3],
+) {
+    for (c, comp) in comps.iter().enumerate() {
+        for (r, &sy) in rows.iter().enumerate() {
+            let line = &comp[sy * width..(sy + 1) * width];
+            for (k, &sx) in cols.iter().enumerate() {
+                blk[c][r * 8 + k] = f16_to_f32(line[sx]);
+            }
+        }
+    }
+    if comps.len() == 3 {
+        for i in 0..64 {
+            let (r, g, b) = (blk[0][i], blk[1][i], blk[2][i]);
+            let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            blk[0][i] = y;
+            blk[1][i] = (b - y) / 1.8556;
+            blk[2][i] = (r - y) / 1.5747;
+        }
+    }
+}
+
+/// Round DCT coefficients to halves and convert those back to floats
+/// (the oracle of `simd::dwa_enc_round`).
+pub(crate) fn round_scalar(d: &[f32; 64], src: &mut [u16; 64], src_f: &mut [f32; 64]) {
+    for i in 0..64 {
+        src[i] = f32_to_f16(d[i]);
+        src_f[i] = f16_to_f32(src[i]);
+    }
+}
+
 /// Encode one standalone channel (1 component) or one R/G/B triple.
 fn encode_group(
     comps: &[Vec<u16>],
@@ -570,25 +608,15 @@ fn encode_group(
     let cols: Vec<[usize; 8]> = (0..bx)
         .map(|x| std::array::from_fn(|k| mirror(x * 8 + k, width)))
         .collect();
+    let isa = crate::simd::isa();
     for yb in 0..by {
         let rows: [usize; 8] = std::array::from_fn(|k| mirror(yb * 8 + k, height));
+        let row_starts = rows.map(|sy| sy * width);
         for (xb, blk) in blocks.iter_mut().enumerate() {
-            for (c, comp) in comps.iter().enumerate() {
-                for (r, &sy) in rows.iter().enumerate() {
-                    let line = &comp[sy * width..(sy + 1) * width];
-                    for (k, &sx) in cols[xb].iter().enumerate() {
-                        blk[c][r * 8 + k] = f16_to_f32(line[sx]);
-                    }
-                }
-            }
-            if n == 3 {
-                for i in 0..64 {
-                    let (r, g, b) = (blk[0][i], blk[1][i], blk[2][i]);
-                    let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-                    blk[0][i] = y;
-                    blk[1][i] = (b - y) / 1.8556;
-                    blk[2][i] = (r - y) / 1.5747;
-                }
+            // Blocks clear of the right edge have contiguous columns.
+            let contiguous = xb * 8 + 8 <= width;
+            if !(contiguous && crate::simd::dwa_enc_gather(isa, comps, &row_starts, xb * 8, blk)) {
+                gather_scalar(comps, width, &rows, &cols[xb], blk);
             }
             for d in blk.iter_mut().take(n) {
                 dct_forward(d);
@@ -599,12 +627,16 @@ fn encode_group(
                 } else {
                     (&q.cbcr, &q.half_cbcr)
                 };
+                // The coefficients rounded to halves, and back to floats.
+                let mut src = [0u16; 64];
+                let mut src_f = [0f32; 64];
+                if !crate::simd::dwa_enc_round(isa, d, &mut src, &mut src_f) {
+                    round_scalar(d, &mut src, &mut src_f);
+                }
                 let mut z = [0u16; 64];
                 for i in 0..64 {
-                    let src = f32_to_f16(d[i]);
                     z[ZIGZAG[i]] =
-                        quantize(u32::from(src), u32::from(htol[i]), tol[i], f16_to_f32(src))
-                            as u16;
+                        quantize(u32::from(src[i]), u32::from(htol[i]), tol[i], src_f[i]) as u16;
                 }
                 group_dc[c].push(z[0]);
                 rle_ac(&z, ac);
@@ -773,6 +805,80 @@ mod tests {
         #[cfg(any(windows, all(target_os = "linux", target_env = "gnu")))]
         assert_eq!(diff, 0);
         let _ = diff;
+    }
+
+    #[test]
+    fn gather_and_round_twins_match_scalar() {
+        let mut seed = 0x5151_aaaau64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let lut = to_nonlinear();
+        // Transfer-table outputs (what triples see) are all finite.
+        assert!(lut.iter().all(|&h| h & 0x7c00 != 0x7c00));
+        let (w, h) = (37usize, 21usize);
+        for n in [1usize, 3] {
+            for round in 0..200 {
+                let comps: Vec<Vec<u16>> = (0..n)
+                    .map(|_| {
+                        (0..w * h)
+                            .map(|_| {
+                                let v = next() as u16;
+                                // Triples carry transfer-table halves.
+                                if n == 3 || round % 2 == 0 {
+                                    lut[v as usize]
+                                } else {
+                                    v
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                for yb in 0..h.div_ceil(8) {
+                    let rows: [usize; 8] = std::array::from_fn(|k| mirror(yb * 8 + k, h));
+                    let starts = rows.map(|sy| sy * w);
+                    for xb in 0..w / 8 {
+                        let cols: [usize; 8] = std::array::from_fn(|k| xb * 8 + k);
+                        let mut want = [[0f32; 64]; 3];
+                        gather_scalar(&comps, w, &rows, &cols, &mut want);
+                        for isa in crate::simd::available() {
+                            let mut got = [[0f32; 64]; 3];
+                            assert!(crate::simd::dwa_enc_gather(
+                                isa,
+                                &comps,
+                                &starts,
+                                xb * 8,
+                                &mut got
+                            ));
+                            for c in 0..n {
+                                let same = want[c]
+                                    .iter()
+                                    .zip(&got[c])
+                                    .all(|(a, b)| a.to_bits() == b.to_bits());
+                                assert!(same, "{isa:?} n {n} block {xb},{yb}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for _ in 0..20_000 {
+            let d: [f32; 64] = std::array::from_fn(|_| f32::from_bits(next() as u32));
+            let (mut s0, mut f0) = ([0u16; 64], [0f32; 64]);
+            round_scalar(&d, &mut s0, &mut f0);
+            for isa in crate::simd::available() {
+                let (mut s1, mut f1) = ([0u16; 64], [0f32; 64]);
+                assert!(crate::simd::dwa_enc_round(isa, &d, &mut s1, &mut f1));
+                assert_eq!(s0, s1, "{isa:?}");
+                assert!(
+                    f0.iter().zip(&f1).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{isa:?}"
+                );
+            }
+        }
     }
 
     #[test]
