@@ -288,6 +288,18 @@ pub(crate) fn decompress_into(
     out: &mut Vec<u16>,
     hs: &mut HufScratch,
 ) -> Result<()> {
+    decompress_with(data, out_len, out, hs, true)
+}
+
+/// [`decompress_into`] with the unchecked fast prefix on or off (off: the
+/// checked loop alone decodes everything, which is the oracle).
+fn decompress_with(
+    data: &[u8],
+    out_len: usize,
+    out: &mut Vec<u16>,
+    hs: &mut HufScratch,
+    fast: bool,
+) -> Result<()> {
     let (_, imax, code, n_bits) = read_tables(data, &mut hs.codes)?;
     let dec = build_dec_table(&hs.codes, &mut hs.short, &mut hs.syms)?;
     let rlc = imax as u32;
@@ -297,7 +309,65 @@ pub(crate) fn decompress_into(
     out.resize(out_len, 0);
     let mut pos = 0usize;
     let mut bits = BitIn::new(code);
-    let mut left = n_bits;
+    // Fast loop: while the read position is at least 16 bytes before the
+    // last whole byte of code bits, no code or run count can run past the
+    // bit count (the buffer never holds more than 64 bits beyond the read
+    // position), so the per-symbol budget checks of the loop below cannot
+    // fire and are skipped. It stops at the first entry it cannot decode
+    // from the short table without a check (invalid codes), leaving that
+    // symbol, and the stream's end, to the checked loop.
+    let whole = (n_bits / 8) as usize;
+    let safe_bytes = whole.saturating_sub(16);
+    if fast && whole >= 24 {
+        loop {
+            if bits.count < 32 {
+                if bits.byte > safe_bytes {
+                    break;
+                }
+                bits.refill();
+            }
+            let e = dec.short[bits.peek(DEC_BITS) as usize];
+            let (sym, l) = if e & 0xff != 0 {
+                (e >> 8, e & 0xff)
+            } else if e == LONG {
+                if bits.byte > safe_bytes {
+                    break;
+                }
+                bits.refill();
+                decode_long(&dec, &bits)?
+            } else {
+                break;
+            };
+            bits.consume(l);
+            if sym == rlc {
+                // After a short code at least 32 - 14 bits remain; after a long
+                // one the buffer may need topping up (the read position stays
+                // within 15 bytes of the last check, inside the code bytes).
+                if bits.count < 8 {
+                    bits.refill();
+                }
+                let n = bits.peek(8) as usize;
+                bits.consume(8);
+                if pos == 0 {
+                    return Err(Error::invalid("Huffman run with nothing to repeat"));
+                }
+                if pos + n > out_len {
+                    return Err(Error::invalid("Huffman data longer than expected"));
+                }
+                let last = out[pos - 1];
+                out[pos..pos + n].fill(last);
+                pos += n;
+            } else {
+                let Some(slot) = out.get_mut(pos) else {
+                    return Err(Error::invalid("Huffman data longer than expected"));
+                };
+                *slot = sym as u16;
+                pos += 1;
+            }
+        }
+    }
+    // The checked loop finishes from the exact same state.
+    let mut left = n_bits - (8 * bits.byte as u64 - u64::from(bits.count));
     while left > 0 {
         // 32 bits cover a short code (<= 14) and a run count (8).
         if bits.count < 32 {
@@ -744,6 +814,68 @@ mod tests {
         assert!(longest > u64::from(DEC_BITS), "longest code {longest}");
         assert_eq!(decompress(&z, data.len()).unwrap(), data);
         assert_eq!(decompress_reference(&z, data.len()).unwrap(), data);
+    }
+
+    /// Corrupted and truncated streams: the fast prefix and the checked
+    /// loop alone agree on every output and on every error.
+    #[test]
+    fn damaged_streams_match_reference() {
+        let mut seed = 4242;
+        let mut cases: Vec<Vec<u16>> = Vec::new();
+        for k in 0..12 {
+            let n = 200 + (lcg(&mut seed) % 4000) as usize;
+            let spread = [3u32, 40, 700, 65536][k % 4];
+            cases.push(
+                (0..n)
+                    .map(|i| {
+                        let r = lcg(&mut seed);
+                        if i % 37 < 20 {
+                            5
+                        } else {
+                            ((r % spread) * (r % 5 + 1) / 5) as u16
+                        }
+                    })
+                    .collect(),
+            );
+        }
+        let mut geo = Vec::new();
+        for k in 0..18u16 {
+            geo.extend(std::iter::repeat_n(k * 5 + 2, 1usize << (17 - k)));
+        }
+        cases.push(geo);
+        for c in &cases {
+            let z = compress(c).unwrap();
+            for t in 0..120 {
+                let mut d = z.clone();
+                match t % 4 {
+                    0 => {
+                        let i = 20 + (lcg(&mut seed) as usize) % (d.len() - 20);
+                        d[i] ^= 1 << (lcg(&mut seed) % 8);
+                    }
+                    1 => d.truncate(20 + (lcg(&mut seed) as usize) % (d.len() - 20)),
+                    2 => {
+                        let i = 20 + (lcg(&mut seed) as usize) % (d.len() - 20);
+                        d[i] = lcg(&mut seed) as u8;
+                    }
+                    _ => {}
+                }
+                for len in [c.len(), c.len() - 1, c.len() + 1] {
+                    let (mut a, mut b) = (Vec::new(), Vec::new());
+                    let ra = decompress_with(&d, len, &mut a, &mut HufScratch::default(), true);
+                    let rb = decompress_with(&d, len, &mut b, &mut HufScratch::default(), false);
+                    assert_eq!(
+                        ra.as_ref().err().map(ToString::to_string),
+                        rb.as_ref().err().map(ToString::to_string),
+                        "case len {} t {t} out {len}",
+                        c.len()
+                    );
+                    if ra.is_ok() {
+                        assert_eq!(a, b, "case len {} t {t} out {len}", c.len());
+                        assert_eq!(decompress_reference(&d, len).ok(), Some(a));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
