@@ -288,6 +288,18 @@ pub(crate) fn decompress_into(
     out: &mut Vec<u16>,
     hs: &mut HufScratch,
 ) -> Result<()> {
+    decompress_with(data, out_len, out, hs, true)
+}
+
+/// [`decompress_into`] with the unchecked fast prefix on or off (off: the
+/// checked loop alone decodes everything, which is the oracle).
+fn decompress_with(
+    data: &[u8],
+    out_len: usize,
+    out: &mut Vec<u16>,
+    hs: &mut HufScratch,
+    fast: bool,
+) -> Result<()> {
     let (_, imax, code, n_bits) = read_tables(data, &mut hs.codes)?;
     let dec = build_dec_table(&hs.codes, &mut hs.short, &mut hs.syms)?;
     let rlc = imax as u32;
@@ -297,7 +309,19 @@ pub(crate) fn decompress_into(
     out.resize(out_len, 0);
     let mut pos = 0usize;
     let mut bits = BitIn::new(code);
-    let mut left = n_bits;
+    // Fast loop: while the read position is at least 16 bytes before the
+    // last whole byte of code bits, no code or run count can run past the
+    // bit count (the buffer never holds more than 64 bits beyond the read
+    // position), so the per-symbol budget checks of the loop below cannot
+    // fire and are skipped. It stops at the first entry it cannot decode
+    // from the short table without a check (invalid codes), leaving that
+    // symbol, and the stream's end, to the checked loop.
+    let whole = (n_bits / 8) as usize;
+    if fast && whole >= 24 {
+        pos = fast_prefix(&dec, rlc, &mut bits, out, whole - 16)?;
+    }
+    // The checked loop finishes from the exact same state.
+    let mut left = n_bits - (8 * bits.byte as u64 - u64::from(bits.count));
     while left > 0 {
         // 32 bits cover a short code (<= 14) and a run count (8).
         if bits.count < 32 {
@@ -348,6 +372,85 @@ pub(crate) fn decompress_into(
         )));
     }
     Ok(())
+}
+
+/// The unchecked fast prefix of [`decompress_with`]: decodes from the start
+/// while the read position is at most `safe_bytes` (16 bytes before the
+/// last whole byte of code bits), where no code or run count can run past
+/// the bit count (the buffer never holds more than 64 bits beyond the read
+/// position), so the budget checks of the checked loop cannot fire. Stops
+/// at the first entry it cannot decode from the tables without a check
+/// (invalid codes) and returns the output position; `bits` is left in the
+/// matching state for the checked loop. Its own function, with the table
+/// as a fixed-size array, the output as a slice and the bit state in
+/// locals, so the hot path keeps all of them in registers (as part of
+/// `decompress_with` the output pointer and length were reloaded, the
+/// table index bounds-checked and the position spilled, every symbol).
+#[inline(never)]
+fn fast_prefix(
+    dec: &DecTable<'_>,
+    rlc: u32,
+    state: &mut BitIn<'_>,
+    out: &mut [u16],
+    safe_bytes: usize,
+) -> Result<usize> {
+    let short: &[u32; DEC_SIZE] = dec.short.try_into().expect("full short table");
+    let mut bits = BitIn {
+        data: state.data,
+        byte: state.byte,
+        buf: state.buf,
+        count: state.count,
+    };
+    let out_len = out.len();
+    let mut pos = 0usize;
+    loop {
+        if bits.count < 32 {
+            if bits.byte > safe_bytes {
+                break;
+            }
+            bits.refill();
+        }
+        let e = short[bits.peek(DEC_BITS) as usize];
+        let (sym, l) = if e & 0xff != 0 {
+            (e >> 8, e & 0xff)
+        } else if e == LONG {
+            if bits.byte > safe_bytes {
+                break;
+            }
+            bits.refill();
+            decode_long(dec, &bits)?
+        } else {
+            break;
+        };
+        bits.consume(l);
+        if sym == rlc {
+            // After a short code at least 32 - 14 bits remain; after a long
+            // one the buffer may need topping up (the read position stays
+            // within 15 bytes of the last check, inside the code bytes).
+            if bits.count < 8 {
+                bits.refill();
+            }
+            let n = bits.peek(8) as usize;
+            bits.consume(8);
+            if pos == 0 {
+                return Err(Error::invalid("Huffman run with nothing to repeat"));
+            }
+            if pos + n > out_len {
+                return Err(Error::invalid("Huffman data longer than expected"));
+            }
+            let last = out[pos - 1];
+            out[pos..pos + n].fill(last);
+            pos += n;
+        } else {
+            let Some(slot) = out.get_mut(pos) else {
+                return Err(Error::invalid("Huffman data longer than expected"));
+            };
+            *slot = sym as u16;
+            pos += 1;
+        }
+    }
+    *state = bits;
+    Ok(pos)
 }
 
 /// The code longer than `DEC_BITS` at the head of the stream.
@@ -461,7 +564,11 @@ thread_local! {
 /// `length | code << 6` entries. `s.used` ends up holding every symbol with
 /// an entry, ascending. Returns the symbol range `(im, iM)`.
 fn build_enc_table(s: &mut EncScratch, data: &[u16]) -> Result<(usize, usize)> {
-    let (t, links, used) = (&mut s.table, &mut s.links, &mut s.used);
+    // Fixed-size views: every u16 symbol indexes them without a bounds
+    // check, and their pointers stay in registers across the pushes.
+    let t: &mut [u64; ENC_SIZE] = s.table.as_mut_slice().try_into().expect("ENC_SIZE table");
+    let links: &mut [u32; ENC_SIZE] = s.links.as_mut_slice().try_into().expect("ENC_SIZE links");
+    let used = &mut s.used;
     used.clear();
     for &v in data {
         let e = &mut t[v as usize];
@@ -535,17 +642,50 @@ fn build_enc_table(s: &mut EncScratch, data: &[u16]) -> Result<(usize, usize)> {
     Ok((im, imax))
 }
 
-struct BitOut {
-    out: Vec<u8>,
+/// The bit writer. It holds the output by reference, so that appending
+/// (which may grow the vector) does not take the writer's own address and
+/// the accumulator stays in registers.
+struct BitOut<'a> {
+    out: &'a mut Vec<u8>,
     bits: u64,
     count: u64,
 }
 
-impl BitOut {
+impl BitOut<'_> {
+    /// Append the low `n` bits of `v`, writing whole bytes as soon as they
+    /// are complete (the reference formulation, and the oracle of
+    /// [`Self::put`]). With more than 56 bits pending the top bits fall off
+    /// the 64-bit accumulator, exactly as in the `exr` crate.
     #[inline(always)]
-    fn put(&mut self, n: u64, v: u64) {
+    fn put_bytewise(&mut self, n: u64, v: u64) {
         self.bits = (self.bits << n) | v;
         self.count += n;
+        while self.count >= 8 {
+            self.count -= 8;
+            self.out.push((self.bits >> self.count) as u8);
+        }
+    }
+    /// [`Self::put_bytewise`], writing 32 bits at a time. Codes of up to 32
+    /// bits accumulate in up to 63 bits (no loss); longer codes first drain
+    /// to under 8 pending bits and then take the bytewise path, so even the
+    /// accumulator overflow of 57- and 58-bit codes matches.
+    #[inline(always)]
+    fn put(&mut self, n: u64, v: u64) {
+        if n > 32 {
+            self.drain();
+            self.put_bytewise(n, v);
+            return;
+        }
+        self.bits = (self.bits << n) | v;
+        self.count += n;
+        if self.count >= 32 {
+            self.count -= 32;
+            self.out
+                .extend_from_slice(&((self.bits >> self.count) as u32).to_be_bytes());
+        }
+    }
+    /// Write the complete pending bytes (leaving under 8 bits pending).
+    fn drain(&mut self) {
         while self.count >= 8 {
             self.count -= 8;
             self.out.push((self.bits >> self.count) as u8);
@@ -556,6 +696,7 @@ impl BitOut {
         self.put(hlen(e), hcode(e));
     }
     fn flush(&mut self) {
+        self.drain();
         if self.count > 0 {
             self.out.push((self.bits << (8 - self.count)) as u8);
         }
@@ -564,7 +705,7 @@ impl BitOut {
 
 fn pack_table(enc: &[u64], im: usize, imax: usize, out: &mut Vec<u8>) {
     let mut w = BitOut {
-        out: std::mem::take(out),
+        out,
         bits: 0,
         count: 0,
     };
@@ -595,11 +736,10 @@ fn pack_table(enc: &[u64], im: usize, imax: usize, out: &mut Vec<u8>) {
         i += 1;
     }
     w.flush();
-    *out = w.out;
 }
 
 #[inline(always)]
-fn send(w: &mut BitOut, sc: u64, run: u64, rc: u64) {
+fn send(w: &mut BitOut<'_>, sc: u64, run: u64, rc: u64) {
     if run == 0 {
         w.code(sc);
     } else if hlen(sc) + hlen(rc) + 8 < hlen(sc) * run {
@@ -631,17 +771,17 @@ pub(crate) fn compress(data: &[u16]) -> Result<Vec<u8>> {
 
 fn compress_with(s: &mut EncScratch, data: &[u16]) -> Result<Vec<u8>> {
     let (im, imax) = build_enc_table(s, data)?;
-    let enc = &s.table;
+    let enc: &[u64; ENC_SIZE] = s.table.as_slice().try_into().expect("ENC_SIZE table");
     let mut out = vec![0u8; 20];
     pack_table(enc, im, imax, &mut out);
     let table_len = out.len() - 20;
     let data_start = out.len();
+    out.reserve(data.len() + data.len() / 2);
     let mut w = BitOut {
-        out,
+        out: &mut out,
         bits: 0,
         count: 0,
     };
-    w.out.reserve(data.len() + data.len() / 2);
     let rc = enc[imax];
     let mut sym = data[0];
     let mut run = 0u64;
@@ -657,7 +797,6 @@ fn compress_with(s: &mut EncScratch, data: &[u16]) -> Result<Vec<u8>> {
     send(&mut w, enc[sym as usize], run, rc);
     let n_bits = (w.out.len() - data_start) as u64 * 8 + w.count;
     w.flush();
-    let mut out = w.out;
     for (k, v) in [im as u32, imax as u32, table_len as u32, n_bits as u32, 0]
         .into_iter()
         .enumerate()
@@ -744,6 +883,101 @@ mod tests {
         assert!(longest > u64::from(DEC_BITS), "longest code {longest}");
         assert_eq!(decompress(&z, data.len()).unwrap(), data);
         assert_eq!(decompress_reference(&z, data.len()).unwrap(), data);
+    }
+
+    /// Corrupted and truncated streams: the fast prefix and the checked
+    /// loop alone agree on every output and on every error.
+    #[test]
+    fn damaged_streams_match_reference() {
+        let mut seed = 4242;
+        let mut cases: Vec<Vec<u16>> = Vec::new();
+        for k in 0..12 {
+            let n = 200 + (lcg(&mut seed) % 4000) as usize;
+            let spread = [3u32, 40, 700, 65536][k % 4];
+            cases.push(
+                (0..n)
+                    .map(|i| {
+                        let r = lcg(&mut seed);
+                        if i % 37 < 20 {
+                            5
+                        } else {
+                            ((r % spread) * (r % 5 + 1) / 5) as u16
+                        }
+                    })
+                    .collect(),
+            );
+        }
+        let mut geo = Vec::new();
+        for k in 0..18u16 {
+            geo.extend(std::iter::repeat_n(k * 5 + 2, 1usize << (17 - k)));
+        }
+        cases.push(geo);
+        for c in &cases {
+            let z = compress(c).unwrap();
+            for t in 0..120 {
+                let mut d = z.clone();
+                match t % 4 {
+                    0 => {
+                        let i = 20 + (lcg(&mut seed) as usize) % (d.len() - 20);
+                        d[i] ^= 1 << (lcg(&mut seed) % 8);
+                    }
+                    1 => d.truncate(20 + (lcg(&mut seed) as usize) % (d.len() - 20)),
+                    2 => {
+                        let i = 20 + (lcg(&mut seed) as usize) % (d.len() - 20);
+                        d[i] = lcg(&mut seed) as u8;
+                    }
+                    _ => {}
+                }
+                for len in [c.len(), c.len() - 1, c.len() + 1] {
+                    let (mut a, mut b) = (Vec::new(), Vec::new());
+                    let ra = decompress_with(&d, len, &mut a, &mut HufScratch::default(), true);
+                    let rb = decompress_with(&d, len, &mut b, &mut HufScratch::default(), false);
+                    assert_eq!(
+                        ra.as_ref().err().map(ToString::to_string),
+                        rb.as_ref().err().map(ToString::to_string),
+                        "case len {} t {t} out {len}",
+                        c.len()
+                    );
+                    if ra.is_ok() {
+                        assert_eq!(a, b, "case len {} t {t} out {len}", c.len());
+                        assert_eq!(decompress_reference(&d, len).ok(), Some(a));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bit_writer_matches_bytewise() {
+        let mut seed = 77;
+        for case in 0..400 {
+            let (mut oa, mut ob) = (Vec::new(), Vec::new());
+            let mut a = BitOut {
+                out: &mut oa,
+                bits: 0,
+                count: 0,
+            };
+            let mut b = BitOut {
+                out: &mut ob,
+                bits: 0,
+                count: 0,
+            };
+            let max = [8u64, 20, 32, 58][case % 4];
+            for _ in 0..(lcg(&mut seed) % 300) {
+                let n = 1 + u64::from(lcg(&mut seed)) % max;
+                let v = (u64::from(lcg(&mut seed)) << 32 | u64::from(lcg(&mut seed)))
+                    & ((1u64 << n) - 1);
+                a.put(n, v);
+                b.put_bytewise(n, v);
+                assert_eq!(
+                    a.out.len() as u64 * 8 + a.count,
+                    b.out.len() as u64 * 8 + b.count
+                );
+            }
+            a.flush();
+            b.flush();
+            assert_eq!(a.out, b.out, "case {case}");
+        }
     }
 
     #[test]

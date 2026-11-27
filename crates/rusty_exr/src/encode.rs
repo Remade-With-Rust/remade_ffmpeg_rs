@@ -329,7 +329,7 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
 
     // Chunks.
     let tiled = opts.tiles.is_some();
-    let compress_one = |i: usize| -> Result<Vec<u8>> {
+    let compress_one = |i: usize, work: &mut compression::Work| -> Result<Vec<u8>> {
         let (tx, ty) = (i % ntx, i / ntx);
         let x_off = tx * tw;
         let width = tw.min(w - x_off);
@@ -360,7 +360,15 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
             chans,
             raw_size,
         };
-        let mut raw = vec![0u8; raw_size];
+        // The worker's raw buffer, reused: every byte below is written. An
+        // uncompressed chunk is built in a fresh buffer that is stored as is
+        // (`vec!` takes the allocator's zeroed path, cheaper than `resize`).
+        let mut buf = if comp == Compression::None {
+            vec![0u8; raw_size]
+        } else {
+            std::mem::take(&mut work.raw)
+        };
+        let raw = compression::grow(&mut buf, raw_size);
         let mut o = 0usize;
         for line in 0..lines {
             let y = y0 + line as i32;
@@ -394,14 +402,20 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
                 }
             }
         }
-        compression::compress(comp, &geom, raw, opts.deflate, dwa_level)
+        if comp == Compression::None {
+            return Ok(buf);
+        }
+        let packed = compression::compress(comp, &geom, raw, opts.deflate, dwa_level, work);
+        work.raw = buf;
+        packed
     };
 
     let nthreads = opts.threads.resolve().min(nchunks).max(1);
     let mut packed: Vec<Option<Vec<u8>>> = vec![None; nchunks];
     if nthreads == 1 {
+        let mut work = compression::Work::default();
         for (i, slot) in packed.iter_mut().enumerate() {
-            *slot = Some(compress_one(i)?);
+            *slot = Some(compress_one(i, &mut work)?);
         }
     } else {
         let next = AtomicUsize::new(0);
@@ -410,12 +424,13 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
                 .map(|_| {
                     s.spawn(|| {
                         let mut v = Vec::new();
+                        let mut work = compression::Work::default();
                         loop {
                             let k = next.fetch_add(1, Ordering::Relaxed);
                             if k >= nchunks {
                                 break;
                             }
-                            v.push((k, compress_one(k)));
+                            v.push((k, compress_one(k, &mut work)));
                         }
                         v
                     })

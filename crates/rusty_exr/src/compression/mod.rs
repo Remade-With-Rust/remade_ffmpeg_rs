@@ -99,9 +99,10 @@ impl BlockGeom<'_> {
         out
     }
 
-    /// The inverse of [`Self::planar_to_raw`].
-    pub fn raw_to_planar(&self, raw: &[u8]) -> Vec<u8> {
-        let mut out = vec![0u8; self.raw_size];
+    /// The inverse of [`Self::planar_to_raw`], into `out` (exactly
+    /// `raw_size` bytes, every one written).
+    pub fn raw_to_planar_into(&self, raw: &[u8], out: &mut [u8]) {
+        assert_eq!(out.len(), self.raw_size);
         let mut starts = Vec::with_capacity(self.chans.len());
         let mut s = 0;
         for c in &self.chans {
@@ -121,8 +122,31 @@ impl BlockGeom<'_> {
                 o += n;
             }
         }
-        out
     }
+}
+
+/// Per-worker encoder buffers, kept from chunk to chunk: they only grow,
+/// and each use overwrites every element it reads, so no chunk pays for an
+/// allocation or a zero fill (each was a fresh zeroed `Vec` per chunk).
+#[derive(Default)]
+pub(crate) struct Work {
+    /// The chunk's raw layout (filled by the writer).
+    pub raw: Vec<u8>,
+    /// Channel-planar bytes (B44, DWA).
+    pub planar: Vec<u8>,
+    /// Channel-planar 16-bit words (PIZ).
+    pub words: Vec<u16>,
+    /// Byte-plane split + predictor output (ZIP, RLE).
+    pub prep: Vec<u8>,
+}
+
+/// The first `n` elements of `v`, growing it (zero-filled) only when it is
+/// shorter. Callers overwrite every element they read.
+pub(crate) fn grow<T: Copy + Default>(v: &mut Vec<T>, n: usize) -> &mut [T] {
+    if v.len() < n {
+        v.resize(n, T::default());
+    }
+    &mut v[..n]
 }
 
 /// Per-worker reusable decode state: buffers that keep their capacity
@@ -273,8 +297,9 @@ pub(crate) fn decompress_layout<'a>(
             Ok(Layout::Raw(&scratch.a))
         }
         Compression::B44 | Compression::B44a => {
-            scratch.a = b44::decompress(geom, data)?;
-            Ok(Layout::Planar(&scratch.a))
+            // The worker's buffer, reused: every byte is written.
+            b44::decompress(geom, data, grow(&mut scratch.a, geom.raw_size))?;
+            Ok(Layout::Planar(&scratch.a[..geom.raw_size]))
         }
         Compression::Dwaa | Compression::Dwab => {
             scratch.a = dwa::decompress(geom, data)?;
@@ -313,25 +338,26 @@ pub(crate) fn decompress(
 pub(crate) fn compress(
     compression: Compression,
     geom: &BlockGeom<'_>,
-    raw: Vec<u8>,
+    raw: &[u8],
     deflater: crate::Deflate,
     dwa_level: f32,
+    work: &mut Work,
 ) -> Result<Vec<u8>> {
     debug_assert_eq!(raw.len(), geom.raw_size);
     let packed = match compression {
-        Compression::None => return Ok(raw),
-        Compression::Rle => rle::compress(&raw),
-        Compression::Zips | Compression::Zip => zip::compress(&raw, deflater),
-        Compression::Piz => piz::compress(geom, &raw),
-        Compression::Pxr24 => pxr24::compress(geom, &raw, deflater),
-        Compression::B44 => b44::compress(geom, &raw, false),
-        Compression::B44a => b44::compress(geom, &raw, true),
-        Compression::Dwaa | Compression::Dwab => dwa_encode::compress(geom, &raw, dwa_level)?,
+        Compression::None => return Ok(raw.to_vec()),
+        Compression::Rle => rle::compress(raw, work),
+        Compression::Zips | Compression::Zip => zip::compress(raw, deflater, work),
+        Compression::Piz => piz::compress(geom, raw, work),
+        Compression::Pxr24 => pxr24::compress(geom, raw, deflater),
+        Compression::B44 => b44::compress(geom, raw, false, work),
+        Compression::B44a => b44::compress(geom, raw, true, work),
+        Compression::Dwaa | Compression::Dwab => dwa_encode::compress(geom, raw, dwa_level, work)?,
     };
     if packed.len() < raw.len() {
         Ok(packed)
     } else {
-        Ok(raw)
+        Ok(raw.to_vec())
     }
 }
 

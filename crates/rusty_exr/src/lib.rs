@@ -40,6 +40,7 @@ mod half;
 mod header;
 mod image;
 mod luts;
+mod simd;
 
 pub use decode::{Block, ChunkPos, Decoder, PartKind, Threads};
 pub use encode::{encode, window, Deflate, EncodeOptions};
