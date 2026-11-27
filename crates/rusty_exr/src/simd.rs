@@ -256,6 +256,28 @@ pub(crate) fn rgba_f16(
 }
 
 // ---------------------------------------------------------------------------
+// DWA decode: lossy FLOAT channels (halves to float words).
+
+/// `words[2 i]`, `words[2 i + 1]` = low and high 16 bits of
+/// `dwa::imath_h2f_bits(halves[i])`, for a prefix of whole 8-sample groups
+/// whose halves are all non-NaN (Imath keeps a NaN's payload unquieted; the
+/// hardware conversion would quiet it). Returns the number of samples done;
+/// the caller finishes from there with the scalar code. `words` holds at
+/// least `2 * halves.len()` words.
+pub(crate) fn dwa_f32_words(isa: Isa, halves: &[u16], words: &mut [u16]) -> usize {
+    assert!(words.len() >= 2 * halves.len());
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SSE2 is part of x86-64; length checked above.
+        Isa::Sse2 => unsafe { x86::dwa_f32_words_sse2(halves, words) },
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: as above, and AVX2 + F16C were detected.
+        Isa::Avx2 => unsafe { x86::dwa_f32_words_avx2(halves, words) },
+        _ => 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DWA encode: block load (+ colour transform) and coefficient rounding.
 
 /// Load an 8x8 block of each component in `comps` (1 or 3; rows start at
@@ -1227,6 +1249,44 @@ mod x86 {
             out[4 * i + 2] = crate::half::f16_to_f32(b[i]);
             out[4 * i + 3] = a.map_or(1.0, |a| crate::half::f16_to_f32(a[i]));
         }
+    }
+
+    /// True when any of the 8 halves in `v` is a NaN.
+    #[inline(always)]
+    unsafe fn any_nan8(v: __m128i) -> bool {
+        // |h| > 0x7c00 (as signed 16-bit: |h| <= 0x7fff).
+        let a = _mm_and_si128(v, _mm_set1_epi16(0x7fff));
+        _mm_movemask_epi8(_mm_cmpgt_epi16(a, _mm_set1_epi16(0x7c00))) != 0
+    }
+
+    pub(super) unsafe fn dwa_f32_words_sse2(h: &[u16], w: &mut [u16]) -> usize {
+        let z = _mm_setzero_si128();
+        let mut i = 0;
+        while i + 8 <= h.len() {
+            let v = _mm_loadu_si128(h.as_ptr().add(i).cast());
+            if any_nan8(v) {
+                break;
+            }
+            let o = w.as_mut_ptr().add(2 * i);
+            _mm_storeu_ps(o.cast(), h2f4(_mm_unpacklo_epi16(v, z)));
+            _mm_storeu_ps(o.add(8).cast(), h2f4(_mm_unpackhi_epi16(v, z)));
+            i += 8;
+        }
+        i
+    }
+
+    #[target_feature(enable = "avx2,f16c")]
+    pub(super) unsafe fn dwa_f32_words_avx2(h: &[u16], w: &mut [u16]) -> usize {
+        let mut i = 0;
+        while i + 8 <= h.len() {
+            let v = _mm_loadu_si128(h.as_ptr().add(i).cast());
+            if any_nan8(v) {
+                break;
+            }
+            _mm256_storeu_ps(w.as_mut_ptr().add(2 * i).cast(), _mm256_cvtph_ps(v));
+            i += 8;
+        }
+        i
     }
 
     pub(super) unsafe fn rgba_f16_sse2(

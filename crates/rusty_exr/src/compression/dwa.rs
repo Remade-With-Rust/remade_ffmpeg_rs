@@ -381,7 +381,7 @@ fn imath_f2h(f: f32) -> u16 {
 
 /// Imath's `half_to_float` (NaN payload kept, quiet bit not forced).
 #[inline]
-fn imath_h2f_bits(h: u16) -> u32 {
+pub(crate) fn imath_h2f_bits(h: u16) -> u32 {
     if h & 0x7c00 == 0x7c00 {
         (u32::from(h & 0x8000) << 16) | 0x7f80_0000 | (u32::from(h & 0x3ff) << 13)
     } else {
@@ -861,6 +861,24 @@ pub(crate) fn decompress(
     Ok(())
 }
 
+/// `words[2 i]`, `words[2 i + 1]` = the low and high words of
+/// `imath_h2f_bits(halves[i])`. The SIMD twin converts whole NaN-free
+/// groups of 8; the scalar loop (its oracle) takes a declined group and the
+/// tail, handing back to the twin at the next group boundary.
+fn halves_to_f32_words(isa: crate::simd::Isa, halves: &[u16], words: &mut [u16]) {
+    let n = halves.len();
+    let mut i = crate::simd::dwa_f32_words(isa, halves, words);
+    while i < n {
+        let b = imath_h2f_bits(halves[i]);
+        words[2 * i] = b as u16;
+        words[2 * i + 1] = (b >> 16) as u16;
+        i += 1;
+        if i % 8 == 0 && i + 8 <= n {
+            i += crate::simd::dwa_f32_words(isa, &halves[i..], &mut words[2 * i..]);
+        }
+    }
+}
+
 /// Three disjoint `len`-word ranges of `words` starting at the given
 /// (pairwise distinct, non-overlapping) offsets, in argument order.
 fn disjoint3(words: &mut [u16], r: [(usize, usize); 3]) -> [&mut [u16]; 3] {
@@ -890,14 +908,7 @@ fn store_words(words: &mut [u16], ch: &ChanGeom<'_>, off: usize, halves: &[u16])
     match ch.ty {
         SampleType::F16 => words[off..off + n].copy_from_slice(&halves[..n]),
         SampleType::F32 => {
-            for (d, &h) in words[off..off + 2 * n]
-                .chunks_exact_mut(2)
-                .zip(&halves[..n])
-            {
-                let b = imath_h2f_bits(h);
-                d[0] = b as u16;
-                d[1] = (b >> 16) as u16;
-            }
+            halves_to_f32_words(crate::simd::isa(), &halves[..n], &mut words[off..off + 2 * n]);
         }
         SampleType::U32 => {
             let w = ch.width;
@@ -987,6 +998,39 @@ mod tests {
     fn lcg(seed: &mut u32) -> u32 {
         *seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
         *seed >> 8
+    }
+
+    #[test]
+    fn f32_words_twins_match_scalar() {
+        // Every half, in an order that puts NaNs in some groups and not in
+        // others, at several lengths and offsets.
+        let mut seed = 99u32;
+        let mut all: Vec<u16> = (0..=u16::MAX).collect();
+        for i in (1..all.len()).rev() {
+            let j = lcg(&mut seed) as usize % (i + 1);
+            all.swap(i, j);
+        }
+        // A run of NaN-free values so whole clean groups occur too.
+        all.extend((0..4000u16).map(|v| v % 0x7c00));
+        let mut isas = crate::simd::available();
+        isas.push(crate::simd::Isa::Scalar);
+        for start in [0usize, 3, 8] {
+            for len in [0usize, 1, 7, 8, 9, 15, 16, 17, 100, all.len() - start] {
+                let h = &all[start..start + len];
+                let want: Vec<u16> = h
+                    .iter()
+                    .flat_map(|&v| {
+                        let b = imath_h2f_bits(v);
+                        [b as u16, (b >> 16) as u16]
+                    })
+                    .collect();
+                for &isa in &isas {
+                    let mut got = vec![0xaaaau16; 2 * len];
+                    halves_to_f32_words(isa, h, &mut got);
+                    assert_eq!(got, want, "{isa:?} start {start} len {len}");
+                }
+            }
+        }
     }
 
     #[test]
