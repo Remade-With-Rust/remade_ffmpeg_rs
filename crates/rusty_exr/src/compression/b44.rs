@@ -71,40 +71,60 @@ pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
         }
         let (nx, ny) = (ch.width, ch.height);
         let out = &mut planar[op..op + n];
-        let mut s = [0u16; 16];
-        for y in (0..ny).step_by(4) {
-            for x in (0..nx).step_by(4) {
-                if ip + 3 > data.len() {
-                    return Err(Error::invalid("B44 chunk truncated"));
-                }
-                if data[ip + 2] >= (13 << 2) {
-                    unpack3(&data[ip..ip + 3], &mut s);
-                    ip += 3;
-                } else {
-                    if ip + 14 > data.len() {
-                        return Err(Error::invalid("B44 chunk truncated"));
-                    }
-                    unpack14(&data[ip..ip + 14], &mut s);
-                    ip += 14;
-                }
-                if ch.p_linear {
-                    for v in &mut s {
-                        *v = log[*v as usize];
-                    }
-                }
-                let cols = (nx - x).min(4);
-                let rows = (ny - y).min(4);
-                for r in 0..rows {
-                    let o = ((y + r) * nx + x) * 2;
-                    for k in 0..cols {
-                        out[o + 2 * k..o + 2 * k + 2].copy_from_slice(&s[r * 4 + k].to_le_bytes());
-                    }
-                }
-            }
+        let lut = ch.p_linear.then_some(&log[..]);
+        // A SIMD prefix of the blocks (raster block order), then the rest.
+        let (done, at) = crate::simd::b44_channel(crate::simd::isa(), data, ip, nx, ny, lut, out);
+        ip = at;
+        let nbx = nx.div_ceil(4);
+        for b in done..nbx * ny.div_ceil(4) {
+            ip = block_scalar(data, ip, (b % nbx) * 4, (b / nbx) * 4, nx, ny, lut, out)?;
         }
         op += n;
     }
     Ok(planar)
+}
+
+/// Decode the block at `ip` into the 4x4 cell at (`x`, `y`) of a HALF
+/// plane (`out`, little-endian, `nx` x `ny`); returns the next block's
+/// offset. The oracle of `simd::b44_channel`.
+pub(crate) fn block_scalar(
+    data: &[u8],
+    ip: usize,
+    x: usize,
+    y: usize,
+    nx: usize,
+    ny: usize,
+    lut: Option<&[u16]>,
+    out: &mut [u8],
+) -> Result<usize> {
+    let mut s = [0u16; 16];
+    if ip + 3 > data.len() {
+        return Err(Error::invalid("B44 chunk truncated"));
+    }
+    let next = if data[ip + 2] >= (13 << 2) {
+        unpack3(&data[ip..ip + 3], &mut s);
+        ip + 3
+    } else {
+        if ip + 14 > data.len() {
+            return Err(Error::invalid("B44 chunk truncated"));
+        }
+        unpack14(&data[ip..ip + 14], &mut s);
+        ip + 14
+    };
+    if let Some(log) = lut {
+        for v in &mut s {
+            *v = log[*v as usize];
+        }
+    }
+    let cols = (nx - x).min(4);
+    let rows = (ny - y).min(4);
+    for r in 0..rows {
+        let o = ((y + r) * nx + x) * 2;
+        for k in 0..cols {
+            out[o + 2 * k..o + 2 * k + 2].copy_from_slice(&s[r * 4 + k].to_le_bytes());
+        }
+    }
+    Ok(next)
 }
 
 /// OpenEXR's `shiftAndRound`: `x / 2^shift`, rounded to nearest, ties to even.
@@ -235,4 +255,88 @@ pub(crate) fn compress(geom: &BlockGeom<'_>, raw: &[u8], flat: bool) -> Vec<u8> 
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The SIMD block prefix followed by the scalar blocks against the
+    /// scalar blocks alone: random 14- and 3-byte blocks (every shift,
+    /// every field value), edge cells, the transfer table, short data.
+    #[test]
+    fn channel_twin_matches_scalar() {
+        let mut seed = 0x0b44_0b44u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let log = &crate::luts::get().b44_log;
+        for &(nx, ny) in &[
+            (1usize, 1usize),
+            (4, 4),
+            (5, 3),
+            (8, 8),
+            (13, 9),
+            (64, 7),
+            (33, 33),
+        ] {
+            for round in 0..40 {
+                let nblocks = nx.div_ceil(4) * ny.div_ceil(4);
+                let mut data = Vec::new();
+                for _ in 0..nblocks {
+                    let r = next();
+                    if r % 5 == 0 {
+                        data.extend_from_slice(&[(r >> 8) as u8, (r >> 16) as u8, 0xfc]);
+                    } else {
+                        let mut b: Vec<u8> = (0..14).map(|_| next() as u8).collect();
+                        // Shift 0..=12 (13 and up mark a 3-byte block).
+                        b[2] = ((r % 13) as u8) << 2 | (b[2] & 3);
+                        data.extend_from_slice(&b);
+                    }
+                }
+                let cut = if round % 7 == 6 {
+                    data.len() - (next() as usize % 20).min(data.len())
+                } else {
+                    data.len()
+                };
+                let data = &data[..cut];
+                for lut in [None, Some(&log[..])] {
+                    let mut want = vec![0u8; nx * ny * 2];
+                    let mut ip = 0;
+                    let nbx = nx.div_ceil(4);
+                    let mut want_err = false;
+                    for b in 0..nblocks {
+                        let (x, y) = ((b % nbx) * 4, (b / nbx) * 4);
+                        let Ok(n) = block_scalar(data, ip, x, y, nx, ny, lut, &mut want) else {
+                            want_err = true;
+                            break;
+                        };
+                        ip = n;
+                    }
+                    for isa in crate::simd::available() {
+                        let mut got = vec![0u8; nx * ny * 2];
+                        let (done, mut ip2) =
+                            crate::simd::b44_channel(isa, data, 0, nx, ny, lut, &mut got);
+                        let mut err = false;
+                        for b in done..nblocks {
+                            let (x, y) = ((b % nbx) * 4, (b / nbx) * 4);
+                            let Ok(n) = block_scalar(data, ip2, x, y, nx, ny, lut, &mut got) else {
+                                err = true;
+                                break;
+                            };
+                            ip2 = n;
+                        }
+                        assert_eq!(err, want_err, "{isa:?} {nx}x{ny}");
+                        if !err {
+                            assert_eq!(ip2, ip, "{isa:?} {nx}x{ny}");
+                            assert_eq!(got, want, "{isa:?} {nx}x{ny} lut {}", lut.is_some());
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

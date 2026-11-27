@@ -277,6 +277,35 @@ pub(crate) fn dwa_enc_round(
     true
 }
 
+// ---------------------------------------------------------------------------
+// B44 decode: a channel's 4x4 blocks.
+
+/// Decode B44 blocks of one HALF channel (`nx` x `ny`, little-endian
+/// `out`) starting at `data[ip]`, in raster block order, through the
+/// optional transfer table `lut` (65536 entries): the twin of
+/// `b44::block_scalar` applied block after block. Stops before the first
+/// block with fewer than 16 bytes left (the caller's scalar loop finishes,
+/// and reports truncation). Returns (blocks decoded, next offset).
+pub(crate) fn b44_channel(
+    isa: Isa,
+    data: &[u8],
+    ip: usize,
+    nx: usize,
+    ny: usize,
+    lut: Option<&[u16]>,
+    out: &mut [u8],
+) -> (usize, usize) {
+    assert!(out.len() == nx * ny * 2 && lut.is_none_or(|l| l.len() == 1 << 16));
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: AVX2 (and so SSSE3) was detected; every block read is
+        // checked to have 16 bytes, every store lands in a cell of `out`.
+        Isa::Avx2 => unsafe { x86::b44_channel_avx2(data, ip, nx, ny, lut, out) },
+        // The field extraction needs `pshufb` (SSSE3): SSE2 stays scalar.
+        _ => (0, ip),
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::wildcard_imports)]
 mod x86 {
@@ -1180,6 +1209,147 @@ mod x86 {
     ) {
         f2h64_f16c(d, src);
         h2f64_f16c(src, src_f);
+    }
+
+    // --- B44 decode -------------------------------------------------------------
+
+    /// Per 16-bit lane of a block (lanes 0..8: rows 0 and 1, lanes 8..16:
+    /// rows 2 and 3): which 6-bit field it adds (`-1`: lane 0 holds the
+    /// first sample itself). Row `r`, column `k > 0` adds field
+    /// `3 + 4 (k - 1) + r`; column 0 of row `r > 0` adds field `r - 1`.
+    const B44_FIELD: [i32; 16] = [-1, 3, 7, 11, 0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14];
+
+    /// `pshufb` control: each lane gets the big-endian 16-bit window that
+    /// holds its field (field `j` starts at bit `22 + 6 j`).
+    const B44_CTRL: [u8; 32] = {
+        let mut t = [0u8; 32];
+        let mut l = 0;
+        while l < 16 {
+            let i = if B44_FIELD[l] < 0 {
+                0
+            } else {
+                (22 + 6 * B44_FIELD[l] as usize) / 8
+            };
+            t[2 * l] = (i + 1) as u8;
+            t[2 * l + 1] = i as u8;
+            l += 1;
+        }
+        t
+    };
+
+    /// Multipliers that move every lane's field to bits 10..16 of the lane.
+    const B44_MULT: [u16; 16] = {
+        let mut t = [1u16; 16];
+        let mut l = 0;
+        while l < 16 {
+            if B44_FIELD[l] >= 0 {
+                t[l] = 1 << ((22 + 6 * B44_FIELD[l] as usize) % 8);
+            }
+            l += 1;
+        }
+        t
+    };
+
+    /// `finish`: negative halves lose the sign bit, the others invert.
+    #[inline(always)]
+    unsafe fn b44_finish(s: __m128i) -> __m128i {
+        let m = _mm_srai_epi16::<15>(s);
+        _mm_or_si128(
+            _mm_and_si128(m, _mm_and_si128(s, _mm_set1_epi16(0x7fff))),
+            _mm_andnot_si128(m, _mm_xor_si128(s, _mm_set1_epi16(-1))),
+        )
+    }
+
+    /// One 14-byte block: rows 0-1 and rows 2-3, before `finish`.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn b44_block14(p: *const u8) -> (__m128i, __m128i) {
+        let v = _mm_loadu_si128(p.cast());
+        let w0 = _mm_shuffle_epi8(v, _mm_loadu_si128(B44_CTRL.as_ptr().cast()));
+        let w1 = _mm_shuffle_epi8(v, _mm_loadu_si128(B44_CTRL.as_ptr().add(16).cast()));
+        let mult0 = _mm_loadu_si128(B44_MULT.as_ptr().cast());
+        let mult1 = _mm_loadu_si128(B44_MULT.as_ptr().add(8).cast());
+        let f0 = _mm_srli_epi16::<10>(_mm_mullo_epi16(w0, mult0));
+        let f1 = _mm_srli_epi16::<10>(_mm_mullo_epi16(w1, mult1));
+        let shift = u32::from(*p.add(2) >> 2);
+        let cnt = _mm_cvtsi32_si128(shift as i32);
+        let bias = _mm_set1_epi16((0x20u32 << shift) as u16 as i16);
+        let d0 = _mm_sub_epi16(_mm_sll_epi16(f0, cnt), bias);
+        let x1 = _mm_sub_epi16(_mm_sll_epi16(f1, cnt), bias);
+        let lane0 = _mm_set_epi16(0, 0, 0, 0, 0, 0, 0, -1);
+        let x0 = _mm_or_si128(_mm_and_si128(lane0, w0), _mm_andnot_si128(lane0, d0));
+        // Prefix along each row (one row per 64-bit half).
+        let mut y0 = _mm_add_epi16(x0, _mm_slli_epi64::<16>(x0));
+        y0 = _mm_add_epi16(y0, _mm_slli_epi64::<32>(y0));
+        let mut y1 = _mm_add_epi16(x1, _mm_slli_epi64::<16>(x1));
+        y1 = _mm_add_epi16(y1, _mm_slli_epi64::<32>(y1));
+        // Column-0 terms broadcast over their row, then summed over the rows
+        // above.
+        let col0 = _mm_set1_epi64x(0xffff);
+        let mut c0 = _mm_and_si128(x0, col0);
+        c0 = _mm_or_si128(c0, _mm_slli_epi64::<16>(c0));
+        c0 = _mm_or_si128(c0, _mm_slli_epi64::<32>(c0));
+        let mut c1 = _mm_and_si128(x1, col0);
+        c1 = _mm_or_si128(c1, _mm_slli_epi64::<16>(c1));
+        c1 = _mm_or_si128(c1, _mm_slli_epi64::<32>(c1));
+        let above0 = _mm_slli_si128::<8>(c0);
+        let both = _mm_add_epi16(c0, _mm_shuffle_epi32::<0x4e>(c0));
+        let above1 = _mm_add_epi16(both, _mm_slli_si128::<8>(c1));
+        (_mm_add_epi16(y0, above0), _mm_add_epi16(y1, above1))
+    }
+
+    // `_mm_storel_epi64` has no alignment requirement.
+    #[allow(clippy::cast_ptr_alignment)]
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn b44_channel_avx2(
+        data: &[u8],
+        mut ip: usize,
+        nx: usize,
+        ny: usize,
+        lut: Option<&[u16]>,
+        out: &mut [u8],
+    ) -> (usize, usize) {
+        let nbx = nx.div_ceil(4);
+        let total = nbx * ny.div_ceil(4);
+        let mut b = 0;
+        while b < total && ip + 16 <= data.len() {
+            let p = data.as_ptr().add(ip);
+            let (s0, s1) = if *p.add(2) >= (13 << 2) {
+                let t0 = _mm_set1_epi16(i16::from_be_bytes([*p, *p.add(1)]));
+                ip += 3;
+                (t0, t0)
+            } else {
+                ip += 14;
+                b44_block14(p)
+            };
+            let (s0, s1) = (b44_finish(s0), b44_finish(s1));
+            let (x, y) = ((b % nbx) * 4, (b / nbx) * 4);
+            if lut.is_none() && x + 4 <= nx && y + 4 <= ny {
+                let o = out.as_mut_ptr();
+                let row = |r: usize| o.add(((y + r) * nx + x) * 2).cast::<__m128i>();
+                _mm_storel_epi64(row(0), s0);
+                _mm_storel_epi64(row(1), _mm_srli_si128::<8>(s0));
+                _mm_storel_epi64(row(2), s1);
+                _mm_storel_epi64(row(3), _mm_srli_si128::<8>(s1));
+            } else {
+                let mut t = [0u16; 16];
+                _mm_storeu_si128(t.as_mut_ptr().cast(), s0);
+                _mm_storeu_si128(t.as_mut_ptr().add(8).cast(), s1);
+                if let Some(l) = lut {
+                    for v in &mut t {
+                        *v = l[*v as usize];
+                    }
+                }
+                for r in 0..(ny - y).min(4) {
+                    let o = ((y + r) * nx + x) * 2;
+                    for k in 0..(nx - x).min(4) {
+                        out[o + 2 * k..o + 2 * k + 2].copy_from_slice(&t[r * 4 + k].to_le_bytes());
+                    }
+                }
+            }
+            b += 1;
+        }
+        (b, ip)
     }
 
     // --- test hooks -------------------------------------------------------
