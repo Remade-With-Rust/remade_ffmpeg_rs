@@ -808,11 +808,7 @@ pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
                 let base = offs[ci];
                 let src = &rle[rle_planes..rle_planes + bpe * plane];
                 let dst = &mut planar[base..base + bpe * plane];
-                for (i, d) in dst.chunks_exact_mut(bpe).enumerate() {
-                    for (k, b) in d.iter_mut().enumerate() {
-                        *b = src[k * plane + i];
-                    }
-                }
+                unsplit_planes(src, plane, dst);
                 rle_planes += bpe * plane;
             }
             Scheme::Unknown => {
@@ -827,6 +823,50 @@ pub(crate) fn decompress(geom: &BlockGeom<'_>, data: &[u8]) -> Result<Vec<u8>> {
         }
     }
     Ok(planar)
+}
+
+/// Rebuild `dst.len() / plane`-byte samples from byte planes: byte `k` of
+/// sample `i` is `src[k * plane + i]`. The fixed-width arms (2 and 4: every
+/// sample type) are zipped loops the compiler vectorizes; the indexed loop
+/// is the general form and their oracle.
+fn unsplit_planes(src: &[u8], plane: usize, dst: &mut [u8]) {
+    match dst.len().checked_div(plane) {
+        Some(2) => {
+            let (a, b) = src.split_at(plane);
+            for ((d, &x), &y) in dst.chunks_exact_mut(2).zip(a).zip(&b[..plane]) {
+                d[0] = x;
+                d[1] = y;
+            }
+        }
+        Some(4) => {
+            let (a, r) = src.split_at(plane);
+            let (b, r) = r.split_at(plane);
+            let (c, e) = r.split_at(plane);
+            for ((((d, &x), &y), &z), &w) in dst
+                .chunks_exact_mut(4)
+                .zip(a)
+                .zip(b)
+                .zip(c)
+                .zip(&e[..plane])
+            {
+                d.copy_from_slice(&[x, y, z, w]);
+            }
+        }
+        _ => unsplit_planes_indexed(src, plane, dst),
+    }
+}
+
+/// The indexed form of [`unsplit_planes`].
+fn unsplit_planes_indexed(src: &[u8], plane: usize, dst: &mut [u8]) {
+    if plane == 0 {
+        return;
+    }
+    let bpe = dst.len() / plane;
+    for (i, d) in dst.chunks_exact_mut(bpe).enumerate() {
+        for (k, b) in d.iter_mut().enumerate() {
+            *b = src[k * plane + i];
+        }
+    }
 }
 
 fn split(d: &[u8], n: u64) -> Result<(&[u8], &[u8])> {
@@ -845,4 +885,29 @@ fn validate(required: u64, compressed: u64, uncompressed: u64, extra: u64) -> Re
         return Err(Error::invalid("DWA section without channels"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lcg(seed: &mut u32) -> u32 {
+        *seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        *seed >> 8
+    }
+
+    #[test]
+    fn unsplit_planes_matches_indexed() {
+        let mut seed = 7u32;
+        for bpe in [1usize, 2, 3, 4, 8] {
+            for plane in [0usize, 1, 2, 15, 16, 17, 33, 1000] {
+                let src: Vec<u8> = (0..bpe * plane).map(|_| lcg(&mut seed) as u8).collect();
+                let mut a = vec![0u8; bpe * plane];
+                let mut b = vec![1u8; bpe * plane];
+                unsplit_planes(&src, plane, &mut a);
+                unsplit_planes_indexed(&src, plane, &mut b);
+                assert_eq!(a, b, "bpe {bpe} plane {plane}");
+            }
+        }
+    }
 }
