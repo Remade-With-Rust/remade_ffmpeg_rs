@@ -487,7 +487,7 @@ fn decode_lossy(
     dc_pos: &mut usize,
     width: usize,
     height: usize,
-    to_linear: Option<&[u16]>,
+    to_linear: Option<&[u16; 65536]>,
     outs: &mut [&mut [u16]],
 ) -> Result<()> {
     let n = outs.len();
@@ -549,6 +549,26 @@ fn decode_lossy(
             let max_x = (width - bx * 8).min(8);
             for comp in 0..n {
                 let out = &mut outs[comp];
+                if max_x == 8 {
+                    // Whole-width block: fixed 8-sample rows, unrolled.
+                    for yy in 0..max_y {
+                        let row = (by * 8 + yy) * width + bx * 8;
+                        let src: &[u16; 8] = halves[comp][yy * 8..yy * 8 + 8]
+                            .try_into()
+                            .expect("8 samples");
+                        let dst: &mut [u16; 8] =
+                            (&mut out[row..row + 8]).try_into().expect("8 samples");
+                        match to_linear {
+                            Some(t) => {
+                                for j in 0..8 {
+                                    dst[j] = t[usize::from(src[j])];
+                                }
+                            }
+                            None => *dst = *src,
+                        }
+                    }
+                    continue;
+                }
                 for yy in 0..max_y {
                     let row = (by * 8 + yy) * width + bx * 8;
                     let src = &halves[comp][yy * 8..yy * 8 + max_x];
@@ -742,6 +762,8 @@ pub(crate) fn decompress(
     let mut acr = AcReader { ac, pos: 0 };
     let mut dc_pos = 0usize;
     let luts = crate::luts::get();
+    // As a fixed-size array, so the per-sample lookup needs no bounds check.
+    let to_linear: &[u16; 65536] = luts.dwa_to_linear[..].try_into().expect("64K table");
 
     for set in &sets {
         if set.iter().any(|&i| schemes[i] != Scheme::Lossy) {
@@ -763,7 +785,7 @@ pub(crate) fn decompress(
                 &mut dc_pos,
                 w,
                 h,
-                Some(&luts.dwa_to_linear),
+                Some(to_linear),
                 &mut outs,
             )?;
         } else {
@@ -779,7 +801,7 @@ pub(crate) fn decompress(
                 &mut dc_pos,
                 w,
                 h,
-                Some(&luts.dwa_to_linear),
+                Some(to_linear),
                 &mut outs,
             )?;
             for (k, &ci) in set.iter().enumerate() {
@@ -806,7 +828,7 @@ pub(crate) fn decompress(
                 let lin = if ch.p_linear {
                     None
                 } else {
-                    Some(&luts.dwa_to_linear[..])
+                    Some(to_linear)
                 };
                 let n = ch.width * ch.height;
                 if ch.ty == SampleType::F16 {
