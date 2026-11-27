@@ -17,7 +17,9 @@ const FLAG_MULTIPART: u32 = 0x1000;
 /// Thread use for whole-image decodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Threads {
-    /// One worker per available core (the default).
+    /// One worker per available core (the default), but no more than one
+    /// per 512 KiB of decoded samples, so a small image does not spawn
+    /// threads it cannot keep busy.
     #[default]
     Auto,
     /// Decode on the calling thread only.
@@ -36,7 +38,27 @@ impl Threads {
             Self::Count(n) => n.max(1),
         }
     }
+
+    /// Workers for `tasks` independent tasks producing `bytes` of samples.
+    /// `Auto` also caps the count at one per [`AUTO_BYTES_PER_WORKER`]:
+    /// spawning a thread per core for a small image cost more than the work
+    /// it shared out (the bands are independent, so the output is the same
+    /// for any worker count).
+    pub(crate) fn workers(self, tasks: usize, bytes: u64) -> usize {
+        let n = match self {
+            Self::Auto => {
+                let by_work = bytes.div_ceil(AUTO_BYTES_PER_WORKER).max(1);
+                self.resolve()
+                    .min(usize::try_from(by_work).unwrap_or(usize::MAX))
+            }
+            _ => self.resolve(),
+        };
+        n.min(tasks).max(1)
+    }
 }
+
+/// Decoded bytes per worker below which [`Threads::Auto`] adds no worker.
+const AUTO_BYTES_PER_WORKER: u64 = 512 * 1024;
 
 /// What kind of data a part stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -788,7 +810,7 @@ impl<'a> Decoder<'a> {
             })
             .collect();
 
-        let nthreads = self.threads.resolve().min(tasks.len()).max(1);
+        let nthreads = self.threads.workers(tasks.len(), total);
         let errors: std::sync::Mutex<Vec<(usize, Error)>> = std::sync::Mutex::new(Vec::new());
         let queue = std::sync::Mutex::new(tasks.into_iter());
         let work = || {
