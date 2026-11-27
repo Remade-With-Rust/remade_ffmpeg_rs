@@ -870,13 +870,35 @@ impl<'a> Decoder<'a> {
     ) -> Result<()> {
         let (_, (x0, y0, w, lines), packed) = self.chunk_data(p, part, ci)?;
         let geom = Self::geom(&p.info, x0, y0, w, lines)?;
+        // DWA can decode HALF lossy channels straight into the band's rows
+        // when the chunk spans whole plane rows (scanline parts).
+        let mut direct: Vec<Option<&mut [u16]>> = Vec::new();
+        if matches!(p.info.compression, Compression::Dwaa | Compression::Dwab)
+            && geom.chans.iter().any(|g| g.ty == SampleType::F16)
+        {
+            let cols = chunk_cols(&p.info, &geom, x0, task);
+            direct = task
+                .planes
+                .iter_mut()
+                .zip(&cols)
+                .zip(&geom.chans)
+                .map(|((plane, &(pw, col, row0)), g)| match plane {
+                    PlaneMut::F16(v) if col == 0 && g.width == pw => {
+                        v.get_mut(row0 * pw..(row0 + g.height) * pw)
+                    }
+                    _ => None,
+                })
+                .collect();
+        }
         let layout = compression::decompress_layout(
             p.info.compression,
             &geom,
             packed,
             self.limits.max_chunk_bytes,
             scratch,
+            &mut direct,
         )?;
+        drop(direct);
         place(&p.info, &geom, x0, task, &layout);
         Ok(())
     }
@@ -1009,17 +1031,15 @@ fn put_row(dst: &mut PlaneMut<'_>, start: usize, n: usize, seg: Seg<'_>) {
     }
 }
 
-/// Copy a decompressed chunk into a band's planes.
-fn place(
+/// Per channel of a chunk: plane width, the chunk's first column, and the
+/// band row index of the chunk's first sampled line.
+fn chunk_cols(
     info: &PartInfo,
     geom: &BlockGeom<'_>,
     x0: i32,
-    task: &mut Task<'_>,
-    layout: &compression::Layout<'_>,
-) {
+    task: &Task<'_>,
+) -> Vec<(usize, usize, usize)> {
     let dw = info.data_window;
-    // Per channel: plane width, the chunk's first column, and the band row
-    // index of the chunk's first sampled line.
     let mut cols = Vec::with_capacity(geom.chans.len());
     for (c, g) in geom.chans.iter().enumerate() {
         let col = count_sampled(
@@ -1035,6 +1055,18 @@ fn place(
         let pw = task.widths[c];
         cols.push((pw, col, row0));
     }
+    cols
+}
+
+/// Copy a decompressed chunk into a band's planes.
+fn place(
+    info: &PartInfo,
+    geom: &BlockGeom<'_>,
+    x0: i32,
+    task: &mut Task<'_>,
+    layout: &compression::Layout<'_>,
+) {
+    let cols = chunk_cols(info, geom, x0, task);
     match *layout {
         compression::Layout::Raw(_) | compression::Layout::Halves(_) => {
             let (raw, half) = match *layout {
@@ -1083,11 +1115,16 @@ fn place(
                 }
             }
         }
-        compression::Layout::PlanarU16(words) => {
+        compression::Layout::PlanarU16(words, placed) => {
             let mut off = 0usize;
             for (c, g) in geom.chans.iter().enumerate() {
                 let (pw, col, row0) = cols[c];
                 let rw = g.width * g.ty.bytes() / 2;
+                if placed.get(c) == Some(&true) {
+                    // Already decoded into the band's rows.
+                    off += rw * g.height;
+                    continue;
+                }
                 for r in 0..g.height {
                     let start = (row0 + r) * pw + col;
                     put_row(

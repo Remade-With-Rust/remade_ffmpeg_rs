@@ -603,6 +603,8 @@ pub(crate) struct DwaScratch {
     dc: Vec<u16>,
     rle: Vec<u8>,
     bufs: [Vec<u16>; 3],
+    /// Per channel of the last chunk: written straight to the output.
+    pub(super) placed: Vec<bool>,
 }
 
 /// Decode one DWA chunk into `scratch.w[..geom.raw_size / 2]` (channel-planar
@@ -611,6 +613,7 @@ pub(crate) fn decompress(
     geom: &BlockGeom<'_>,
     data: &[u8],
     scratch: &mut super::Scratch,
+    direct: &mut [Option<&mut [u16]>],
 ) -> Result<()> {
     const HEADER: usize = 11 * 8;
     if data.len() < HEADER {
@@ -759,6 +762,16 @@ pub(crate) fn decompress(
         o += ch.bytes() / 2;
     }
     let words = super::grow(words_buf, geom.raw_size / 2);
+    // HALF lossy channels whose output rows the caller handed over are
+    // decoded straight into them (and skipped when the words are placed).
+    ds.placed.clear();
+    ds.placed.resize(chans.len(), false);
+    let mut target = |ci: usize, n: usize| -> Option<&mut [u16]> {
+        direct
+            .get_mut(ci)
+            .and_then(Option::take)
+            .filter(|d| d.len() == n)
+    };
     let mut done = vec![false; chans.len()];
     let mut acr = AcReader { ac, pos: 0 };
     let mut dc_pos = 0usize;
@@ -777,9 +790,19 @@ pub(crate) fn decompress(
             && set[0] != set[2]
             && set[1] != set[2];
         if direct {
-            // Channels in a set share geometry (checked in `classify`), and
-            // distinct channels own disjoint word ranges.
-            let mut outs = disjoint3(words, set.map(|i| (offs[i], w * h)));
+            // Straight to the output rows when the caller handed over all
+            // three; else into the words (channels in a set share geometry,
+            // checked in `classify`, and distinct channels own disjoint word
+            // ranges). One call site either way.
+            let mut outs = match set.map(|i| target(i, w * h)) {
+                [Some(a), Some(b), Some(c)] => {
+                    for &ci in set {
+                        ds.placed[ci] = true;
+                    }
+                    [a, b, c]
+                }
+                _ => disjoint3(words, set.map(|i| (offs[i], w * h))),
+            };
             decode_lossy(&mut acr, dc, &mut dc_pos, w, h, Some(to_linear), &mut outs)?;
         } else {
             let [b0, b1, b2] = &mut ds.bufs;
@@ -813,7 +836,13 @@ pub(crate) fn decompress(
                 let lin = if ch.p_linear { None } else { Some(to_linear) };
                 let n = ch.width * ch.height;
                 if ch.ty == SampleType::F16 {
-                    let out = &mut words[offs[ci]..offs[ci] + n];
+                    let out = match target(ci, n) {
+                        Some(out) => {
+                            ds.placed[ci] = true;
+                            out
+                        }
+                        None => &mut words[offs[ci]..offs[ci] + n],
+                    };
                     decode_lossy(
                         &mut acr,
                         dc,
