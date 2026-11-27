@@ -126,6 +126,43 @@ pub(crate) fn decompress(
     Ok(())
 }
 
+/// One row of the encoder: the samples in `src` (little-endian) as
+/// big-endian deltas from their left neighbour (FLOAT through
+/// [`f32_to_f24`] first), split into byte planes in `dst` (most significant
+/// plane first; FLOAT keeps three). The oracle of `simd::pxr24_enc_row`.
+pub(crate) fn enc_row(ty: SampleType, src: &[u8], dst: &mut [u8]) {
+    let n = packed_bytes(ty);
+    let w = dst.len() / n;
+    match ty {
+        SampleType::F16 => {
+            let mut prev = 0u16;
+            for x in 0..w {
+                let v = u16::from_le_bytes([src[2 * x], src[2 * x + 1]]);
+                let d = v.wrapping_sub(prev).to_be_bytes();
+                prev = v;
+                dst[x] = d[0];
+                dst[w + x] = d[1];
+            }
+        }
+        SampleType::U32 | SampleType::F32 => {
+            let f24 = ty == SampleType::F32;
+            let mut prev = 0u32;
+            for x in 0..w {
+                let b = &src[4 * x..4 * x + 4];
+                let mut v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                if f24 {
+                    v = f32_to_f24(v);
+                }
+                let d = v.wrapping_sub(prev).to_be_bytes();
+                prev = v;
+                for k in 0..n {
+                    dst[k * w + x] = d[4 - n + k];
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn compress(geom: &BlockGeom<'_>, raw: &[u8], deflater: crate::Deflate) -> Vec<u8> {
     let packed_size: usize = geom
         .chans
@@ -133,6 +170,7 @@ pub(crate) fn compress(geom: &BlockGeom<'_>, raw: &[u8], deflater: crate::Deflat
         .map(|c| c.width * c.height * packed_bytes(c.ty))
         .sum();
     let mut packed = vec![0u8; packed_size];
+    let isa = crate::simd::isa();
     let mut ip = 0;
     let mut op = 0;
     for line in 0..geom.lines {
@@ -142,48 +180,14 @@ pub(crate) fn compress(geom: &BlockGeom<'_>, raw: &[u8], deflater: crate::Deflat
                 continue;
             }
             let w = c.width;
-            match c.ty {
-                SampleType::F16 => {
-                    let mut prev = 0u16;
-                    for x in 0..w {
-                        let v = u16::from_le_bytes([raw[ip + 2 * x], raw[ip + 2 * x + 1]]);
-                        let d = v.wrapping_sub(prev).to_be_bytes();
-                        prev = v;
-                        packed[op + x] = d[0];
-                        packed[op + w + x] = d[1];
-                    }
-                    ip += 2 * w;
-                    op += 2 * w;
-                }
-                SampleType::U32 => {
-                    let mut prev = 0u32;
-                    for x in 0..w {
-                        let b = &raw[ip + 4 * x..ip + 4 * x + 4];
-                        let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                        let d = v.wrapping_sub(prev).to_be_bytes();
-                        prev = v;
-                        for k in 0..4 {
-                            packed[op + k * w + x] = d[k];
-                        }
-                    }
-                    ip += 4 * w;
-                    op += 4 * w;
-                }
-                SampleType::F32 => {
-                    let mut prev = 0u32;
-                    for x in 0..w {
-                        let b = &raw[ip + 4 * x..ip + 4 * x + 4];
-                        let v = f32_to_f24(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-                        let d = v.wrapping_sub(prev).to_be_bytes();
-                        prev = v;
-                        for k in 0..3 {
-                            packed[op + k * w + x] = d[k + 1];
-                        }
-                    }
-                    ip += 4 * w;
-                    op += 3 * w;
-                }
+            let n = packed_bytes(c.ty);
+            let src = &raw[ip..ip + c.ty.bytes() * w];
+            let dst = &mut packed[op..op + n * w];
+            if !crate::simd::pxr24_enc_row(isa, c.ty, src, dst) {
+                enc_row(c.ty, src, dst);
             }
+            ip += c.ty.bytes() * w;
+            op += n * w;
         }
     }
     super::deflate(&packed, deflater)
@@ -192,6 +196,47 @@ pub(crate) fn compress(geom: &BlockGeom<'_>, raw: &[u8], deflater: crate::Deflat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f24_twin_matches_scalar() {
+        // Every pattern in release builds; a dense stride in debug ones.
+        let step: u64 = if cfg!(debug_assertions) { 1021 } else { 1 };
+        for isa in crate::simd::available() {
+            let mut x = 0u64;
+            while u32::try_from(x).is_ok() {
+                let v: [u32; 4] = std::array::from_fn(|k| (x as u32).wrapping_add(k as u32));
+                let got = crate::simd::f24_4(isa, v);
+                for k in 0..4 {
+                    assert_eq!(got[k], f32_to_f24(v[k]), "{isa:?} {:08x}", v[k]);
+                }
+                x += 4 * step;
+            }
+        }
+    }
+
+    #[test]
+    fn encoder_row_twins_match_scalar() {
+        let mut seed = 0x2468_ace0u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for w in [0usize, 1, 3, 7, 8, 9, 15, 16, 17, 31, 64, 100, 257] {
+            for ty in [SampleType::F16, SampleType::F32, SampleType::U32] {
+                let src: Vec<u8> = (0..ty.bytes() * w).map(|_| next() as u8).collect();
+                let n = packed_bytes(ty);
+                let mut want = vec![0u8; n * w];
+                enc_row(ty, &src, &mut want);
+                for isa in crate::simd::available() {
+                    let mut got = vec![0u8; n * w];
+                    assert!(crate::simd::pxr24_enc_row(isa, ty, &src, &mut got));
+                    assert_eq!(got, want, "{isa:?} {ty:?} w {w}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn row_twins_match_scalar() {

@@ -386,6 +386,51 @@ pub(crate) fn b44_search(isa: Isa, s: &[u16; 16]) -> Option<crate::compression::
     }
 }
 
+// ---------------------------------------------------------------------------
+// PXR24 encode: row deltas into byte planes.
+
+/// The twin of `pxr24::enc_row`: `src` holds `w` little-endian samples of
+/// type `ty`, `dst` receives `w` bytes per plane (2 for HALF, 3 for FLOAT,
+/// 4 for UINT). Returns `false` when no SIMD family is in use.
+pub(crate) fn pxr24_enc_row(
+    isa: Isa,
+    ty: crate::header::SampleType,
+    src: &[u8],
+    dst: &mut [u8],
+) -> bool {
+    use crate::header::SampleType;
+    let (bytes, planes) = match ty {
+        SampleType::F16 => (2, 2),
+        SampleType::F32 => (4, 3),
+        SampleType::U32 => (4, 4),
+    };
+    let w = src.len() / bytes;
+    assert!(src.len() == bytes * w && dst.len() == planes * w);
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SSE2 is part of x86-64; lengths checked above.
+        Isa::Sse2 | Isa::Avx2 => unsafe {
+            if bytes == 2 {
+                x86::pxr24_enc_16_sse2(src, dst, w);
+            } else {
+                x86::pxr24_enc_32_sse2(src, dst, w, planes);
+            }
+        },
+        _ => return false,
+    }
+    true
+}
+
+/// `pxr24::f32_to_f24` on four values (test hook for the exhaustive check).
+#[cfg(test)]
+pub(crate) fn f24_4(isa: Isa, v: [u32; 4]) -> [u32; 4] {
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        Isa::Sse2 | Isa::Avx2 => x86::f24_4_test(v),
+        _ => v.map(crate::compression::pxr24::f32_to_f24),
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::wildcard_imports)]
 mod x86 {
@@ -1569,6 +1614,129 @@ mod x86 {
                 };
             }
             shift += 1;
+        }
+    }
+
+    // --- PXR24 encode -----------------------------------------------------------
+
+    /// `pxr24::f32_to_f24` on four lanes (masks for the branches).
+    #[inline(always)]
+    unsafe fn f24(x: __m128i) -> __m128i {
+        let sign = _mm_and_si128(x, _mm_set1_epi32(i32::MIN));
+        let exp = _mm_and_si128(x, _mm_set1_epi32(0x7f80_0000));
+        let man = _mm_and_si128(x, _mm_set1_epi32(0x007f_ffff));
+        let z = _mm_setzero_si128();
+        let one = _mm_set1_epi32(1);
+        // Infinity / NaN: NaN keeps its high payload and stays a NaN.
+        let special = _mm_cmpeq_epi32(exp, _mm_set1_epi32(0x7f80_0000));
+        let m = _mm_srli_epi32::<8>(man);
+        let man_set = _mm_andnot_si128(_mm_cmpeq_epi32(man, z), _mm_set1_epi32(-1));
+        let m_zero = _mm_and_si128(_mm_cmpeq_epi32(m, z), one);
+        let sv = _mm_or_si128(
+            _mm_srli_epi32::<8>(exp),
+            _mm_and_si128(man_set, _mm_or_si128(m, m_zero)),
+        );
+        // Finite: round the significand, unless that overflows the exponent.
+        let em = _mm_or_si128(exp, man);
+        let r = _mm_srli_epi32::<8>(_mm_add_epi32(em, _mm_and_si128(man, _mm_set1_epi32(0x80))));
+        let over = _mm_cmpgt_epi32(r, _mm_set1_epi32(0x007f_7fff));
+        let nv = _mm_or_si128(
+            _mm_and_si128(over, _mm_srli_epi32::<8>(em)),
+            _mm_andnot_si128(over, r),
+        );
+        let v = _mm_or_si128(_mm_and_si128(special, sv), _mm_andnot_si128(special, nv));
+        _mm_or_si128(_mm_srli_epi32::<8>(sign), v)
+    }
+
+    #[cfg(test)]
+    pub(super) fn f24_4_test(v: [u32; 4]) -> [u32; 4] {
+        // SAFETY: SSE2 is baseline on x86-64.
+        unsafe {
+            let r = f24(_mm_loadu_si128(v.as_ptr().cast()));
+            let mut o = [0u32; 4];
+            _mm_storeu_si128(o.as_mut_ptr().cast(), r);
+            o
+        }
+    }
+
+    /// `pxr24::enc_row` for HALF: eight samples per step.
+    pub(super) unsafe fn pxr24_enc_16_sse2(src: &[u8], dst: &mut [u8], w: usize) {
+        let steps = w / 8;
+        let lo8 = _mm_set1_epi16(0xff);
+        let mut carry = _mm_setzero_si128();
+        let d = dst.as_mut_ptr();
+        for s in 0..steps {
+            let v = _mm_loadu_si128(src.as_ptr().add(16 * s).cast());
+            let prev = _mm_or_si128(_mm_slli_si128::<2>(v), carry);
+            carry = _mm_srli_si128::<14>(v);
+            let delta = _mm_sub_epi16(v, prev);
+            let hi = _mm_packus_epi16(_mm_srli_epi16::<8>(delta), delta);
+            let lo = _mm_packus_epi16(_mm_and_si128(delta, lo8), delta);
+            _mm_storel_epi64(d.add(8 * s).cast(), hi);
+            _mm_storel_epi64(d.add(w + 8 * s).cast(), lo);
+        }
+        let mut prev = if steps > 0 {
+            u16::from_le_bytes([src[16 * steps - 2], src[16 * steps - 1]])
+        } else {
+            0
+        };
+        for x in 8 * steps..w {
+            let v = u16::from_le_bytes([src[2 * x], src[2 * x + 1]]);
+            let b = v.wrapping_sub(prev).to_be_bytes();
+            prev = v;
+            dst[x] = b[0];
+            dst[w + x] = b[1];
+        }
+    }
+
+    /// `pxr24::enc_row` for FLOAT (`planes == 3`) and UINT (`planes == 4`):
+    /// eight samples per step.
+    pub(super) unsafe fn pxr24_enc_32_sse2(src: &[u8], dst: &mut [u8], w: usize, planes: usize) {
+        let steps = w / 8;
+        let f24_on = planes == 3;
+        let lo8 = _mm_set1_epi32(0xff);
+        let mut carry = _mm_setzero_si128();
+        let d = dst.as_mut_ptr();
+        for s in 0..steps {
+            let mut v0 = _mm_loadu_si128(src.as_ptr().add(32 * s).cast());
+            let mut v1 = _mm_loadu_si128(src.as_ptr().add(32 * s + 16).cast());
+            if f24_on {
+                v0 = f24(v0);
+                v1 = f24(v1);
+            }
+            let p0 = _mm_or_si128(_mm_slli_si128::<4>(v0), carry);
+            let p1 = _mm_or_si128(_mm_slli_si128::<4>(v1), _mm_srli_si128::<12>(v0));
+            carry = _mm_srli_si128::<12>(v1);
+            let (d0, d1) = (_mm_sub_epi32(v0, p0), _mm_sub_epi32(v1, p1));
+            // Plane k holds byte (planes - 1 - k) of each delta, counting
+            // from the least significant.
+            for k in 0..planes {
+                let sh = _mm_cvtsi32_si128((8 * (planes - 1 - k)) as i32);
+                let b0 = _mm_and_si128(_mm_srl_epi32(d0, sh), lo8);
+                let b1 = _mm_and_si128(_mm_srl_epi32(d1, sh), lo8);
+                let p = _mm_packs_epi32(b0, b1);
+                _mm_storel_epi64(d.add(k * w + 8 * s).cast(), _mm_packus_epi16(p, p));
+            }
+        }
+        let mut prev = 0u32;
+        if steps > 0 {
+            let o = 32 * steps;
+            prev = u32::from_le_bytes([src[o - 4], src[o - 3], src[o - 2], src[o - 1]]);
+            if f24_on {
+                prev = crate::compression::pxr24::f32_to_f24(prev);
+            }
+        }
+        for x in 8 * steps..w {
+            let b = &src[4 * x..4 * x + 4];
+            let mut v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            if f24_on {
+                v = crate::compression::pxr24::f32_to_f24(v);
+            }
+            let dv = v.wrapping_sub(prev).to_be_bytes();
+            prev = v;
+            for k in 0..planes {
+                dst[k * w + x] = dv[4 - planes + k];
+            }
         }
     }
 
