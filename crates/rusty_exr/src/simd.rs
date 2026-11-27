@@ -854,14 +854,65 @@ mod x86 {
         }
     }
 
+    /// [`row_pass`] on two consecutive rows at once (`r[0..8]` and
+    /// `r[8..16]`), one per 128-bit lane: every in-lane operation is the
+    /// 128-bit pass's own, so the results are identical. Returns the two
+    /// rows' outputs, each as one 256-bit vector (outputs 0..8).
+    #[inline]
+    #[target_feature(enable = "avx2,f16c")]
+    unsafe fn row_pass2(r: *const f32) -> (__m256, __m256) {
+        let lo = _mm256_set_m128(_mm_loadu_ps(r.add(8)), _mm_loadu_ps(r));
+        let hi = _mm256_set_m128(_mm_loadu_ps(r.add(12)), _mm_loadu_ps(r.add(4)));
+        let both = |v: &[f32; 4]| {
+            let x = _mm_loadu_ps(v.as_ptr());
+            _mm256_set_m128(x, x)
+        };
+        let (m0, m1, m2, m3) = (both(&M1[0]), both(&M1[1]), both(&M1[2]), both(&M1[3]));
+        let (n0, n1, n2, n3) = (both(&M2[0]), both(&M2[1]), both(&M2[2]), both(&M2[3]));
+        let e = _mm256_add_ps(
+            _mm256_add_ps(
+                _mm256_mul_ps(_mm256_shuffle_ps::<0x00>(lo, lo), m0),
+                _mm256_mul_ps(_mm256_shuffle_ps::<0xaa>(lo, lo), m1),
+            ),
+            _mm256_add_ps(
+                _mm256_mul_ps(_mm256_shuffle_ps::<0x00>(hi, hi), m2),
+                _mm256_mul_ps(_mm256_shuffle_ps::<0xaa>(hi, hi), m3),
+            ),
+        );
+        let o = _mm256_add_ps(
+            _mm256_add_ps(
+                _mm256_mul_ps(_mm256_shuffle_ps::<0x55>(lo, lo), n0),
+                _mm256_mul_ps(_mm256_shuffle_ps::<0xff>(lo, lo), n1),
+            ),
+            _mm256_add_ps(
+                _mm256_mul_ps(_mm256_shuffle_ps::<0x55>(hi, hi), n2),
+                _mm256_mul_ps(_mm256_shuffle_ps::<0xff>(hi, hi), n3),
+            ),
+        );
+        let s = _mm256_add_ps(e, o);
+        let d = _mm256_sub_ps(e, o);
+        let dr = _mm256_shuffle_ps::<0x1b>(d, d);
+        (
+            _mm256_permute2f128_ps::<0x20>(s, dr),
+            _mm256_permute2f128_ps::<0x31>(s, dr),
+        )
+    }
+
     #[inline]
     #[target_feature(enable = "avx2,f16c")]
     unsafe fn idct_avx2(d: &mut [f32; 64], zr: usize) {
         let present = 8 - zr;
         let mut rows = [_mm256_setzero_ps(); 8];
-        for i in 0..present {
-            let (lo, hi) = row_pass(d.as_ptr().add(i * 8));
-            rows[i] = _mm256_set_m128(hi, lo);
+        // Row pairs at full width (a row past `present` is zero input and
+        // never read by the column pass); a lone first row (zr == 7) on the
+        // 128-bit pass.
+        if present == 1 {
+            let (lo, hi) = row_pass(d.as_ptr());
+            rows[0] = _mm256_set_m128(hi, lo);
+        } else {
+            for i in (0..present).step_by(2) {
+                (rows[i], rows[i + 1]) = row_pass2(d.as_ptr().add(i * 8));
+            }
         }
         let p = d.as_mut_ptr();
         if zr == 7 {
