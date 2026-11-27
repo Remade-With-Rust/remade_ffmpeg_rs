@@ -138,63 +138,166 @@ fn wav_decode(buf: &mut [u16], nx: usize, ox: usize, ny: usize, oy: usize, max: 
     }
 }
 
-fn wav_decode_impl<const W14: bool>(buf: &mut [u16], nx: usize, ox: usize, ny: usize, oy: usize) {
-    let dec = if W14 { wdec14 } else { wdec16 };
+/// The largest level step `p` (a power of two) and its double, for an
+/// `nx` x `ny` grid, as the inverse transform starts.
+fn top_level(nx: usize, ny: usize) -> (usize, usize) {
     let n = nx.min(ny);
     let mut p = 1;
     while p <= n {
         p <<= 1;
     }
     p >>= 1;
-    let mut p2 = p;
-    p >>= 1;
+    (p >> 1, p)
+}
+
+fn wav_decode_impl<const W14: bool>(buf: &mut [u16], nx: usize, ox: usize, ny: usize, oy: usize) {
+    let (mut p, mut p2) = top_level(nx, ny);
     while p >= 1 {
-        let oy1 = oy * p;
-        let oy2 = oy * p2;
-        let ox1 = ox * p;
-        let ox2 = ox * p2;
-        let ey = oy * (ny - p2);
-        let mut py = 0;
-        while py <= ey {
-            let ex = py + ox * (nx - p2);
-            // Every index below is at most ex + oy1 + ox1.
-            assert!(ex + oy1 + ox1 < buf.len());
-            let mut px = py;
-            while px <= ex {
-                let p01 = px + ox1;
-                let p10 = px + oy1;
-                let p11 = p10 + ox1;
-                let (i00, i10) = dec(buf[px], buf[p10]);
-                let (i01, i11) = dec(buf[p01], buf[p11]);
-                let (a, b) = dec(i00, i01);
-                buf[px] = a;
-                buf[p01] = b;
-                let (a, b) = dec(i10, i11);
-                buf[p10] = a;
-                buf[p11] = b;
-                px += ox2;
-            }
-            if nx & p != 0 {
-                let p10 = px + oy1;
-                let (a, b) = dec(buf[px], buf[p10]);
-                buf[px] = a;
-                buf[p10] = b;
-            }
-            py += oy2;
+        wav_decode_level::<W14>(buf, nx, ox, ny, oy, p, p2);
+        p2 = p;
+        p >>= 1;
+    }
+}
+
+/// One level (step `p`) of the inverse wavelet.
+fn wav_decode_level<const W14: bool>(
+    buf: &mut [u16],
+    nx: usize,
+    ox: usize,
+    ny: usize,
+    oy: usize,
+    p: usize,
+    p2: usize,
+) {
+    let dec = if W14 { wdec14 } else { wdec16 };
+    let oy1 = oy * p;
+    let oy2 = oy * p2;
+    let ox1 = ox * p;
+    let ox2 = ox * p2;
+    let ey = oy * (ny - p2);
+    let mut py = 0;
+    while py <= ey {
+        let ex = py + ox * (nx - p2);
+        // Every index below is at most ex + oy1 + ox1.
+        assert!(ex + oy1 + ox1 < buf.len());
+        let mut px = py;
+        while px <= ex {
+            let p01 = px + ox1;
+            let p10 = px + oy1;
+            let p11 = p10 + ox1;
+            let (i00, i10) = dec(buf[px], buf[p10]);
+            let (i01, i11) = dec(buf[p01], buf[p11]);
+            let (a, b) = dec(i00, i01);
+            buf[px] = a;
+            buf[p01] = b;
+            let (a, b) = dec(i10, i11);
+            buf[p10] = a;
+            buf[p11] = b;
+            px += ox2;
         }
-        if ny & p != 0 {
-            let ex = py + ox * (nx - p2);
-            let mut px = py;
-            while px <= ex {
-                let p01 = px + ox1;
-                let (a, b) = dec(buf[px], buf[p01]);
-                buf[px] = a;
-                buf[p01] = b;
-                px += ox2;
+        if nx & p != 0 {
+            let p10 = px + oy1;
+            let (a, b) = dec(buf[px], buf[p10]);
+            buf[px] = a;
+            buf[p10] = b;
+        }
+        py += oy2;
+    }
+    if ny & p != 0 {
+        let ex = py + ox * (nx - p2);
+        let mut px = py;
+        while px <= ex {
+            let p01 = px + ox1;
+            let (a, b) = dec(buf[px], buf[p01]);
+            buf[px] = a;
+            buf[p01] = b;
+            px += ox2;
+        }
+    }
+}
+
+/// Inverse wavelet of one channel plane: `nx` x `ny` samples of `spp`
+/// interleaved 16-bit words (2 for FLOAT/UINT channels), each word plane
+/// transformed on its own as OpenEXR does. Same result as calling
+/// [`wav_decode`] per word plane: the planes touch disjoint words, so their
+/// levels may interleave, and level 1 (three quarters of all the work)
+/// runs through the SIMD row kernel for every plane at once.
+fn wav_decode_plane(s: &mut [u16], nx: usize, ny: usize, spp: usize, max: u16) {
+    let isa = crate::simd::isa();
+    if isa == crate::simd::Isa::Scalar {
+        for off in 0..spp {
+            wav_decode(&mut s[off..], nx, spp, ny, nx * spp, max);
+        }
+    } else if max < (1 << 14) {
+        wav_decode_plane_impl::<true>(s, nx, ny, spp, isa);
+    } else {
+        wav_decode_plane_impl::<false>(s, nx, ny, spp, isa);
+    }
+}
+
+fn wav_decode_plane_impl<const W14: bool>(
+    s: &mut [u16],
+    nx: usize,
+    ny: usize,
+    spp: usize,
+    isa: crate::simd::Isa,
+) {
+    let (ox, oy) = (spp, nx * spp);
+    let (mut p, mut p2) = top_level(nx, ny);
+    while p >= 1 {
+        if p == 1 {
+            wav_decode_level1::<W14>(s, nx, ny, spp, isa);
+        } else {
+            for off in 0..spp {
+                wav_decode_level::<W14>(&mut s[off..], nx, ox, ny, oy, p, p2);
             }
         }
         p2 = p;
         p >>= 1;
+    }
+}
+
+/// Level 1 of [`wav_decode_level`] for every word plane at once.
+fn wav_decode_level1<const W14: bool>(
+    s: &mut [u16],
+    nx: usize,
+    ny: usize,
+    spp: usize,
+    isa: crate::simd::Isa,
+) {
+    let dec = if W14 { wdec14 } else { wdec16 };
+    let row = nx * spp;
+    let groups = nx / 2; // 2x2 groups per row pair
+    let mut py = 0;
+    while py + 2 * row <= ny * row {
+        let (top, bot) = s[py..py + 2 * row].split_at_mut(row);
+        let done = crate::simd::piz_wdec_rows(isa, top, bot, groups * 2 * spp, spp, W14);
+        for g in done / (2 * spp)..groups {
+            for off in 0..spp {
+                let x = g * 2 * spp + off;
+                let y = x + spp;
+                let (i00, i10) = dec(top[x], bot[x]);
+                let (i01, i11) = dec(top[y], bot[y]);
+                (top[x], top[y]) = dec(i00, i01);
+                (bot[x], bot[y]) = dec(i10, i11);
+            }
+        }
+        if nx & 1 != 0 {
+            for off in 0..spp {
+                let x = groups * 2 * spp + off;
+                (top[x], bot[x]) = dec(top[x], bot[x]);
+            }
+        }
+        py += 2 * row;
+    }
+    if ny & 1 != 0 {
+        let last = &mut s[py..py + row];
+        for g in 0..groups {
+            for off in 0..spp {
+                let x = g * 2 * spp + off;
+                (last[x], last[x + spp]) = dec(last[x], last[x + spp]);
+            }
+        }
     }
 }
 
@@ -268,17 +371,13 @@ pub(crate) fn decompress(
         let spp = ch.ty.bytes() / 2;
         let count = ch.width * ch.height * spp;
         if count > 0 {
-            let s = &mut tmp[start..start + count];
-            for off in 0..spp {
-                wav_decode(
-                    &mut s[off..],
-                    ch.width,
-                    spp,
-                    ch.height,
-                    ch.width * spp,
-                    max_value,
-                );
-            }
+            wav_decode_plane(
+                &mut tmp[start..start + count],
+                ch.width,
+                ch.height,
+                spp,
+                max_value,
+            );
         }
         start += count;
     }
@@ -357,6 +456,57 @@ mod tests {
             for h in (0..=u16::MAX).step_by(11) {
                 assert_eq!(wdec16(l, h), wdec16_reference(l, h));
                 assert_eq!(wdec14(l, h), wdec14_reference(l, h));
+            }
+        }
+    }
+
+    /// The plane decoder (SIMD level 1, interleaved word planes) against the
+    /// per-plane scalar oracle, for every ISA this CPU has, over odd and
+    /// even sizes, both word counts, both value ranges and random words.
+    #[test]
+    fn plane_decoder_matches_scalar() {
+        let mut seed = 0x2545_f491u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let sizes = [
+            (1, 1),
+            (2, 2),
+            (3, 2),
+            (2, 3),
+            (5, 7),
+            (16, 2),
+            (17, 3),
+            (33, 9),
+            (40, 41),
+            (64, 16),
+            (97, 31),
+            (130, 5),
+        ];
+        for &(nx, ny) in &sizes {
+            for spp in [1, 2] {
+                for max in [100u16, 0x3fff, 0x4000, 60000] {
+                    let orig: Vec<u16> = (0..nx * ny * spp).map(|_| next() as u16).collect();
+                    let mut want = orig.clone();
+                    for off in 0..spp {
+                        wav_decode(&mut want[off..], nx, spp, ny, nx * spp, max);
+                    }
+                    for isa in crate::simd::available() {
+                        let mut got = orig.clone();
+                        if max < (1 << 14) {
+                            wav_decode_plane_impl::<true>(&mut got, nx, ny, spp, isa);
+                        } else {
+                            wav_decode_plane_impl::<false>(&mut got, nx, ny, spp, isa);
+                        }
+                        assert_eq!(got, want, "{isa:?} {nx}x{ny} spp {spp} max {max}");
+                    }
+                    let mut got = orig.clone();
+                    wav_decode_plane(&mut got, nx, ny, spp, max);
+                    assert_eq!(got, want, "dispatch {nx}x{ny} spp {spp} max {max}");
+                }
             }
         }
     }

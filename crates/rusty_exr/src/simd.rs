@@ -110,6 +110,39 @@ pub(crate) fn dwa_block(
     }
 }
 
+// ---------------------------------------------------------------------------
+// PIZ: level 1 of the inverse wavelet over one row pair.
+
+/// Inverse-wavelet level 1 over the first `len` words of a row pair:
+/// `len` covers whole 2x2 groups of `unit`-word samples (`unit` 1 for
+/// HALF planes, 2 for the two interleaved word planes of FLOAT/UINT), each
+/// group being samples `x` and `x + unit` of `top` and `bot`. Processes a
+/// prefix of whole 16-word chunks and returns its length; the caller
+/// finishes the rest with the scalar code. Bit-identical to `piz`'s
+/// `wdec14`/`wdec16` group step (wrapping 16-bit integer arithmetic).
+pub(crate) fn piz_wdec_rows(
+    isa: Isa,
+    top: &mut [u16],
+    bot: &mut [u16],
+    len: usize,
+    unit: usize,
+    w14: bool,
+) -> usize {
+    assert!(len <= top.len() && len <= bot.len() && (unit == 1 || unit == 2));
+    let chunks = len / 16;
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SSE2 is part of x86-64; the kernel touches words
+        // `0..chunks * 16`, inside both slices (checked above).
+        Isa::Sse2 => unsafe { x86::wdec_rows_sse2(top, bot, chunks, unit, w14) },
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: as above, and AVX2 was detected before `Isa::Avx2` is chosen.
+        Isa::Avx2 => unsafe { x86::wdec_rows_avx2(top, bot, chunks, unit, w14) },
+        _ => return 0,
+    }
+    chunks * 16
+}
+
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::wildcard_imports)]
 mod x86 {
@@ -534,6 +567,198 @@ mod x86 {
             f2h64_f16c(&d[c], &mut out[c]);
         }
         true
+    }
+
+    // --- PIZ inverse wavelet, level 1 -----------------------------------------
+
+    /// Generates the 2x2 group step for one vector width. `$de` splits two
+    /// loaded vectors into first and second samples of each pair, `$il`
+    /// interleaves them back.
+    macro_rules! wdec_kernel {
+        ($name:ident, $feat:literal, $V:ty, $n:literal, $load:ident, $store:ident,
+         $add:ident, $sub:ident, $and:ident, $srai:ident, $srli:ident, $set1:ident,
+         $de1:ident, $il1:ident, $de2:ident, $il2:ident) => {
+            #[target_feature(enable = $feat)]
+            unsafe fn $name<const W14: bool, const UNIT: usize>(
+                top: *mut u16,
+                bot: *mut u16,
+                chunks: usize,
+            ) {
+                #[inline]
+                #[target_feature(enable = $feat)]
+                unsafe fn dec<const W14: bool>(l: $V, h: $V) -> ($V, $V) {
+                    if W14 {
+                        let a = $add($add(l, $and(h, $set1(1))), $srai::<1>(h));
+                        (a, $sub(a, h))
+                    } else {
+                        let bb = $sub(l, $srli::<1>(h));
+                        ($sub($add(h, bb), $set1(-0x8000)), bb)
+                    }
+                }
+                for c in 0..chunks {
+                    let (t, b) = (top.add(c * $n), bot.add(c * $n));
+                    let lanes = $n / 2;
+                    let (t0, t1) = ($load(t.cast()), $load(t.add(lanes).cast()));
+                    let (b0, b1) = ($load(b.cast()), $load(b.add(lanes).cast()));
+                    let ((ta, tb), (ba, bb)) = if UNIT == 1 {
+                        ($de1(t0, t1), $de1(b0, b1))
+                    } else {
+                        ($de2(t0, t1), $de2(b0, b1))
+                    };
+                    let (i00, i10) = dec::<W14>(ta, ba);
+                    let (i01, i11) = dec::<W14>(tb, bb);
+                    let (a, bv) = dec::<W14>(i00, i01);
+                    let (cv, dv) = dec::<W14>(i10, i11);
+                    let ((o0, o1), (o2, o3)) = if UNIT == 1 {
+                        ($il1(a, bv), $il1(cv, dv))
+                    } else {
+                        ($il2(a, bv), $il2(cv, dv))
+                    };
+                    $store(t.cast(), o0);
+                    $store(t.add(lanes).cast(), o1);
+                    $store(b.cast(), o2);
+                    $store(b.add(lanes).cast(), o3);
+                }
+            }
+        };
+    }
+
+    // 16-bit units: first samples are the even words, second the odd ones.
+    #[inline(always)]
+    unsafe fn de1_128(v0: __m128i, v1: __m128i) -> (__m128i, __m128i) {
+        (
+            _mm_packs_epi32(
+                _mm_srai_epi32::<16>(_mm_slli_epi32::<16>(v0)),
+                _mm_srai_epi32::<16>(_mm_slli_epi32::<16>(v1)),
+            ),
+            _mm_packs_epi32(_mm_srai_epi32::<16>(v0), _mm_srai_epi32::<16>(v1)),
+        )
+    }
+    #[inline(always)]
+    unsafe fn il1_128(a: __m128i, b: __m128i) -> (__m128i, __m128i) {
+        (_mm_unpacklo_epi16(a, b), _mm_unpackhi_epi16(a, b))
+    }
+    // 32-bit units: first samples are the even dwords, second the odd ones.
+    #[inline(always)]
+    unsafe fn de2_128(v0: __m128i, v1: __m128i) -> (__m128i, __m128i) {
+        let s0 = _mm_shuffle_epi32::<0b11_01_10_00>(v0);
+        let s1 = _mm_shuffle_epi32::<0b11_01_10_00>(v1);
+        (_mm_unpacklo_epi64(s0, s1), _mm_unpackhi_epi64(s0, s1))
+    }
+    #[inline(always)]
+    unsafe fn il2_128(a: __m128i, b: __m128i) -> (__m128i, __m128i) {
+        (_mm_unpacklo_epi32(a, b), _mm_unpackhi_epi32(a, b))
+    }
+    // 256-bit versions: every step stays inside 128-bit lanes, and the
+    // interleave undoes the split lane by lane.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn de1_256(v0: __m256i, v1: __m256i) -> (__m256i, __m256i) {
+        (
+            _mm256_packs_epi32(
+                _mm256_srai_epi32::<16>(_mm256_slli_epi32::<16>(v0)),
+                _mm256_srai_epi32::<16>(_mm256_slli_epi32::<16>(v1)),
+            ),
+            _mm256_packs_epi32(_mm256_srai_epi32::<16>(v0), _mm256_srai_epi32::<16>(v1)),
+        )
+    }
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn il1_256(a: __m256i, b: __m256i) -> (__m256i, __m256i) {
+        (_mm256_unpacklo_epi16(a, b), _mm256_unpackhi_epi16(a, b))
+    }
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn de2_256(v0: __m256i, v1: __m256i) -> (__m256i, __m256i) {
+        let s0 = _mm256_shuffle_epi32::<0b11_01_10_00>(v0);
+        let s1 = _mm256_shuffle_epi32::<0b11_01_10_00>(v1);
+        (_mm256_unpacklo_epi64(s0, s1), _mm256_unpackhi_epi64(s0, s1))
+    }
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn il2_256(a: __m256i, b: __m256i) -> (__m256i, __m256i) {
+        (_mm256_unpacklo_epi32(a, b), _mm256_unpackhi_epi32(a, b))
+    }
+
+    wdec_kernel!(
+        wdec_sse2,
+        "sse2",
+        __m128i,
+        16,
+        _mm_loadu_si128,
+        _mm_storeu_si128,
+        _mm_add_epi16,
+        _mm_sub_epi16,
+        _mm_and_si128,
+        _mm_srai_epi16,
+        _mm_srli_epi16,
+        _mm_set1_epi16,
+        de1_128,
+        il1_128,
+        de2_128,
+        il2_128
+    );
+    wdec_kernel!(
+        wdec_avx2,
+        "avx2",
+        __m256i,
+        32,
+        _mm256_loadu_si256,
+        _mm256_storeu_si256,
+        _mm256_add_epi16,
+        _mm256_sub_epi16,
+        _mm256_and_si256,
+        _mm256_srai_epi16,
+        _mm256_srli_epi16,
+        _mm256_set1_epi16,
+        de1_256,
+        il1_256,
+        de2_256,
+        il2_256
+    );
+
+    pub(super) unsafe fn wdec_rows_sse2(
+        top: &mut [u16],
+        bot: &mut [u16],
+        chunks: usize,
+        unit: usize,
+        w14: bool,
+    ) {
+        let (t, b) = (top.as_mut_ptr(), bot.as_mut_ptr());
+        match (w14, unit) {
+            (true, 1) => wdec_sse2::<true, 1>(t, b, chunks),
+            (true, _) => wdec_sse2::<true, 2>(t, b, chunks),
+            (false, 1) => wdec_sse2::<false, 1>(t, b, chunks),
+            (false, _) => wdec_sse2::<false, 2>(t, b, chunks),
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn wdec_rows_avx2(
+        top: &mut [u16],
+        bot: &mut [u16],
+        chunks: usize,
+        unit: usize,
+        w14: bool,
+    ) {
+        // 32-word chunks, then at most one 16-word chunk.
+        let (t, b) = (top.as_mut_ptr(), bot.as_mut_ptr());
+        let wide = chunks / 2;
+        match (w14, unit) {
+            (true, 1) => wdec_avx2::<true, 1>(t, b, wide),
+            (true, _) => wdec_avx2::<true, 2>(t, b, wide),
+            (false, 1) => wdec_avx2::<false, 1>(t, b, wide),
+            (false, _) => wdec_avx2::<false, 2>(t, b, wide),
+        }
+        if chunks % 2 == 1 {
+            let (t, b) = (t.add(wide * 32), b.add(wide * 32));
+            match (w14, unit) {
+                (true, 1) => wdec_sse2::<true, 1>(t, b, 1),
+                (true, _) => wdec_sse2::<true, 2>(t, b, 1),
+                (false, 1) => wdec_sse2::<false, 1>(t, b, 1),
+                (false, _) => wdec_sse2::<false, 2>(t, b, 1),
+            }
+        }
     }
 
     // --- test hooks -------------------------------------------------------
