@@ -317,54 +317,8 @@ fn decompress_with(
     // from the short table without a check (invalid codes), leaving that
     // symbol, and the stream's end, to the checked loop.
     let whole = (n_bits / 8) as usize;
-    let safe_bytes = whole.saturating_sub(16);
     if fast && whole >= 24 {
-        loop {
-            if bits.count < 32 {
-                if bits.byte > safe_bytes {
-                    break;
-                }
-                bits.refill();
-            }
-            let e = dec.short[bits.peek(DEC_BITS) as usize];
-            let (sym, l) = if e & 0xff != 0 {
-                (e >> 8, e & 0xff)
-            } else if e == LONG {
-                if bits.byte > safe_bytes {
-                    break;
-                }
-                bits.refill();
-                decode_long(&dec, &bits)?
-            } else {
-                break;
-            };
-            bits.consume(l);
-            if sym == rlc {
-                // After a short code at least 32 - 14 bits remain; after a long
-                // one the buffer may need topping up (the read position stays
-                // within 15 bytes of the last check, inside the code bytes).
-                if bits.count < 8 {
-                    bits.refill();
-                }
-                let n = bits.peek(8) as usize;
-                bits.consume(8);
-                if pos == 0 {
-                    return Err(Error::invalid("Huffman run with nothing to repeat"));
-                }
-                if pos + n > out_len {
-                    return Err(Error::invalid("Huffman data longer than expected"));
-                }
-                let last = out[pos - 1];
-                out[pos..pos + n].fill(last);
-                pos += n;
-            } else {
-                let Some(slot) = out.get_mut(pos) else {
-                    return Err(Error::invalid("Huffman data longer than expected"));
-                };
-                *slot = sym as u16;
-                pos += 1;
-            }
-        }
+        pos = fast_prefix(&dec, rlc, &mut bits, out, whole - 16)?;
     }
     // The checked loop finishes from the exact same state.
     let mut left = n_bits - (8 * bits.byte as u64 - u64::from(bits.count));
@@ -418,6 +372,85 @@ fn decompress_with(
         )));
     }
     Ok(())
+}
+
+/// The unchecked fast prefix of [`decompress_with`]: decodes from the start
+/// while the read position is at most `safe_bytes` (16 bytes before the
+/// last whole byte of code bits), where no code or run count can run past
+/// the bit count (the buffer never holds more than 64 bits beyond the read
+/// position), so the budget checks of the checked loop cannot fire. Stops
+/// at the first entry it cannot decode from the tables without a check
+/// (invalid codes) and returns the output position; `bits` is left in the
+/// matching state for the checked loop. Its own function, with the table
+/// as a fixed-size array, the output as a slice and the bit state in
+/// locals, so the hot path keeps all of them in registers (as part of
+/// `decompress_with` the output pointer and length were reloaded, the
+/// table index bounds-checked and the position spilled, every symbol).
+#[inline(never)]
+fn fast_prefix(
+    dec: &DecTable<'_>,
+    rlc: u32,
+    state: &mut BitIn<'_>,
+    out: &mut [u16],
+    safe_bytes: usize,
+) -> Result<usize> {
+    let short: &[u32; DEC_SIZE] = dec.short.try_into().expect("full short table");
+    let mut bits = BitIn {
+        data: state.data,
+        byte: state.byte,
+        buf: state.buf,
+        count: state.count,
+    };
+    let out_len = out.len();
+    let mut pos = 0usize;
+    loop {
+        if bits.count < 32 {
+            if bits.byte > safe_bytes {
+                break;
+            }
+            bits.refill();
+        }
+        let e = short[bits.peek(DEC_BITS) as usize];
+        let (sym, l) = if e & 0xff != 0 {
+            (e >> 8, e & 0xff)
+        } else if e == LONG {
+            if bits.byte > safe_bytes {
+                break;
+            }
+            bits.refill();
+            decode_long(dec, &bits)?
+        } else {
+            break;
+        };
+        bits.consume(l);
+        if sym == rlc {
+            // After a short code at least 32 - 14 bits remain; after a long
+            // one the buffer may need topping up (the read position stays
+            // within 15 bytes of the last check, inside the code bytes).
+            if bits.count < 8 {
+                bits.refill();
+            }
+            let n = bits.peek(8) as usize;
+            bits.consume(8);
+            if pos == 0 {
+                return Err(Error::invalid("Huffman run with nothing to repeat"));
+            }
+            if pos + n > out_len {
+                return Err(Error::invalid("Huffman data longer than expected"));
+            }
+            let last = out[pos - 1];
+            out[pos..pos + n].fill(last);
+            pos += n;
+        } else {
+            let Some(slot) = out.get_mut(pos) else {
+                return Err(Error::invalid("Huffman data longer than expected"));
+            };
+            *slot = sym as u16;
+            pos += 1;
+        }
+    }
+    *state = bits;
+    Ok(pos)
 }
 
 /// The code longer than `DEC_BITS` at the head of the stream.
