@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.5](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-heif-v0.9.4...rff-format-heif-v0.9.5) - 2026-11-27
+
+### Added
+
+- *(rff-format-heif)* decode monochrome-coded alpha (sync rusty_h265 4:0:0) ([#246](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/246))
+
 ## [0.9.3](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-heif-v0.9.2...rff-format-heif-v0.9.3) - 2026-11-26
 
 ### Other
