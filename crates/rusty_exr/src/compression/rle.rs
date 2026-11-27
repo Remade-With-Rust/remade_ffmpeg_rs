@@ -57,7 +57,11 @@ fn unpack_slice(src: &[u8], out: &mut [u8]) -> Result<usize> {
         let d: &mut [u8; 128] = (&mut out[o..o + 128]).try_into().expect("128 bytes");
         if n < 0 {
             let n = usize::from(n.unsigned_abs());
-            for (dc, sc) in d.chunks_exact_mut(16).zip(s.chunks_exact(16)).take(n.div_ceil(16)) {
+            for (dc, sc) in d
+                .chunks_exact_mut(16)
+                .zip(s.chunks_exact(16))
+                .take(n.div_ceil(16))
+            {
                 dc.copy_from_slice(sc);
             }
             i += 1 + n;
@@ -280,7 +284,15 @@ mod tests {
         };
         for case in 0..4000 {
             let len = (next() % 600) as usize;
-            let data: Vec<u8> = (0..len).map(|i| if next() % 3 == 0 { (i / 7) as u8 } else { next() as u8 }).collect();
+            let data: Vec<u8> = (0..len)
+                .map(|i| {
+                    if next() % 3 == 0 {
+                        (i / 7) as u8
+                    } else {
+                        next() as u8
+                    }
+                })
+                .collect();
             let mut p = pack(&data);
             // Damage: flip, truncate or extend some streams.
             match case % 4 {
@@ -296,7 +308,11 @@ mod tests {
                 let mut out = vec![9u8; 5];
                 let got = unpack_into(&p, want, &mut out).map(|()| out);
                 let refr = unpack_reference(&p, want);
-                assert_eq!(format!("{got:?}"), format!("{refr:?}"), "case {case} want {want}");
+                assert_eq!(
+                    format!("{got:?}"),
+                    format!("{refr:?}"),
+                    "case {case} want {want}"
+                );
             }
         }
     }

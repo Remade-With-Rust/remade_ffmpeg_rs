@@ -726,7 +726,8 @@ pub(crate) fn decompress(
         // byte (the ZIP byte split of 2n bytes, whose halves are n each).
         let (lo, hi) = b.split_at(n);
         ds.dc.clear();
-        ds.dc.extend(lo.iter().zip(hi).map(|(&l, &h)| u16::from_le_bytes([l, h])));
+        ds.dc
+            .extend(lo.iter().zip(hi).map(|(&l, &h)| u16::from_le_bytes([l, h])));
         &ds.dc
     } else {
         if dc_count != 0 {
@@ -779,15 +780,7 @@ pub(crate) fn decompress(
             // Channels in a set share geometry (checked in `classify`), and
             // distinct channels own disjoint word ranges.
             let mut outs = disjoint3(words, set.map(|i| (offs[i], w * h)));
-            decode_lossy(
-                &mut acr,
-                dc,
-                &mut dc_pos,
-                w,
-                h,
-                Some(to_linear),
-                &mut outs,
-            )?;
+            decode_lossy(&mut acr, dc, &mut dc_pos, w, h, Some(to_linear), &mut outs)?;
         } else {
             let [b0, b1, b2] = &mut ds.bufs;
             let mut outs: [&mut [u16]; 3] = [
@@ -795,15 +788,7 @@ pub(crate) fn decompress(
                 super::grow(b1, w * h),
                 super::grow(b2, w * h),
             ];
-            decode_lossy(
-                &mut acr,
-                dc,
-                &mut dc_pos,
-                w,
-                h,
-                Some(to_linear),
-                &mut outs,
-            )?;
+            decode_lossy(&mut acr, dc, &mut dc_pos, w, h, Some(to_linear), &mut outs)?;
             for (k, &ci) in set.iter().enumerate() {
                 store_words(words, &chans[ci], offs[ci], &ds.bufs[k][..w * h]);
             }
@@ -825,11 +810,7 @@ pub(crate) fn decompress(
         }
         match schemes[ci] {
             Scheme::Lossy => {
-                let lin = if ch.p_linear {
-                    None
-                } else {
-                    Some(to_linear)
-                };
+                let lin = if ch.p_linear { None } else { Some(to_linear) };
                 let n = ch.width * ch.height;
                 if ch.ty == SampleType::F16 {
                     let out = &mut words[offs[ci]..offs[ci] + n];
@@ -930,7 +911,11 @@ fn store_words(words: &mut [u16], ch: &ChanGeom<'_>, off: usize, halves: &[u16])
     match ch.ty {
         SampleType::F16 => words[off..off + n].copy_from_slice(&halves[..n]),
         SampleType::F32 => {
-            halves_to_f32_words(crate::simd::isa(), &halves[..n], &mut words[off..off + 2 * n]);
+            halves_to_f32_words(
+                crate::simd::isa(),
+                &halves[..n],
+                &mut words[off..off + 2 * n],
+            );
         }
         SampleType::U32 => {
             let w = ch.width;
