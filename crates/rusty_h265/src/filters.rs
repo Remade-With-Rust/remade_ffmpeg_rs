@@ -147,6 +147,7 @@ fn deblock(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps) {
     let h4 = st.h4;
     let bd_y = sps.bit_depth_luma;
     let bd_c = sps.bit_depth_chroma;
+    let chroma = sps.chroma_array_type != 0;
     // The boundary strengths were derived during the parse, by the coding,
     // prediction and transform units that own each edge (`SliceDecoder::
     // bs_edges`). The per-picture scan that re-derived them from the per-4x4
@@ -225,8 +226,9 @@ fn deblock(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps) {
                 accel::deblock::luma_edge(&mut pl.data, st_, x4 * 4, y4 * 4, dir, beta, tc, no_p, no_q, mx);
 
                 // Chroma: bS == 2 on the chroma 8-grid (the luma 16-grid).
+                // None at all in 4:0:0.
                 let on_chroma_grid = if dir == 0 { x4 % 4 == 0 } else { y4 % 4 == 0 };
-                if b == 2 && on_chroma_grid {
+                if b == 2 && on_chroma_grid && chroma {
                     if accel::census::ALWAYS {
                         accel::census::arm(&accel::census::RT_DEBLOCK_CHROMA);
                     }

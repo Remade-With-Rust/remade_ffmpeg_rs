@@ -146,6 +146,9 @@ pub struct SliceDecoder<'a> {
     intra_split: bool,
     max_trafo_depth: u8,
     intra_chroma_mode: u8,
+    /// `ChromaArrayType != 0`: false for a 4:0:0 stream, which codes no
+    /// chroma syntax and has no chroma planes to write.
+    chroma: bool,
     coeffs: Vec<i32>,
     /// Stage-1 scratch for the inverse transform, reused across blocks.
     itx_tmp: Vec<i32>,
@@ -365,6 +368,7 @@ impl<'a> SliceDecoder<'a> {
             intra_split: false,
             max_trafo_depth: 0,
             intra_chroma_mode: 0,
+            chroma: inp.sps.chroma_array_type != 0,
             coeffs: vec![0; 32 * 32],
             itx_tmp: vec![0; 32 * 32],
             dbg_cu: std::env::var_os("RH265_DBG_CU").is_some(),
@@ -893,7 +897,10 @@ impl<'a> SliceDecoder<'a> {
         // The NxN split's internal prediction block edges coincide with its
         // transform block edges (an intra NxN coding unit always splits its
         // transform tree), so the transform units derive them; nothing to do.
-        // intra_chroma_pred_mode (once for 4:2:0)
+        // intra_chroma_pred_mode (once for 4:2:0; absent in 4:0:0)
+        if !self.chroma {
+            return Ok(());
+        }
         let icpm = if self.cab.decode(CTX_INTRA_CHROMA_PRED_MODE) == 0 { 4 } else { self.cab.bypass_bits(2) as u8 };
         let luma0 = self.st.cell[self.st.idx4(x0, y0)].intra_mode;
         self.intra_chroma_mode = match icpm {
@@ -972,7 +979,9 @@ impl<'a> SliceDecoder<'a> {
                 }
             }
         }
-        for c in 1..3 {
+        // No chroma samples when ChromaArrayType is 0.
+        let ncomp = if self.chroma { 3 } else { 1 };
+        for c in 1..ncomp {
             let pl = &mut self.pic.planes[c];
             for y in 0..n / 2 {
                 for x in 0..n / 2 {
