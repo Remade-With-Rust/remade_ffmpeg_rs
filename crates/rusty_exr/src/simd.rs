@@ -18,6 +18,9 @@
 //! commutative bit for bit (NaN operand order is the one thing that could
 //! differ, and the callers keep non-finite data on the scalar path).
 
+// Off x86-64 every dispatcher reduces to its scalar arm, so the kernel
+// arguments go unused and the code after the early return is unreachable.
+#![cfg_attr(not(target_arch = "x86_64"), allow(unused_variables, unreachable_code))]
 #![allow(unsafe_code)]
 
 /// Which kernel family the process uses.
