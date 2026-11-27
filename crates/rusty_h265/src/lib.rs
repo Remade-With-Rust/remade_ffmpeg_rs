@@ -2,7 +2,8 @@
 //!
 //! Written from ITU-T H.265 (with the JCT-VC HM reference decoder as the
 //! transcribable source) and gated on the JCT-VC HEVC_v1 conformance suite.
-//! Scope (v1): Main, Main 10 and Main Still Picture — 4:2:0, 8 and 10 bit.
+//! Scope (v1): Main, Main 10 and Main Still Picture — 4:2:0 or 4:0:0
+//! (monochrome), 8 and 10 bit.
 //! Range extensions, screen content coding and layered profiles are parsed
 //! and refused with a named [`Error::Unsupported`].
 //!

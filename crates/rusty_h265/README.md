@@ -10,7 +10,8 @@ ITU-T H.265 with the JCT-VC HM reference decoder (BSD-3) as the transcribable
 source, and gated on the **JCT-VC HEVC_v1 conformance suite** (147 streams,
 published YUV md5 + the decoded-picture-hash SEI of every picture).
 
-Scope (v1): **Main, Main 10 and Main Still Picture** — 4:2:0, 8 and 10 bit,
+Scope (v1): **Main, Main 10 and Main Still Picture** — 4:2:0 or 4:0:0
+(monochrome), 8 and 10 bit,
 every version-1 tool: CABAC, all intra modes, merge/AMVP/TMVP, weighted
 prediction, PCM, lossless, transform skip, scaling lists, sign data hiding,
 deblocking, SAO, slices, dependent slice segments, tiles and wavefront
@@ -45,7 +46,8 @@ decoded-picture-hash SEI (MD5 / CRC / checksum) and counts mismatches in
 
 The `rusty_h265` binary is the conformance-harness front end:
 `rusty_h265 <in.bit> <out.yuv> [--verify-sei]` writes the cropped pictures as
-planar 4:2:0 (`u8`, or `u16` little-endian above 8 bits) in output order.
+planar 4:2:0, or luma only for 4:0:0 (`u8`, or `u16` little-endian above 8
+bits), in output order.
 
 ## Performance
 

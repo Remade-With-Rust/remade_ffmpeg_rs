@@ -25,11 +25,17 @@ impl<'a> SliceDecoder<'a> {
         };
         let (mut cbf_cb, mut cbf_cr) = (false, false);
         if log2 > 2 {
-            if depth == 0 || parent_cbf_cb {
-                cbf_cb = self.cab.decode(CTX_CBF_CHROMA + depth as usize) == 1;
-            }
-            if depth == 0 || parent_cbf_cr {
-                cbf_cr = self.cab.decode(CTX_CBF_CHROMA + depth as usize) == 1;
+            // No chroma cbf at all when ChromaArrayType is 0: both stay false
+            // here, at the root or above, so every child inherits false (the
+            // root's `true` parents only gate whether a flag is CODED). The
+            // luma-cbf condition below is then the version-1 one unchanged.
+            if self.chroma {
+                if depth == 0 || parent_cbf_cb {
+                    cbf_cb = self.cab.decode(CTX_CBF_CHROMA + depth as usize) == 1;
+                }
+                if depth == 0 || parent_cbf_cr {
+                    cbf_cr = self.cab.decode(CTX_CBF_CHROMA + depth as usize) == 1;
+                }
             }
         } else {
             cbf_cb = parent_cbf_cb;
@@ -91,8 +97,10 @@ impl<'a> SliceDecoder<'a> {
         // This transform block's edges, now that its `nz` is known. The sides
         // on the coding block boundary belong to `coding_unit`.
         self.bs_edges(x0, y0, n, n, x0 != self.cu_x, y0 != self.cu_y, true);
-        // Chroma (4:2:0)
-        let (xc, yc, log2c, do_chroma) = if log2 > 2 {
+        // Chroma (4:2:0; none in 4:0:0)
+        let (xc, yc, log2c, do_chroma) = if !self.chroma {
+            (0, 0, 0, false)
+        } else if log2 > 2 {
             (x0 / 2, y0 / 2, log2 - 1, true)
         } else if blk_idx == 3 {
             (xbase / 2, ybase / 2, 2, true)

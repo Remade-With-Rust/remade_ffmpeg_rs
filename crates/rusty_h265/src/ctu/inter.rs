@@ -763,7 +763,9 @@ impl<'a> SliceDecoder<'a> {
         let mut fw = 0usize;
         let mut fh = 0usize;
         let mut pair_done = false;
-        for c in 0..3usize {
+        // A 4:0:0 picture has no chroma planes: luma only.
+        let ncomp = if self.chroma { 3 } else { 1 };
+        for c in 0..ncomp {
             if c != 2 {
                 let ss = if c == 0 { 0 } else { 1 };
                 (bw, bh) = (w >> ss, h >> ss);

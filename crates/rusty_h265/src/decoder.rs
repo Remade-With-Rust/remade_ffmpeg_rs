@@ -893,8 +893,8 @@ impl Decoder {
     }
 }
 
-/// v1 scope: Main / Main 10 / Main Still Picture, 4:2:0 (or monochrome
-/// syntax), ≤ 10 bit, no extensions.
+/// v1 scope: Main / Main 10 / Main Still Picture, 4:2:0 or 4:0:0
+/// (monochrome), ≤ 10 bit, no extensions.
 ///
 /// A format-range-extensions profile (`general_profile_idc` 4: Main Intra,
 /// Main 10 Intra, Main 4:4:4 ...) is admitted too, because every RExt coding
@@ -903,6 +903,15 @@ impl Decoder {
 /// no extension decodes by exactly the version-1 process. The chroma,
 /// bit-depth and extension checks below still refuse anything that would
 /// need an RExt tool. (HEIF writers label still images "Main Intra" this way.)
+///
+/// 4:0:0 (`chroma_format_idc` 0) is the version-1 process with every chroma
+/// syntax element and chroma stage removed: `ChromaArrayType` 0 drops
+/// `cbf_cb`/`cbf_cr`, `intra_chroma_pred_mode`, the chroma PCM samples, the
+/// chroma SAO and weighted-prediction syntax, and chroma prediction,
+/// residual and deblocking. Monochrome is a range-extensions *profile*
+/// (Monochrome, Monochrome 10, ...), but it needs no RExt *tool*, so it is
+/// admitted under the same rule; HEIF codes alpha planes this way. 4:2:2
+/// and 4:4:4 stay refused.
 fn check_scope(sps: &Sps, pps: &Pps) -> Result<()> {
     let prof = sps.ptl.profile();
     if !matches!(prof, 0 | PROFILE_MAIN | PROFILE_MAIN10 | PROFILE_MAIN_STILL | PROFILE_REXT) {
@@ -910,10 +919,12 @@ fn check_scope(sps: &Sps, pps: &Pps) -> Result<()> {
             "general_profile_idc {prof} (only Main / Main 10 / Main Still Picture, or a range-extensions profile using no RExt tool)"
         )));
     }
-    if sps.chroma_format_idc != 1 {
-        return Err(Error::unsupported(format!("chroma_format_idc {} (only 4:2:0)", sps.chroma_format_idc)));
+    if sps.chroma_format_idc > 1 {
+        return Err(Error::unsupported(format!("chroma_format_idc {} (only 4:2:0 and 4:0:0)", sps.chroma_format_idc)));
     }
-    if sps.bit_depth_luma > 10 || sps.bit_depth_chroma > 10 {
+    // A monochrome stream still codes `bit_depth_chroma_minus8`, but no
+    // process reads it, so only a stream with chroma is held to it.
+    if sps.bit_depth_luma > 10 || (sps.chroma_format_idc != 0 && sps.bit_depth_chroma > 10) {
         return Err(Error::unsupported(format!("bit depth {}/{} (max 10)", sps.bit_depth_luma, sps.bit_depth_chroma)));
     }
     if sps.range_extension || sps.multilayer_extension || sps.ext_3d || sps.scc_extension {

@@ -8,18 +8,19 @@
 //! picture the file describes:
 //!
 //! * **primary image** — an `hvc1` item, a `grid` of them (cropped to the
-//!   grid's output size), or an `iden` derivation; 8- and 10-bit 4:2:0;
+//!   grid's output size), or an `iden` derivation; 8- and 10-bit 4:2:0 or
+//!   monochrome (4:0:0);
 //! * **transforms** — `clap`, `irot`, `imir`, applied in the order the file
 //!   associates them (`ipma`), rounded exactly as libheif rounds `clap`;
-//! * **alpha** — an `auxl` auxiliary image with an alpha `auxC` type, and the
-//!   `prem` (premultiplied) flag;
+//! * **alpha** — an `auxl` auxiliary image with an alpha `auxC` type (coded
+//!   as monochrome HEVC), and the `prem` (premultiplied) flag;
 //! * **colour** — `colr` `nclx` (falling back to the HEVC VUI) and ICC;
 //! * **metadata** — the Exif and XMP items, as raw bytes;
 //! * **depth maps and thumbnails** — decoded on request.
 //!
 //! Not covered: encoding, image sequences (`msf1` tracks), overlays
-//! (`iovl`), and HEVC range extensions (4:0:0, 4:2:2, 4:4:4, 12-bit), which
-//! `rusty_h265` refuses by name. Gain maps are reported, not applied.
+//! (`iovl`), and HEVC range extensions beyond monochrome (4:2:2, 4:4:4,
+//! 12-bit), which `rusty_h265` refuses by name. Gain maps are reported, not applied.
 //!
 //! ```no_run
 //! let data = std::fs::read("photo.heic").unwrap();

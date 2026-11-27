@@ -94,6 +94,46 @@ fn exif_xmp_and_colour() {
     assert_eq!(rgba.len(), 128 * 128 * 4);
 }
 
+/// Alpha planes coded as monochrome (4:0:0) HEVC, as libheif and Apple
+/// write them. `three-images.heic` has two colour items with an `auxl`
+/// alpha each (an image and its thumbnail), both `clap`-cropped. The hashes
+/// are FFmpeg 9.1's decode of the same items (`-pix_fmt yuv420p` / `gray`,
+/// cropped), which this crate matches exactly.
+#[test]
+fn monochrome_alpha_matches_ffmpeg() {
+    // (item, width, height, colour planes hash, alpha hash)
+    const ITEMS: &[(u32, u32, u32, u64, u64)] = &[
+        (5, 32, 80, 0x7228_674a_6e93_9925, 0x24ad_a752_2fd1_eb25),
+        (7, 6, 16, 0x25a9_d68a_9e3a_f345, 0xf047_22a7_b619_4aa5),
+    ];
+    let data = fixture("three-images.heic");
+    for threads in [1, 0] {
+        let opts = DecodeOptions {
+            threads,
+            ..DecodeOptions::default()
+        };
+        let heif = Heif::parse_with(&data, opts).unwrap();
+        for &(id, w, h, want_yuv, want_alpha) in ITEMS {
+            let d = heif.decode_with_alpha(id).unwrap();
+            assert_eq!((d.image.width, d.image.height), (w, h), "item {id}");
+            assert_eq!(d.image.chroma, Chroma::Yuv420, "item {id}");
+            assert_eq!(fnv(&d.image.to_planar_bytes()), want_yuv, "item {id}");
+            let a = d.alpha.as_ref().expect("alpha plane");
+            assert_eq!((a.plane.width, a.plane.height, a.bit_depth), (w, h, 8));
+            assert!(!a.premultiplied);
+            let bytes: Vec<u8> = a.plane.data.iter().map(|&v| v as u8).collect();
+            assert_eq!(fnv(&bytes), want_alpha, "item {id} alpha");
+            // Straight alpha: the RGBA alpha channel is the plane itself.
+            let rgba = d.to_rgba8();
+            assert!(rgba.chunks_exact(4).zip(&bytes).all(|(p, &a)| p[3] == a));
+            // The alpha item decodes on its own, as a monochrome image.
+            let alpha_id = id + 1;
+            let ai = heif.decode_item(alpha_id).unwrap();
+            assert_eq!(ai.chroma, Chroma::Monochrome, "item {alpha_id}");
+        }
+    }
+}
+
 /// A grid whose tiles do not fill their cells -- here 512x512 tiles in
 /// 520x520 cells, made by editing the tiles' `ispe` -- is composed on the
 /// neutral canvas: luma 0 and chroma at the midpoint wherever no tile

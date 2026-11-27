@@ -10,9 +10,10 @@ decoder, [`rusty_h265`](https://crates.io/crates/rusty_h265). No C, no FFI.
 
 - **Primary image**: an `hvc1` item, a `grid` of tiles (decoded in parallel,
   cropped to the grid's output size), or an `iden` derivation; 8- and 10-bit
-  4:2:0.
+  4:2:0 or monochrome (4:0:0).
 - **Transforms**: `clap`, `irot`, `imir`, in the order the file lists them.
-- **Alpha**: `auxl` alpha planes, with the premultiplied (`prem`) flag.
+- **Alpha**: `auxl` alpha planes (monochrome-coded, as libheif and Apple
+  write them), with the premultiplied (`prem`) flag.
 - **Colour**: `colr` nclx (falling back to the HEVC VUI) and ICC profiles.
 - **Metadata**: Exif and XMP items, raw.
 - **Depth maps and thumbnails**, decoded on request.
@@ -20,7 +21,8 @@ decoder, [`rusty_h265`](https://crates.io/crates/rusty_h265). No C, no FFI.
   files are errors, never panics.
 
 Not covered: encoding, image sequences, overlays (`iovl`), and HEVC range
-extensions (4:0:0, 4:2:2, 4:4:4, 12-bit), which `rusty_h265` refuses by name.
+extensions beyond monochrome (4:2:2, 4:4:4, 12-bit), which `rusty_h265`
+refuses by name.
 HDR gain maps are reported, not applied.
 
 ## Usage
