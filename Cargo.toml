@@ -132,7 +132,7 @@ rusty_exr = { path = "crates/rusty_exr", version = "0.2.2" }
 rusty_vorbis = { path = "crates/rusty_vorbis", version = "0.1.5" }
 # jpeg: our own rusty_jpeg, from crates.io (the vendored copy is gone: one
 # repository publishes it — github.com/Remade-With-Rust/rusty_jpeg).
-rusty_jpeg = "0.4.12"
+rusty_jpeg = "0.5"
 rff-codec-rawvideo = { path = "crates/rff-codec-rawvideo", version = "0.9.6" }
 # TEMPORARY C/FFI H.264 â€” deliberately NOT in default-members; opt-in only.
 rff-codec-openh264 = { path = "crates/rff-codec-openh264", version = "0.9.6" }

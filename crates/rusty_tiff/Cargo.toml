@@ -39,7 +39,7 @@ bytemuck = "1"
 # loop and window copies never run (output is identical, so no test notices,
 # and a workspace that pulls flate2 with default features masks it).
 flate2 = { version = "1.1.11", default-features = false, features = ["zlib-rs", "runtime_detection"] }
-rusty_jpeg = { version = "0.4.12", optional = true }
+rusty_jpeg = { version = "0.5", optional = true }
 
 [dev-dependencies]
 # Bench/example roots only (project convention, see CLAUDE.md): every
