@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_svgtree-v0.2.1...rusty_svgtree-v0.3.0) - 2026-11-28
+
+### Added
+
+- *(rusty_svgtree)* tree view for vector writers (glyph runs, font data, render_node, Image::decode) ([#256](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/256))
+
 ## [0.2.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_svgtree-v0.2.0...rusty_svgtree-v0.2.1) - 2026-11-28
 
 ### Other

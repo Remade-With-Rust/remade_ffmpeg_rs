@@ -1,6 +1,6 @@
 [package]
 name = "rusty_svgtree"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 # 1.88: the default JPEG support pulls in rusty_jpeg 0.4.8, which uses safe
 # `#[target_feature]` functions and safe intrinsic calls (1.86 / 1.87);
