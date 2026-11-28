@@ -11,7 +11,7 @@
 //! the PR that added this; these are two small members of it.
 
 use rusty_h265::md5::Md5;
-use rusty_h265::{Decoder, Error};
+use rusty_h265::Decoder;
 
 const FIXTURES: &[(&str, &[u8], &str, usize)] = &[
     // 33x18 (conformance-window crop), x265 inter: B-frames, WPP, SAO, deblocking.
@@ -59,26 +59,5 @@ fn monochrome_streams_are_bit_exact() {
         let s = dec.stats;
         assert_eq!(s.sei_checked as usize, want_frames, "{name}: every picture carries a hash SEI");
         assert_eq!(s.sei_mismatch, 0, "{name}: decoded-picture-hash SEI mismatch");
-    }
-}
-
-/// 4:2:2 and 4:4:4 stay out of scope, refused by name rather than misdecoded.
-#[test]
-fn chroma_422_and_444_stay_refused() {
-    for (name, data) in [
-        ("4:2:2", &include_bytes!("fixtures/yuv422_refused.hevc")[..]),
-        ("4:4:4", &include_bytes!("fixtures/yuv444_refused.hevc")[..]),
-    ] {
-        let mut dec = Decoder::new();
-        let mut refused = false;
-        for nal in rusty_h265::nal::split_annex_b(data) {
-            if let Err(Error::Unsupported(m)) = dec.push_nal(nal, None) {
-                assert!(m.contains("chroma_format_idc"), "{name}: {m}");
-                refused = true;
-            }
-        }
-        dec.flush();
-        assert!(refused, "{name} was not refused");
-        assert!(dec.next_frame().is_err(), "{name} produced a picture");
     }
 }

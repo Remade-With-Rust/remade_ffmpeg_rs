@@ -86,6 +86,8 @@ pub struct SliceHeader {
     pub slice_qp_delta: i32,
     pub cb_qp_offset: i32,
     pub cr_qp_offset: i32,
+    /// `cu_chroma_qp_offset_enabled_flag` (RExt).
+    pub cu_chroma_qp_offset_enabled: bool,
     pub deblocking_filter_disabled: bool,
     pub beta_offset_div2: i32,
     pub tc_offset_div2: i32,
@@ -128,10 +130,18 @@ fn parse_pred_weight_table(r: &mut BitReader, sps: &Sps, sh: &SliceHeader) -> Re
         }
         t.chroma_log2_weight_denom = c as u32;
     }
-    let high_precision = false; // sps_range_extension.high_precision_offsets_enabled_flag (RExt)
+    // §7.4.7.3: with `high_precision_offsets_enabled_flag` (RExt) the offsets
+    // are coded at the sample bit depth instead of 8-bit units.
+    let high_precision = sps.rext.high_precision_offsets;
     let offset_shift_l = if high_precision { 0 } else { sps.bit_depth_luma as i32 - 8 };
     let offset_shift_c = if high_precision { 0 } else { sps.bit_depth_chroma as i32 - 8 };
     let wp_offset_half_c = 1 << (if high_precision { sps.bit_depth_chroma - 1 } else { 7 });
+    let (off_lo_l, off_hi_l) = if high_precision {
+        (-(1 << (sps.bit_depth_luma - 1)), (1 << (sps.bit_depth_luma - 1)) - 1)
+    } else {
+        (-128, 127)
+    };
+    let (off_lo_c, off_hi_c) = (-4 * wp_offset_half_c, 4 * wp_offset_half_c - 1);
     for list in 0..(if sh.slice_type.is_b() { 2 } else { 1 }) {
         let n = if list == 0 { sh.num_ref_idx_l0_active } else { sh.num_ref_idx_l1_active } as usize;
         let mut luma_flags = vec![false; n];
@@ -159,7 +169,7 @@ fn parse_pred_weight_table(r: &mut BitReader, sps: &Sps, sh: &SliceHeader) -> Re
                 }
                 e.luma_weight += dw;
                 let off = r.read_se()?;
-                if !(-128..=127).contains(&off) {
+                if !(off_lo_l..=off_hi_l).contains(&off) {
                     return Err(Error::invalid("luma_offset"));
                 }
                 e.luma_offset = off << offset_shift_l;
@@ -172,7 +182,7 @@ fn parse_pred_weight_table(r: &mut BitReader, sps: &Sps, sh: &SliceHeader) -> Re
                     }
                     e.chroma_weight[j] += dw;
                     let d_off = r.read_se()?;
-                    if !(-512..=511).contains(&d_off) {
+                    if !(off_lo_c..=off_hi_c).contains(&d_off) {
                         return Err(Error::invalid("delta_chroma_offset"));
                     }
                     // (7-56)
@@ -256,6 +266,7 @@ pub fn parse_slice_header<'a>(r: &mut BitReader, nal: &NalHeader, sps_by_pps: &d
             slice_qp_delta: 0,
             cb_qp_offset: 0,
             cr_qp_offset: 0,
+            cu_chroma_qp_offset_enabled: false,
             deblocking_filter_disabled: pps.deblocking_filter_disabled,
             beta_offset_div2: pps.beta_offset_div2,
             tc_offset_div2: pps.tc_offset_div2,
@@ -423,7 +434,7 @@ pub fn parse_slice_header<'a>(r: &mut BitReader, nal: &NalHeader, sps_by_pps: &d
             }
         }
         if pps.chroma_qp_offset_list_enabled {
-            r.read_flag()?; // cu_chroma_qp_offset_enabled_flag (RExt)
+            sh.cu_chroma_qp_offset_enabled = r.read_flag()?;
         }
         let mut deblocking_override = false;
         if pps.deblocking_filter_override_enabled {

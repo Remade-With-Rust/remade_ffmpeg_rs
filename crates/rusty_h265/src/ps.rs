@@ -14,6 +14,8 @@ pub const PROFILE_MAIN: u8 = 1;
 pub const PROFILE_MAIN10: u8 = 2;
 pub const PROFILE_MAIN_STILL: u8 = 3;
 pub const PROFILE_REXT: u8 = 4;
+/// High Throughput 4:4:4 (16 Intra) profiles (A.3.6).
+pub const PROFILE_HIGH_THROUGHPUT: u8 = 5;
 
 /// `profile_tier_level()` — the general (top) layer only; sub-layer PTL is
 /// skipped exactly (its presence flags still have to be read).
@@ -514,6 +516,20 @@ fn parse_vui(r: &mut BitReader, max_sub_layers_minus1: u32) -> Result<Vui> {
     Ok(v)
 }
 
+/// `sps_range_extension()` (§7.3.2.2.2): the RExt coding tools.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpsRangeExt {
+    pub transform_skip_rotation: bool,
+    pub transform_skip_context: bool,
+    pub implicit_rdpcm: bool,
+    pub explicit_rdpcm: bool,
+    pub extended_precision_processing: bool,
+    pub intra_smoothing_disabled: bool,
+    pub high_precision_offsets: bool,
+    pub persistent_rice_adaptation: bool,
+    pub cabac_bypass_alignment: bool,
+}
+
 /// Sequence parameter set (§7.3.2.2) with its derived variables (§7.4.3.2).
 #[derive(Debug, Clone, Default)]
 pub struct Sps {
@@ -556,8 +572,11 @@ pub struct Sps {
     pub temporal_mvp_enabled: bool,
     pub strong_intra_smoothing_enabled: bool,
     pub vui: Option<Vui>,
-    // extension presence — refused by name when set (v1 scope)
+    // extension presence. Multilayer / 3D / SCC are refused by name; the
+    // range extension is parsed into `rext` and each tool decided on its own.
     pub range_extension: bool,
+    /// `sps_range_extension()` (§7.3.2.2.2); all false when absent.
+    pub rext: SpsRangeExt,
     pub multilayer_extension: bool,
     pub ext_3d: bool,
     pub scc_extension: bool,
@@ -676,6 +695,21 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
         s.ext_3d = r.read_flag()?;
         s.scc_extension = r.read_flag()?;
         r.read_bits(4)?; // sps_extension_4bits
+        if s.range_extension {
+            s.rext = SpsRangeExt {
+                transform_skip_rotation: r.read_flag()?,
+                transform_skip_context: r.read_flag()?,
+                implicit_rdpcm: r.read_flag()?,
+                explicit_rdpcm: r.read_flag()?,
+                extended_precision_processing: r.read_flag()?,
+                intra_smoothing_disabled: r.read_flag()?,
+                high_precision_offsets: r.read_flag()?,
+                persistent_rice_adaptation: r.read_flag()?,
+                cabac_bypass_alignment: r.read_flag()?,
+            };
+        }
+        // Later extensions (multilayer, 3D, SCC) follow; they are refused at
+        // activation, so nothing past this point is read.
     }
 
     // derived
@@ -751,10 +785,17 @@ pub struct Pps {
     pub multilayer_extension: bool,
     pub ext_3d: bool,
     pub scc_extension: bool,
-    // range extension fields we accept in v1 syntax form (values must be v1-neutral)
+    // `pps_range_extension()` (§7.3.2.3.2); v1-neutral defaults when absent.
     pub log2_max_transform_skip_block_size: u8,
     pub cross_component_prediction_enabled: bool,
     pub chroma_qp_offset_list_enabled: bool,
+    pub diff_cu_chroma_qp_offset_depth: u8,
+    /// `cb_qp_offset_list[]` / `cr_qp_offset_list[]`
+    /// (`chroma_qp_offset_list_len_minus1 + 1` entries, at most 6).
+    pub cb_qp_offset_list: Vec<i32>,
+    pub cr_qp_offset_list: Vec<i32>,
+    pub log2_sao_offset_scale_luma: u8,
+    pub log2_sao_offset_scale_chroma: u8,
 }
 
 impl Pps {
@@ -851,8 +892,23 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps> {
             }
             p.cross_component_prediction_enabled = r.read_flag()?;
             p.chroma_qp_offset_list_enabled = r.read_flag()?;
-            // The remaining RExt fields are only reached by RExt streams,
-            // which are refused at activation (v1 scope).
+            if p.chroma_qp_offset_list_enabled {
+                p.diff_cu_chroma_qp_offset_depth = r.read_ue_max(3)? as u8;
+                let n = r.read_ue_max(5)? as usize + 1;
+                for _ in 0..n {
+                    let cb = r.read_se()?;
+                    let cr = r.read_se()?;
+                    if !(-12..=12).contains(&cb) || !(-12..=12).contains(&cr) {
+                        return Err(Error::invalid("cb/cr_qp_offset_list"));
+                    }
+                    p.cb_qp_offset_list.push(cb);
+                    p.cr_qp_offset_list.push(cr);
+                }
+            }
+            // Range-checked against the bit depth at activation (§7.4.3.3.2:
+            // at most Max(0, BitDepth - 10)).
+            p.log2_sao_offset_scale_luma = r.read_ue_max(6)? as u8;
+            p.log2_sao_offset_scale_chroma = r.read_ue_max(6)? as u8;
         }
     }
     Ok(p)

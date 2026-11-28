@@ -134,6 +134,65 @@ fn monochrome_alpha_matches_ffmpeg() {
     }
 }
 
+/// HEVC range-extension chroma formats: a 4:2:2 10-bit grid (the layout
+/// of Canon and Sony `.HIF` files) and `clap`-cropped single items in 4:4:4
+/// 8-bit and 4:2:2 12-bit. The hashes are FFmpeg 9.1's decode of the same
+/// files (`-pix_fmt yuv422p10le` / `yuv444p` / `yuv422p12le`, grid composed
+/// and cropped), which this crate matches exactly; `to_rgba8` converts them.
+#[test]
+fn range_extension_chroma_matches_ffmpeg() {
+    // (file, width, height, chroma, bit depth, planar hash)
+    const CASES: &[(&str, u32, u32, Chroma, u8, u64)] = &[
+        (
+            "grid-422-10bit.heic",
+            192,
+            128,
+            Chroma::Yuv422,
+            10,
+            0xa517_381c_aab2_071c,
+        ),
+        (
+            "yuv444-8bit-clap.heic",
+            58,
+            44,
+            Chroma::Yuv444,
+            8,
+            0x7820_d335_e5ef_bba3,
+        ),
+        (
+            "yuv422-12bit-clap.heic",
+            90,
+            60,
+            Chroma::Yuv422,
+            12,
+            0x61fc_8b9a_b899_14cf,
+        ),
+    ];
+    for &(name, w, h, chroma, bits, want) in CASES {
+        let data = fixture(name);
+        for threads in [1, 0] {
+            let opts = DecodeOptions {
+                threads,
+                ..DecodeOptions::default()
+            };
+            let heif = Heif::parse_with(&data, opts).unwrap();
+            let d = heif.decode_primary().unwrap();
+            assert_eq!((d.image.width, d.image.height), (w, h), "{name}");
+            assert_eq!(
+                (d.image.chroma, d.image.bit_depth),
+                (chroma, bits),
+                "{name}"
+            );
+            assert_eq!(
+                fnv(&d.image.to_planar_bytes()),
+                want,
+                "{name}, threads {threads}"
+            );
+            assert_eq!(d.to_rgba8().len(), (w * h * 4) as usize, "{name}");
+        }
+    }
+}
+
 /// A grid whose tiles do not fill their cells -- here 512x512 tiles in
 /// 520x520 cells, made by editing the tiles' `ispe` -- is composed on the
 /// neutral canvas: luma 0 and chroma at the midpoint wherever no tile

@@ -327,7 +327,13 @@ impl<'a> SliceDecoder<'a> {
             pu
         };
         self.store_motion(xp, yp, w, h, &pu);
-        self.motion_compensate(xp, yp, w, h, &pu)?;
+        // 4:2:0 and 4:0:0 take the instantiation whose chroma geometry is
+        // constant; only 4:2:2 / 4:4:4 compile run-time subsampling in.
+        if self.cat >= 2 {
+            self.motion_compensate::<true>(xp, yp, w, h, &pu)?;
+        } else {
+            self.motion_compensate::<false>(xp, yp, w, h, &pu)?;
+        }
         Ok(merge)
     }
 
@@ -718,7 +724,8 @@ impl<'a> SliceDecoder<'a> {
     /// reference plane directly when the footprint is inside the picture (the
     /// overwhelming majority of blocks), and copies an edge-extended footprint
     /// into scratch when it is not (§8.5.3.3.2's coordinate clipping).
-    fn motion_compensate(&mut self, xp: usize, yp: usize, w: usize, h: usize, pu: &PuMv) -> Result<()> {
+    /// `RANGE`: the picture is 4:2:2 or 4:4:4.
+    fn motion_compensate<const RANGE: bool>(&mut self, xp: usize, yp: usize, w: usize, h: usize, pu: &PuMv) -> Result<()> {
         crate::prof_scope!(crate::prof::Stage::Mc);
         if self.ablate.mc {
             return Ok(());
@@ -768,19 +775,27 @@ impl<'a> SliceDecoder<'a> {
         for c in 0..ncomp {
             if c != 2 {
                 let ss = if c == 0 { 0 } else { 1 };
-                (bw, bh) = (w >> ss, h >> ss);
+                // log2 SubWidthC/SubHeightC. `RANGE` (4:2:2 / 4:4:4) reads
+                // them from the SPS; otherwise this folds to `ss` and the
+                // 4:2:0 instantiation is the version-1 code.
+                let (sx, sy) = if RANGE && c > 0 { (self.ssx, self.ssy) } else { (ss, ss) };
+                (bw, bh) = (w >> sx, h >> sy);
                 if bw == 0 || bh == 0 {
                     continue;
                 }
-                (xb, yb) = (xp >> ss, yp >> ss);
+                (xb, yb) = (xp >> sx, yp >> sy);
                 bit_depth = if c == 0 { sps.bit_depth_luma } else { sps.bit_depth_chroma };
                 let taps = if c == 0 { 8usize } else { 4 };
                 m = taps / 2 - 1;
                 (fw, fh) = (bw + taps - 1, bh + taps - 1);
 
                 // The fractional split is a property of the COMPONENT, not of
-                // the list.
+                // the list. Chroma positions are in 1/8 sample (§8.5.3.2.10:
+                // mvC = mv * 2 / SubWidthC), so a full-resolution chroma axis
+                // (4:4:4, and 4:2:2 vertically) reads the vector at twice the
+                // scale: (2 mv) >> 3 = mv >> 2 and (2 mv) & 7 = (mv & 3) << 1.
                 let (frac_bits, frac_mask) = if c == 0 { (2u32, 3i32) } else { (3u32, 7i32) };
+                let (mx, my) = if RANGE && c > 0 { (1 - sx as u32, 1 - sy as u32) } else { (0, 0) };
                 for l in 0..2usize {
                     used[l] = false;
                     fp_geo[l] = None;
@@ -788,12 +803,8 @@ impl<'a> SliceDecoder<'a> {
                     let Some(r) = rp[l] else { continue };
                     used[l] = true;
                     let mv = pu.mv[l];
-                    let (xi, yi, fx, fy) = (
-                        xb as i32 + (mv[0] >> frac_bits),
-                        yb as i32 + (mv[1] >> frac_bits),
-                        (mv[0] & frac_mask) as usize,
-                        (mv[1] & frac_mask) as usize,
-                    );
+                    let (vx, vy) = (mv[0] << mx, mv[1] << my);
+                    let (xi, yi, fx, fy) = (xb as i32 + (vx >> frac_bits), yb as i32 + (vy >> frac_bits), (vx & frac_mask) as usize, (vy & frac_mask) as usize);
                     geo[l] = (xi, yi, fx, fy);
                     let p = &r.pic.planes[c];
                     if fx == 0 && fy == 0 && xi >= 0 && yi >= 0 && xi as usize + bw <= p.width && yi as usize + bh <= p.height {
@@ -817,10 +828,14 @@ impl<'a> SliceDecoder<'a> {
             // its footprint 35x35, so both halves always fit. Weighted chroma
             // (Cb and Cr carry separate weights) keeps the per-plane path.
             if c == 1 && (used[0] || used[1]) {
-                let pair = match weights {
-                    None => true,
-                    Some(t) => neutral_weights(t, pu, used, 1, wp_off) && neutral_weights(t, pu, used, 2, wp_off),
-                };
+                // Both halves of `pred` and `pad` must hold one plane's block:
+                // always true in 4:2:0, not for the largest 4:4:4 blocks.
+                let fits = !RANGE || (2 * bw * bh <= scratch.pred[0].len() && 2 * (fw * fh + accel::pixel::PAD_SLACK) <= scratch.pad.len());
+                let pair = fits
+                    && match weights {
+                        None => true,
+                        Some(t) => neutral_weights(t, pu, used, 1, wp_off) && neutral_weights(t, pu, used, 2, wp_off),
+                    };
                 if pair {
                     pair_done = true;
                     let fp = if bit_depth <= 12 { fp_geo } else { [None; 2] };

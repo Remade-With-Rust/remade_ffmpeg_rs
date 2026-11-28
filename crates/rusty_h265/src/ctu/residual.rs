@@ -3,18 +3,56 @@
 //! and inverse transform, residual add. A child of `ctu` so it shares the
 //! `SliceDecoder` fields.
 
-use super::{wrap_qp, PartMode, SliceDecoder};
+use super::{wrap_qp, IntraComp, PartMode, SliceDecoder};
 use crate::cabac::*;
 use crate::error::{Error, Result};
 use crate::intra;
 use crate::itx::{self, TransformKind};
 use crate::pic::{PicState, PRED_INTRA};
-use crate::tables::{scan_set, CHROMA_QP_420};
+use crate::tables::{chroma_qp, scan_set};
 use rusty_h265_accel as accel;
 
+/// The significance-context row of `transform_skip_context_enabled_flag`.
+static ZERO16: [u8; 16] = [0; 16];
+
+/// The per-block range-extension residual decisions (see
+/// `SliceDecoder::rext_residual_tools`).
+#[derive(Clone, Copy)]
+struct RextResidual {
+    rdpcm: Option<bool>,
+    ts_ctx: bool,
+    /// Rotation applies (still subject to the 4x4 size).
+    rotate: bool,
+    stat_idx: Option<usize>,
+    rice_cap: u32,
+}
+
+impl RextResidual {
+    const NONE: Self = RextResidual {
+        rdpcm: None,
+        ts_ctx: false,
+        rotate: false,
+        stat_idx: None,
+        rice_cap: 4,
+    };
+}
+
+/// What happens to an untransformed (transform-skip or transquant-bypass)
+/// residual block after scaling, under the range extensions.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Untransformed {
+    /// `transform_skip_rotation_enabled_flag`: rotate the 4x4 block by 180°.
+    pub rotate: bool,
+    /// Residual DPCM: `Some(true)` accumulates down columns, `Some(false)`
+    /// along rows (§8.6.8).
+    pub rdpcm: Option<bool>,
+}
+
 impl<'a> SliceDecoder<'a> {
+    /// `parent_cbf_cb` / `parent_cbf_cr` are bit sets: bit 0 is the flag of
+    /// the (upper) chroma block, bit 1 the lower one that only 4:2:2 codes.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn transform_tree(&mut self, x0: usize, y0: usize, xbase: usize, ybase: usize, log2: usize, depth: u8, blk_idx: usize, parent_cbf_cb: bool, parent_cbf_cr: bool) -> Result<()> {
+    pub(super) fn transform_tree(&mut self, x0: usize, y0: usize, xbase: usize, ybase: usize, log2: usize, depth: u8, blk_idx: usize, parent_cbf_cb: u8, parent_cbf_cr: u8) -> Result<()> {
         let max_tb = self.sps.log2_max_tb_size as usize;
         let min_tb = self.sps.log2_min_tb_size as usize;
         let split = if log2 <= max_tb && log2 > min_tb && depth < self.max_trafo_depth && !(self.intra_split && depth == 0) {
@@ -23,18 +61,21 @@ impl<'a> SliceDecoder<'a> {
             let inter_split = self.sps.max_transform_hierarchy_depth_inter == 0 && !self.cu_intra && self.part_mode != PartMode::Part2Nx2N && depth == 0;
             log2 > max_tb || (self.intra_split && depth == 0) || inter_split
         };
-        let (mut cbf_cb, mut cbf_cr) = (false, false);
-        if log2 > 2 {
-            // No chroma cbf at all when ChromaArrayType is 0: both stay false
-            // here, at the root or above, so every child inherits false (the
-            // root's `true` parents only gate whether a flag is CODED). The
-            // luma-cbf condition below is then the version-1 one unchanged.
-            if self.chroma {
-                if depth == 0 || parent_cbf_cb {
-                    cbf_cb = self.cab.decode(CTX_CBF_CHROMA + depth as usize) == 1;
+        let (mut cbf_cb, mut cbf_cr) = (0u8, 0u8);
+        if log2 > 2 || self.cat == 3 {
+            // No chroma cbf at all when ChromaArrayType is 0: both stay 0
+            // here, at the root or above, so every child inherits 0 (the
+            // parents only gate whether a flag is CODED). The luma-cbf
+            // condition below is then the version-1 one unchanged.
+            if self.cat == 2 {
+                (cbf_cb, cbf_cr) = self.cbf_chroma_422(log2, depth, split, parent_cbf_cb, parent_cbf_cr);
+            } else if self.chroma {
+                let ctx = CTX_CBF_CHROMA + depth as usize;
+                if depth == 0 || parent_cbf_cb & 1 != 0 {
+                    cbf_cb = self.cab.decode(ctx) as u8;
                 }
-                if depth == 0 || parent_cbf_cr {
-                    cbf_cr = self.cab.decode(CTX_CBF_CHROMA + depth as usize) == 1;
+                if depth == 0 || parent_cbf_cr & 1 != 0 {
+                    cbf_cr = self.cab.decode(ctx) as u8;
                 }
             }
         } else {
@@ -50,16 +91,16 @@ impl<'a> SliceDecoder<'a> {
             return Ok(());
         }
         let mut cbf_luma = true;
-        if self.cu_intra || depth != 0 || cbf_cb || cbf_cr {
+        if self.cu_intra || depth != 0 || cbf_cb != 0 || cbf_cr != 0 {
             cbf_luma = self.cab.decode(CTX_CBF_LUMA + if depth == 0 { 1 } else { 0 }) == 1;
         }
         self.transform_unit(x0, y0, xbase, ybase, log2, blk_idx, cbf_luma, cbf_cb, cbf_cr)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn transform_unit(&mut self, x0: usize, y0: usize, xbase: usize, ybase: usize, log2: usize, blk_idx: usize, cbf_luma: bool, cbf_cb: bool, cbf_cr: bool) -> Result<()> {
+    fn transform_unit(&mut self, x0: usize, y0: usize, xbase: usize, ybase: usize, log2: usize, blk_idx: usize, cbf_luma: bool, cbf_cb: u8, cbf_cr: u8) -> Result<()> {
         let n = 1usize << log2;
-        let cbf_chroma = cbf_cb || cbf_cr;
+        let cbf_chroma = cbf_cb != 0 || cbf_cr != 0;
         if (cbf_luma || cbf_chroma) && self.pps.cu_qp_delta_enabled && !self.is_cu_qp_delta_coded {
             // cu_qp_delta_abs: prefix TU cMax 5 (ctx 0 then 1), suffix EG0.
             let mut v = 0u32;
@@ -83,58 +124,266 @@ impl<'a> SliceDecoder<'a> {
             self.qp_y = wrap_qp(self.qp_y_pred + delta, self.sps.qp_bd_offset_y);
             self.set_cu_qp();
         }
+        if self.cu_chroma_qp_offset_enabled && cbf_chroma && !self.cu_transquant_bypass && !self.is_cu_chroma_qp_offset_coded {
+            self.chroma_qp_offset_syntax();
+        }
         // Luma
         let luma_mode = self.st.cell[self.st.idx4(x0, y0)].intra_mode;
         let mut dc_luma = None;
         if self.cu_intra {
-            dc_luma = self.intra_predict(0, x0, y0, n, luma_mode, cbf_luma);
+            dc_luma = self.intra_predict_any(0, x0, y0, n, luma_mode, cbf_luma);
         }
         if cbf_luma {
-            self.residual_block(x0, y0, log2, 0, luma_mode, dc_luma)?;
+            self.residual_block_any(x0, y0, log2, 0, luma_mode, dc_luma)?;
             let w4 = self.st.w4;
             PicState::fill4_with(&mut self.st.cell, w4, x0, y0, n, n, |c| c.nz = 1);
         }
         // This transform block's edges, now that its `nz` is known. The sides
         // on the coding block boundary belong to `coding_unit`.
         self.bs_edges(x0, y0, n, n, x0 != self.cu_x, y0 != self.cu_y, true);
-        // Chroma (4:2:0; none in 4:0:0)
+        // Chroma, in chroma-plane coordinates (none in 4:0:0). A luma 4x4
+        // block below 4:4:4 carries no chroma of its own: the fourth one
+        // (blkIdx 3) codes the chroma of the whole 8x8 parent.
+        let (sx, sy) = (self.ssx, self.ssy);
         let (xc, yc, log2c, do_chroma) = if !self.chroma {
             (0, 0, 0, false)
-        } else if log2 > 2 {
-            (x0 / 2, y0 / 2, log2 - 1, true)
+        } else if log2 > 2 || self.cat == 3 {
+            (x0 >> sx, y0 >> sy, log2 - sx, true)
         } else if blk_idx == 3 {
-            (xbase / 2, ybase / 2, 2, true)
+            (xbase >> sx, ybase >> sy, 2, true)
         } else {
             (0, 0, 0, false)
         };
         if do_chroma {
             let nc = 1usize << log2c;
-            let cmode = self.intra_chroma_mode;
+            let cmode = self.intra_chroma_mode_at(x0, y0);
+            // 4:2:2: the chroma block is nc x 2nc, coded as two square
+            // blocks, the lower one predicted from the reconstructed upper.
+            let nsub = if self.cat == 2 { 2 } else { 1 };
             for c in 1..3usize {
                 let cbf = if c == 1 { cbf_cb } else { cbf_cr };
-                let mut dc_c = None;
-                if self.cu_intra {
-                    dc_c = self.intra_predict(c, xc, yc, nc, cmode, cbf);
+                // Cross-component prediction (4:4:4, RExt): chroma residual
+                // gains a scaled copy of the luma residual. Coded only when
+                // luma has a residual and chroma is inter or intra DM.
+                if self.ccp_active {
+                    self.res_scale[c - 1] = if cbf_luma && (!self.cu_intra || self.intra_chroma_dm_at(x0, y0)) {
+                        self.cross_comp_pred(c - 1)
+                    } else {
+                        0
+                    };
                 }
-                if cbf {
-                    self.residual_block(xc * 2, yc * 2, log2c, c, cmode, dc_c)?;
+                for s in 0..nsub {
+                    let ycs = yc + s * nc;
+                    let coded = (cbf >> s) & 1 != 0;
+                    let mut dc_c = None;
+                    if self.cu_intra {
+                        dc_c = self.intra_predict_any(c, xc, ycs, nc, cmode, coded);
+                    }
+                    if coded {
+                        self.residual_block_any(xc, ycs, log2c, c, cmode, dc_c)?;
+                    } else if self.ccp_active && self.res_scale[c - 1] != 0 {
+                        self.ccp_only(xc, ycs, log2c, c);
+                    }
                 }
             }
         }
         Ok(())
     }
 
+    /// The range-extension decisions for one residual block: residual DPCM
+    /// (explicit `explicit_rdpcm_flag`/`_dir_flag` in inter units, §7.3.8.11;
+    /// implicit in intra units predicted purely horizontally or vertically,
+    /// §8.6.8), the single significance context of
+    /// `transform_skip_context_enabled_flag`, rotation, and the StatCoeff slot
+    /// of persistent Rice adaptation (sbType, §9.3.3.11).
+    #[cold]
+    #[inline(never)]
+    fn rext_residual_tools(cab: &mut Cabac, r: &crate::ps::SpsRangeExt, intra: bool, untransformed: bool, c_idx: usize, mode: u8) -> RextResidual {
+        let mut rdpcm = None;
+        if untransformed {
+            if !intra && r.explicit_rdpcm {
+                let k = (c_idx > 0) as usize;
+                if cab.decode(CTX_EXPLICIT_RDPCM_FLAG + k) == 1 {
+                    rdpcm = Some(cab.decode(CTX_EXPLICIT_RDPCM_DIR + k) == 1);
+                }
+            } else if intra && r.implicit_rdpcm && (mode == 10 || mode == 26) {
+                rdpcm = Some(mode == 26);
+            }
+        }
+        let stat_idx = r.persistent_rice_adaptation.then(|| CTX_STAT_COEFF + 2 * (c_idx == 0) as usize + untransformed as usize);
+        RextResidual {
+            rdpcm,
+            ts_ctx: r.transform_skip_context && untransformed,
+            rotate: r.transform_skip_rotation && untransformed && intra,
+            stat_idx,
+            rice_cap: if stat_idx.is_some() { 31 } else { 4 },
+        }
+    }
+
+    /// The chroma cbfs of a 4:2:2 transform-tree node: a second flag for the
+    /// lower chroma block of every node whose chroma is coded at this depth
+    /// (unsplit, or 8x8 luma whose 4x4 children share the parent's chroma).
+    /// Out of line so the 4:2:0 path keeps its version-1 shape.
+    #[inline(never)]
+    fn cbf_chroma_422(&mut self, log2: usize, depth: u8, split: bool, parent_cb: u8, parent_cr: u8) -> (u8, u8) {
+        let two = !split || log2 == 3;
+        let ctx = CTX_CBF_CHROMA + depth as usize;
+        let mut flags = [0u8; 2];
+        for (f, parent) in flags.iter_mut().zip([parent_cb, parent_cr]) {
+            if depth == 0 || parent & 1 != 0 {
+                *f = self.cab.decode(ctx) as u8;
+                if two {
+                    *f |= (self.cab.decode(ctx) as u8) << 1;
+                }
+            }
+        }
+        (flags[0], flags[1])
+    }
+
+    /// `cross_comp_pred()` (§7.3.8.12): `ResScaleVal` for chroma component
+    /// `k` (0 = Cb, 1 = Cr).
+    #[cold]
+    #[inline(never)]
+    fn cross_comp_pred(&mut self, k: usize) -> i32 {
+        // log2_res_scale_abs_plus1: truncated rice, cMax 4, ctxInc 4k + binIdx.
+        let mut v = 0usize;
+        while v < 4 && self.cab.decode(CTX_LOG2_RES_SCALE_ABS + 4 * k + v) == 1 {
+            v += 1;
+        }
+        if v == 0 {
+            return 0;
+        }
+        let sign = self.cab.decode(CTX_RES_SCALE_SIGN + k) == 1;
+        let mag = 1i32 << (v - 1);
+        if sign {
+            -mag
+        } else {
+            mag
+        }
+    }
+
+    /// A chroma block with no coded residual under cross-component
+    /// prediction: its residual is the scaled luma residual alone.
+    #[cold]
+    #[inline(never)]
+    fn ccp_only(&mut self, xc: usize, yc: usize, log2: usize, c_idx: usize) {
+        let n = 1usize << log2;
+        self.coeffs[..n * n].fill(0);
+        self.modify_residual(n, c_idx, Untransformed::default());
+        let max = (1i32 << self.sps.bit_depth_chroma) - 1;
+        let plane = &mut self.pic.planes[c_idx];
+        let stride = plane.stride;
+        accel::pixel::add_residual(&mut plane.data[yc * stride + xc..], stride, &self.coeffs[..n * n], n, n, max);
+    }
+
+    /// The range-extension residual modifications, on `self.coeffs` after the
+    /// inverse transform (or scaling-only, or bypass): rotation (§8.6.2),
+    /// residual DPCM (§8.6.8), and cross-component prediction (§8.6.6), which
+    /// also records the luma residual it reads.
+    #[cold]
+    #[inline(never)]
+    fn modify_residual(&mut self, n: usize, c_idx: usize, ut: Untransformed) {
+        let nn = n * n;
+        let r = &mut self.coeffs[..nn];
+        if ut.rotate {
+            // A permutation, so it commutes with the transform-skip shift
+            // the spec applies after it.
+            r.reverse();
+        }
+        match ut.rdpcm {
+            Some(true) => {
+                for i in n..nn {
+                    r[i] += r[i - n];
+                }
+            }
+            Some(false) => {
+                for y in 0..n {
+                    for x in 1..n {
+                        r[y * n + x] += r[y * n + x - 1];
+                    }
+                }
+            }
+            None => {}
+        }
+        if self.ccp_active {
+            if c_idx == 0 {
+                self.res_y[..nn].copy_from_slice(r);
+            } else {
+                let scale = self.res_scale[c_idx - 1];
+                if scale != 0 {
+                    let (bdy, bdc) = (self.sps.bit_depth_luma, self.sps.bit_depth_chroma);
+                    for (v, &y) in r.iter_mut().zip(&self.res_y[..nn]) {
+                        *v += (scale * ((y << bdc) >> bdy)) >> 3;
+                    }
+                }
+            }
+        }
+    }
+
+    /// `cu_chroma_qp_offset_flag` / `cu_chroma_qp_offset_idx` (§7.3.8.10,
+    /// RExt): picks `CuQpOffsetCb/Cr` from the PPS lists for the rest of the
+    /// chroma QP offset group.
+    #[cold]
+    #[inline(never)]
+    fn chroma_qp_offset_syntax(&mut self) {
+        let pps = self.pps;
+        let flag = self.cab.decode(CTX_CU_CHROMA_QP_OFFSET_FLAG) == 1;
+        self.cu_qp_offset_c = if flag {
+            let len_minus1 = pps.cb_qp_offset_list.len().saturating_sub(1) as u32;
+            let mut idx = 0u32;
+            // Truncated rice, cMax = chroma_qp_offset_list_len_minus1, one context.
+            while idx < len_minus1 && self.cab.decode(CTX_CU_CHROMA_QP_OFFSET_IDX) == 1 {
+                idx += 1;
+            }
+            [pps.cb_qp_offset_list[idx as usize], pps.cr_qp_offset_list[idx as usize]]
+        } else {
+            [0, 0]
+        };
+        self.is_cu_chroma_qp_offset_coded = true;
+    }
+
     // ---- intra prediction glue (§8.4.4.2.1) ----
 
-    /// Predicts the N×N block of component `c` at component coordinates (xb, yb).
-    fn intra_predict(&mut self, c: usize, xb: usize, yb: usize, n: usize, mode: u8, residual_follows: bool) -> Option<u16> {
+    /// Predicts the N×N block of component `c` at component coordinates
+    /// (xb, yb): the version-1 instantiation unless the slice needs the
+    /// range-extension intra rules (4:2:2 / 4:4:4 geometry or filtering,
+    /// `intra_smoothing_disabled_flag`, implicit RDPCM).
+    #[inline(always)]
+    fn intra_predict_any(&mut self, c: usize, xb: usize, yb: usize, n: usize, mode: u8, residual_follows: bool) -> Option<u16> {
+        if self.intra_range {
+            self.intra_predict::<true>(c, xb, yb, n, mode, residual_follows)
+        } else {
+            self.intra_predict::<false>(c, xb, yb, n, mode, residual_follows)
+        }
+    }
+
+    /// See [`Self::intra_predict_any`].
+    fn intra_predict<const RANGE: bool>(&mut self, c: usize, xb: usize, yb: usize, n: usize, mode: u8, residual_follows: bool) -> Option<u16> {
         crate::prof_scope!(crate::prof::Stage::Intra);
         if self.ablate.intra {
             return None;
         }
-        let ss = if c > 0 { 1 } else { 0 };
-        let xl = (xb << ss) as i32;
-        let yl = (yb << ss) as i32;
+        // Per-component subsampling and §8.4.4.2 filters: the version-1
+        // constants, or (`RANGE`) fixed per component for the slice
+        // (`SliceDecoder::intra_comp`), where implicit RDPCM also turns the
+        // boundary smoothing off for a transquant-bypass block.
+        let (sx, sy, pf) = if RANGE {
+            let IntraComp { sx, sy, mut pf } = self.intra_comp[(c > 0) as usize];
+            if self.cu_transquant_bypass && self.sps.rext.implicit_rdpcm {
+                pf.edge = false;
+            }
+            (sx, sy, pf)
+        } else {
+            let ss = (c > 0) as usize;
+            let pf = if c == 0 {
+                intra::PredFilters::luma(self.sps.strong_intra_smoothing_enabled)
+            } else {
+                intra::PredFilters::CHROMA
+            };
+            (ss, ss, pf)
+        };
+        let xl = (xb << sx) as i32;
+        let yl = (yb << sy) as i32;
         let constrained = self.pps.constrained_intra_pred;
         let refs = &mut self.iref;
         // The reference-sample gather asks about up to 4n + 1 neighbours of
@@ -162,11 +411,11 @@ impl<'a> SliceDecoder<'a> {
             // five.
             let st = &*self.st;
             let plane = &self.pic.planes[c];
-            let nl = (n << ss) as i32;
+            let (nlx, nly) = ((n << sx) as i32, (n << sy) as i32);
             let a_left = st.avail_n(&ac, xl - 1, yl);
-            let a_bl = st.avail_n(&ac, xl - 1, yl + nl);
+            let a_bl = st.avail_n(&ac, xl - 1, yl + nly);
             let a_top = st.avail_n(&ac, xl, yl - 1);
-            let a_tr = st.avail_n(&ac, xl + nl, yl - 1);
+            let a_tr = st.avail_n(&ac, xl + nlx, yl - 1);
             let a_corner = st.avail_n(&ac, xl - 1, yl - 1);
             let bl_count = if a_bl { n.min(plane.height - (yb + n)) } else { 0 };
             let tr_count = if a_tr { n.min(plane.width - (xb + n)) } else { 0 };
@@ -198,7 +447,7 @@ impl<'a> SliceDecoder<'a> {
             let plane = &mut self.pic.planes[c];
             let stride = plane.stride;
             let off = yb * stride + xb;
-            return intra::predict(refs, n, mode, c, bit_depth, self.sps.strong_intra_smoothing_enabled, &mut plane.data[off..], stride, residual_follows);
+            return intra::predict_filtered(refs, n, mode, pf, bit_depth, &mut plane.data[off..], stride, residual_follows);
         }
         // Constrained intra prediction: availability also depends on each
         // neighbour's prediction mode, which is not uniform over a block, so
@@ -217,9 +466,9 @@ impl<'a> SliceDecoder<'a> {
             // old shape asked per sample: for a 32x32 block that was 129
             // z-scan/slice/tile derivations instead of 33.
             // `run` is 4 or 2 — a power of two — so the wrap below is a mask,
-            // not a `%`. Written as `%` it was a hardware divide per run.
-            let run = 4 >> ss;
-            let rmask = run - 1;
+            // not a `%`. Written as `%` it was a hardware divide per run. It
+            // differs per axis in 4:2:2.
+            let (run_y, run_x) = (4 >> sy, 4 >> sx);
             // Gather a SPAN of consecutive available runs at a time, not a run.
             //
             // Availability is derived per run, but the copy does not have to be.
@@ -241,8 +490,8 @@ impl<'a> SliceDecoder<'a> {
             let mut k = 0;
             let mut span: Option<usize> = None;
             while k < 2 * n {
-                let end = (k + run - ((yb + k) & rmask)).min(2 * n);
-                if avail(st, (xb as i32 - 1) << ss, ((yb + k) as i32) << ss) {
+                let end = (k + run_y - ((yb + k) & (run_y - 1))).min(2 * n);
+                if avail(st, (xb as i32 - 1) << sx, ((yb + k) as i32) << sy) {
                     span.get_or_insert(k);
                 } else {
                     all_avail = false;
@@ -270,8 +519,8 @@ impl<'a> SliceDecoder<'a> {
             let mut k = 0;
             let mut span: Option<usize> = None;
             while k < 2 * n {
-                let end = (k + run - ((xb + k) & rmask)).min(2 * n);
-                if avail(st, ((xb + k) as i32) << ss, (yb as i32 - 1) << ss) {
+                let end = (k + run_x - ((xb + k) & (run_x - 1))).min(2 * n);
+                if avail(st, ((xb + k) as i32) << sx, (yb as i32 - 1) << sy) {
                     span.get_or_insert(k);
                 } else {
                     all_avail = false;
@@ -286,7 +535,7 @@ impl<'a> SliceDecoder<'a> {
                 refs.top[a..2 * n].copy_from_slice(&top_row()[xb + a..xb + 2 * n]);
                 refs.top_avail[a..2 * n].fill(true);
             }
-            if avail(st, (xb as i32 - 1) << ss, (yb as i32 - 1) << ss) {
+            if avail(st, (xb as i32 - 1) << sx, (yb as i32 - 1) << sy) {
                 refs.corner = plane.get(xb - 1, yb - 1);
                 refs.corner_avail = true;
             } else {
@@ -303,15 +552,28 @@ impl<'a> SliceDecoder<'a> {
         let plane = &mut self.pic.planes[c];
         let stride = plane.stride;
         let off = yb * stride + xb;
-        intra::predict(refs, n, mode, c, bit_depth, self.sps.strong_intra_smoothing_enabled, &mut plane.data[off..], stride, residual_follows)
+        intra::predict_filtered(refs, n, mode, pf, bit_depth, &mut plane.data[off..], stride, residual_follows)
     }
 
     // ---- residual coding (§7.3.8.11) + reconstruction ----
 
-    /// Parses one transform block's coefficients (luma-domain coordinates
-    /// `x0, y0`; for chroma these are the chroma block's coordinates × 2),
-    /// scales, inverse-transforms and adds to the picture.
-    fn residual_block(&mut self, x0: usize, y0: usize, log2: usize, c_idx: usize, pred_mode_intra: u8, dc: Option<u16>) -> Result<()> {
+    /// Parses one transform block's coefficients (`x0, y0` in the
+    /// component's own sample coordinates), scales, inverse-transforms and
+    /// adds to the picture.
+    fn residual_block_any(&mut self, x0: usize, y0: usize, log2: usize, c_idx: usize, pred_mode_intra: u8, dc: Option<u16>) -> Result<()> {
+        // Two instantiations: without the range-extension residual tools the
+        // parse is the version-1 one with every RExt branch compiled out, so
+        // a stream that uses none of them pays one predictable branch here.
+        if self.rext_residual {
+            self.residual_block::<true>(x0, y0, log2, c_idx, pred_mode_intra, dc)
+        } else {
+            self.residual_block::<false>(x0, y0, log2, c_idx, pred_mode_intra, dc)
+        }
+    }
+
+    /// One transform block (see [`Self::residual_block_any`]); `REXT` says
+    /// whether any range-extension residual tool is on.
+    fn residual_block<const REXT: bool>(&mut self, x0: usize, y0: usize, log2: usize, c_idx: usize, pred_mode_intra: u8, dc: Option<u16>) -> Result<()> {
         let n = 1usize << log2;
         let nn = n * n;
         if accel::census::ALWAYS {
@@ -321,10 +583,19 @@ impl<'a> SliceDecoder<'a> {
         // known about the block. It is now below, once the last-significant
         // position says how much of the block is live.
         let cab = &mut self.cab;
+        let bypass = self.cu_transquant_bypass;
         let mut transform_skip = false;
-        if self.pps.transform_skip_enabled && !self.cu_transquant_bypass && log2 <= self.pps.log2_max_transform_skip_block_size as usize {
+        if self.pps.transform_skip_enabled && !bypass && log2 <= self.pps.log2_max_transform_skip_block_size as usize {
             transform_skip = cab.decode(CTX_TRANSFORM_SKIP + if c_idx > 0 { 1 } else { 0 }) == 1;
         }
+        // The range-extension residual tools, all behind one per-slice flag
+        // so a stream without them pays a single predictable branch.
+        let rt = if REXT {
+            Self::rext_residual_tools(cab, &self.sps.rext, self.cu_intra, transform_skip || bypass, c_idx, pred_mode_intra)
+        } else {
+            RextResidual::NONE
+        };
+        let (rdpcm, ts_ctx, stat_idx, rice_cap) = (rt.rdpcm, rt.ts_ctx, rt.stat_idx, rt.rice_cap);
         // last_sig_coeff_{x,y}_prefix / suffix
         let (ctx_off, ctx_shift) = if c_idx == 0 { (3 * (log2 - 2) + ((log2 - 1) >> 2), (log2 + 1) >> 2) } else { (15, log2 - 2) };
         let cmax = (log2 << 1) - 1;
@@ -354,7 +625,7 @@ impl<'a> SliceDecoder<'a> {
             return Err(Error::invalid("last significant coefficient outside the block"));
         }
         // scanIdx (§7.4.9.11)
-        let scan_idx = if self.cu_intra && (log2 == 2 || (log2 == 3 && c_idx == 0)) {
+        let scan_idx = if self.cu_intra && (log2 == 2 || (log2 == 3 && (c_idx == 0 || self.cat == 3))) {
             if (6..=14).contains(&pred_mode_intra) {
                 2
             } else if (22..=30).contains(&pred_mode_intra) {
@@ -444,10 +715,9 @@ impl<'a> SliceDecoder<'a> {
                     self.pps.cb_qp_offset + self.sh.cb_qp_offset
                 } else {
                     self.pps.cr_qp_offset + self.sh.cr_qp_offset
-                };
+                } + self.cu_qp_offset_c[c_idx - 1];
                 let qpi = (self.qp_y + off).clamp(-sps.qp_bd_offset_c, 57);
-                let qpc = if qpi < 0 { qpi } else { CHROMA_QP_420[qpi as usize] as i32 };
-                qpc + sps.qp_bd_offset_c
+                chroma_qp(qpi, self.cat) + sps.qp_bd_offset_c
             };
             let m: Option<&[u8]> = match self.scaling {
                 Some(sf) if !(transform_skip && n > 4) => {
@@ -472,7 +742,8 @@ impl<'a> SliceDecoder<'a> {
         let sig_base = CTX_SIG + if c_idx == 0 { 0 } else { 27 };
         let gt1_base = CTX_GT1 + if c_idx == 0 { 0 } else { 16 };
         let gt2_base = CTX_GT2 + if c_idx == 0 { 0 } else { 4 };
-        let sign_hiding = self.pps.sign_data_hiding_enabled && !self.cu_transquant_bypass;
+        // No sign hiding on bypass blocks or residual-DPCM blocks (§7.3.8.11).
+        let sign_hiding = self.pps.sign_data_hiding_enabled && !bypass && rdpcm.is_none();
 
         for i in (0..=last_sb).rev() {
             let (xs, ys) = (sb_scan[i].0 as usize, sb_scan[i].1 as usize);
@@ -494,7 +765,13 @@ impl<'a> SliceDecoder<'a> {
             // never has to recover (xP, yP) or (xC, yC); `sig_off` is the
             // sub-block/size/component term, which the old shape recomputed for
             // every one of 2.3 M scanned positions (18.8 M on intra content).
-            let (sig_row, sig_off) = if log2 == 2 {
+            // `transform_skip_context_enabled_flag` (RExt) codes every flag of
+            // an untransformed block with one context: an all-zero row and an
+            // offset to that context, so the per-coefficient loop below keeps
+            // its shape and pays nothing for the tool.
+            let (sig_row, sig_off) = if REXT && ts_ctx {
+                (&ZERO16, CTX_SIG_TS + (c_idx > 0) as usize - sig_base)
+            } else if log2 == 2 {
                 (sc.sig_4x4, 0usize)
             } else {
                 let mut o = if xs > 0 || ys > 0 { 3 } else { 0 };
@@ -516,7 +793,7 @@ impl<'a> SliceDecoder<'a> {
             };
             // The DC of the DC sub-block is context 0 (§9.3.4.2.5). For a 4x4
             // block the map already reads 0 there, so one test serves both.
-            let dc_sb = xs == 0 && ys == 0;
+            let dc_sb = xs == 0 && ys == 0 && !(REXT && ts_ctx);
             // significant_coeff_flag
             let mut sig_pos = [0u8; 16];
             let mut nsig = 0usize;
@@ -603,8 +880,15 @@ impl<'a> SliceDecoder<'a> {
             // shifts by 0; `signs` is then 0 anyway, so the result still reads
             // as all-positive.
             let mut sbits = cab.bypass_bits(nsigns as u32).wrapping_shl(32 - nsigns as u32);
-            // coeff_abs_level_remaining
-            let mut rice = 0u32;
+            // coeff_abs_level_remaining. The Rice parameter starts at 0, or
+            // at StatCoeff[sbType] / 4 with persistent Rice adaptation (RExt).
+            let mut rice = match stat_idx {
+                Some(i) => (cab.ctx.0[i] as u32 / 4).min(rice_cap),
+                None => 0,
+            };
+            // The first `coeff_abs_level_remaining` of the sub-block, for the
+            // StatCoeff update after the loop (persistent Rice only).
+            let mut first_rem = -1i32;
             let mut sum_abs = 0i32;
             for k in 0..nsig {
                 let np = sig_pos[k & 15] as usize;
@@ -623,8 +907,11 @@ impl<'a> SliceDecoder<'a> {
                 if base == threshold {
                     let rem = Self::coeff_remaining(cab, rice)?;
                     abs += rem;
+                    if stat_idx.is_some() && first_rem < 0 {
+                        first_rem = rem;
+                    }
                     if abs > 3 * (1 << rice) {
-                        rice = (rice + 1).min(4);
+                        rice = (rice + 1).min(rice_cap);
                     }
                 }
                 let neg = (sbits as i32) < 0;
@@ -651,8 +938,25 @@ impl<'a> SliceDecoder<'a> {
                     }
                 };
             }
+            // §9.3.3.11: the sub-block's first remaining level nudges
+            // StatCoeff[sbType], which seeds the next sub-block's parameter.
+            if let (Some(si), true) = (stat_idx, first_rem >= 0) {
+                // Shifts held below 30 so a hostile stream cannot overflow
+                // them; a real StatCoeff never gets near (the level would be
+                // beyond the 16-bit coefficient range first).
+                let s = cab.ctx.0[si];
+                let sh = (s / 4).min(29) as u32;
+                if first_rem >= (3 << sh) {
+                    cab.ctx.0[si] = s.saturating_add(1);
+                } else if 2 * first_rem < (1 << sh) && s > 0 {
+                    cab.ctx.0[si] = s - 1;
+                }
+            }
         }
-        self.reconstruct_residual(x0, y0, log2, c_idx, transform_skip, nz_w, nz_h, dc)
+        // §8.6.2: a 4x4 intra block that skips the transform is rotated by
+        // 180 degrees under `transform_skip_rotation_enabled_flag`.
+        let rotate = rt.rotate && n == 4;
+        self.reconstruct_residual(x0, y0, log2, c_idx, transform_skip, nz_w, nz_h, dc, Untransformed { rotate, rdpcm })
     }
 
     /// `coeff_abs_level_remaining` (§9.3.3.11), HM's equivalent form.
@@ -674,7 +978,7 @@ impl<'a> SliceDecoder<'a> {
 
     /// §8.6.2–8.6.4 on `self.coeffs`, then adds the residual to the picture.
     #[allow(clippy::too_many_arguments)]
-    fn reconstruct_residual(&mut self, x0: usize, y0: usize, log2: usize, c_idx: usize, transform_skip: bool, nz_w: usize, nz_h: usize, dc: Option<u16>) -> Result<()> {
+    fn reconstruct_residual(&mut self, x0: usize, y0: usize, log2: usize, c_idx: usize, transform_skip: bool, nz_w: usize, nz_h: usize, dc: Option<u16>, ut: Untransformed) -> Result<()> {
         crate::prof_scope!(crate::prof::Stage::Transform);
         if self.ablate.residual {
             return Ok(());
@@ -716,9 +1020,11 @@ impl<'a> SliceDecoder<'a> {
             cx::bump(&cx::RT_TX_FULL_AREA, (n * n) as u64);
         }
         itx::inverse_transform(&mut self.coeffs[..nn], &mut self.itx_tmp, n, nz_w, nz_h, bit_depth, kind);
-        let ss = if c_idx > 0 { 1 } else { 0 };
+        if ut.rotate || ut.rdpcm.is_some() || self.ccp_active {
+            self.modify_residual(n, c_idx, ut);
+        }
         let max = (1i32 << bit_depth) - 1;
-        let (xb, yb) = (x0 >> ss, y0 >> ss);
+        let (xb, yb) = (x0, y0);
         // Disjoint field borrows: the coefficients are read, the picture written.
         let coeffs = &self.coeffs[..nn];
         let plane = &mut self.pic.planes[c_idx];

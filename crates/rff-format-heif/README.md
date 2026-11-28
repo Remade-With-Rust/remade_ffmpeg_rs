@@ -20,9 +20,10 @@ decoder, [`rusty_h265`](https://crates.io/crates/rusty_h265). No C, no FFI.
 - **Bounded**: every count and size is checked against `Limits`; malformed
   files are errors, never panics.
 
-Not covered: encoding, image sequences, overlays (`iovl`), and HEVC range
-extensions beyond monochrome (4:2:2, 4:4:4, 12-bit), which `rusty_h265`
-refuses by name.
+Not covered: encoding, image sequences and overlays (`iovl`). HEVC items
+decode in 4:0:0, 4:2:0, 4:2:2 and 4:4:4 at 8 to 12 bits (camera `.HIF` files
+are 4:2:2 10-bit); `rusty_h265` refuses the few range-extension tools it does
+not implement (16-bit coding) by name.
 HDR gain maps are reported, not applied.
 
 ## Usage

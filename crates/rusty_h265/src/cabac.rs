@@ -72,7 +72,19 @@ pub const CTX_SIG: usize = 83; // 42 (luma 27, chroma 15)
 pub const CTX_SIG_TS: usize = 125; // 2 (RExt transform-skip contexts, unused in v1)
 pub const CTX_GT1: usize = 127; // 24 (luma 16, chroma 8)
 pub const CTX_GT2: usize = 151; // 6 (luma 4, chroma 2)
-pub const NUM_CTX: usize = 157;
+                                // Range-extension syntax elements (§9.3.2.2, Tables 9-4 rows added in v2).
+pub const CTX_CU_CHROMA_QP_OFFSET_FLAG: usize = 157; // 1
+pub const CTX_CU_CHROMA_QP_OFFSET_IDX: usize = 158; // 1
+pub const CTX_EXPLICIT_RDPCM_FLAG: usize = 159; // 2 (luma, chroma)
+pub const CTX_EXPLICIT_RDPCM_DIR: usize = 161; // 2 (luma, chroma)
+pub const CTX_LOG2_RES_SCALE_ABS: usize = 163; // 8 (4 per chroma component)
+pub const CTX_RES_SCALE_SIGN: usize = 171; // 2 (per chroma component)
+pub const NUM_CTX: usize = 173;
+/// `StatCoeff[0..4]` of persistent Rice adaptation (RExt) live in the
+/// context array's padding, so the WPP and dependent-slice storage and
+/// synchronisation (§9.3.2.3/9.3.2.4) carry them with the models, and
+/// `Contexts::init` resets them to 0, as the spec requires.
+pub const CTX_STAT_COEFF: usize = 252; // 4
 /// The context array's allocated length: `NUM_CTX` rounded up to a power of two.
 ///
 /// The guard on `decode`'s index used to be `ctx_idx.min(NUM_CTX - 1)`, which
@@ -123,6 +135,12 @@ pub static INIT_VALUES: [[u8; NUM_CTX]; 3] = [
         140, 92, 137, 138, 140, 152, 138, 139, 153, 74, 149, 92, 139, 107, 122, 152, // gt1 luma
         140, 179, 166, 182, 140, 227, 122, 197, // gt1 chroma
         138, 153, 136, 167, 152, 152, // gt2
+        CNU, // cu_chroma_qp_offset_flag
+        CNU, // cu_chroma_qp_offset_idx
+        CNU, CNU, // explicit_rdpcm_flag (never coded in an I slice)
+        CNU, CNU, // explicit_rdpcm_dir_flag
+        CNU, CNU, CNU, CNU, CNU, CNU, CNU, CNU, // log2_res_scale_abs_plus1
+        CNU, CNU, // res_scale_sign_flag
     ],
     // initType 1
     [
@@ -157,6 +175,12 @@ pub static INIT_VALUES: [[u8; NUM_CTX]; 3] = [
         154, 196, 196, 167, 154, 152, 167, 182, 182, 134, 149, 136, 153, 121, 136, 137,
         169, 194, 166, 167, 154, 167, 137, 182,
         107, 167, 91, 122, 107, 167,
+        CNU,
+        CNU,
+        139, 139,
+        139, 139,
+        CNU, CNU, CNU, CNU, CNU, CNU, CNU, CNU,
+        CNU, CNU,
     ],
     // initType 2
     [
@@ -191,6 +215,12 @@ pub static INIT_VALUES: [[u8; NUM_CTX]; 3] = [
         154, 196, 167, 167, 154, 152, 167, 182, 182, 134, 149, 136, 153, 121, 136, 122,
         169, 208, 166, 167, 154, 152, 167, 182,
         107, 167, 91, 107, 107, 167,
+        CNU,
+        CNU,
+        139, 139,
+        139, 139,
+        CNU, CNU, CNU, CNU, CNU, CNU, CNU, CNU,
+        CNU, CNU,
     ],
 ];
 
