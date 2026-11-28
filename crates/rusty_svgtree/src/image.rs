@@ -1,5 +1,8 @@
-//! Embedded images: `data:` URI parsing, format sniffing, header-only size
-//! probing at parse time, and bounded decoding at render time.
+//! Embedded images: `data:` URI parsing, the application's image loader,
+//! format sniffing, header-only size probing at parse time, and bounded
+//! decoding at render time.
+
+use std::sync::Arc;
 
 use rusty_raster::{IntSize, Pixmap, Size};
 
@@ -143,18 +146,70 @@ pub(crate) struct Nested {
     pub depth: u32,
     /// Elements all of them together may still have.
     pub nodes_left: usize,
+    /// An image loader answered [`ImageLoad::Fail`]: the parse fails.
+    pub failed: bool,
 }
 
-/// Resolves an `<image>` `href`. Only `data:` URIs are loaded (no file or
-/// network access by design); the format is recognised by MIME type or by
-/// content. Returns the data and its intrinsic size, read from the header
-/// only.
-pub(crate) fn load_href(
-    href: &str,
-    opt: &Options,
-    nested: &mut Nested,
-) -> Option<(ImageKind, Size)> {
-    let href = href.trim();
+/// Where an image reference points.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum ImageSource<'a> {
+    /// A `data:` URI, decoded (base64 or percent-encoding undone).
+    Data {
+        /// The MIME type, lowercase, without parameters; empty if none.
+        mime: &'a str,
+        /// The payload.
+        data: &'a [u8],
+    },
+    /// Anything else: a relative or absolute path or URL, as written
+    /// (trimmed). Resolving it is the loader's business.
+    Url(&'a str),
+}
+
+/// An `<image>` or `feImage` reference, asked of an [`ImageLoader`].
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub struct ImageRequest<'a> {
+    /// What the reference points at.
+    pub source: ImageSource<'a>,
+    /// How deep the document is in documents embedded as images: 0 for the
+    /// one being parsed, 1 for an SVG image in it, and so on (at most 8).
+    pub depth: u32,
+}
+
+/// What to do with an image reference (see [`ImageLoader`]).
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum ImageLoad {
+    /// As without a loader: a `data:` URI is loaded, anything else skipped.
+    Default,
+    /// Leave the image out (it counts in [`Skipped::images`](crate::Skipped)).
+    Skip,
+    /// Fail the whole parse with [`Error::ImageRefused`](crate::Error), as a
+    /// strict caller does when an image cannot be read.
+    Fail,
+    /// These bytes: PNG, JPEG, GIF or WebP (recognised by content), or else an
+    /// SVG document (svgz too), parsed as a nested document with the same
+    /// options, sharing the element limit of the documents around it and
+    /// asking the loader for its own images one level deeper.
+    Data(Arc<Vec<u8>>),
+}
+
+/// Loads the images a document refers to: files, URLs, and `data:` URIs
+/// under the application's own rules and budgets (see
+/// [`Options::image_loader`]).
+///
+/// Called once per distinct `href` text of a document (copies made by `use`
+/// share their original's), before anything is decoded. What it returns is
+/// held to [`Options::max_image_pixels`] and the nesting limits as a `data:`
+/// URI is.
+pub trait ImageLoader: std::fmt::Debug + Send + Sync {
+    /// What to do with a reference.
+    fn load(&self, request: &ImageRequest) -> ImageLoad;
+}
+
+/// A `data:` URI's MIME type and payload; `None` if `href` is not one.
+fn parse_data_uri(href: &str) -> Option<(String, Vec<u8>)> {
     if !crate::values::starts_with_ci(href, "data:") {
         return None;
     }
@@ -175,6 +230,40 @@ pub(crate) fn load_href(
     } else {
         percent_decode(payload.as_bytes())
     };
+    Some((mime, data))
+}
+
+/// Resolves an `<image>` `href`, through the application's loader if there
+/// is one; without one only `data:` URIs are loaded (no file or network
+/// access). The format is recognised by MIME type or by content. Returns the
+/// data and its intrinsic size, read from the header only.
+pub(crate) fn load_href(
+    href: &str,
+    opt: &Options,
+    nested: &mut Nested,
+) -> Option<(ImageKind, Size)> {
+    let href = href.trim();
+    let data_uri = parse_data_uri(href);
+    if let Some(loader) = &opt.image_loader {
+        let source = match &data_uri {
+            Some((mime, data)) => ImageSource::Data { mime, data },
+            None => ImageSource::Url(href),
+        };
+        let request = ImageRequest {
+            source,
+            depth: nested.depth,
+        };
+        match loader.load(&request) {
+            ImageLoad::Default => {}
+            ImageLoad::Skip => return None,
+            ImageLoad::Fail => {
+                nested.failed = true;
+                return None;
+            }
+            ImageLoad::Data(data) => return load_bytes(data, opt, nested),
+        }
+    }
+    let (mime, data) = data_uri?;
     let format = match mime.as_str() {
         "image/png" => Format::Png,
         "image/jpeg" | "image/jpg" => Format::Jpeg,
@@ -188,12 +277,24 @@ pub(crate) fn load_href(
         },
         _ => return None,
     };
+    raster(format, Arc::new(data), opt)
+}
+
+/// Bytes from a loader: a raster image by content, else an SVG document.
+fn load_bytes(data: Arc<Vec<u8>>, opt: &Options, nested: &mut Nested) -> Option<(ImageKind, Size)> {
+    match sniff(&data) {
+        Some(format) => raster(format, data, opt),
+        None => load_svg(&data, opt, nested),
+    }
+}
+
+/// A raster image, its size read from its header.
+fn raster(format: Format, data: Arc<Vec<u8>>, opt: &Options) -> Option<(ImageKind, Size)> {
     let (w, h) = probe_size(format, &data)?;
     if u64::from(w) * u64::from(h) > opt.max_image_pixels {
         return None;
     }
     let size = Size::from_wh(w as f32, h as f32)?;
-    let data = std::sync::Arc::new(data);
     let kind = match format {
         Format::Png => ImageKind::Png(data),
         Format::Jpeg => ImageKind::Jpeg(data),
@@ -214,9 +315,10 @@ fn load_svg(data: &[u8], opt: &Options, nested: &mut Nested) -> Option<(ImageKin
     };
     let tree = crate::Tree::parse(data, opt, &mut inner);
     nested.nodes_left = inner.nodes_left;
+    nested.failed |= inner.failed;
     let tree = tree.ok()?;
     let size = tree.size();
-    Some((ImageKind::Svg(std::sync::Arc::new(tree)), size))
+    Some((ImageKind::Svg(Arc::new(tree)), size))
 }
 
 /// Decompresses gzip data, at most `max` bytes of it (more is an error).

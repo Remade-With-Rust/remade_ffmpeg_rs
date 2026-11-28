@@ -211,6 +211,7 @@ impl Cache {
         };
         let tree = crate::Tree::parse(data, &opt, &mut inner);
         limits.nodes_left = inner.nodes_left;
+        limits.failed |= inner.failed;
         let tree = tree.ok()?;
         let nodes = tree.node_count;
         let Some(id) = id else {

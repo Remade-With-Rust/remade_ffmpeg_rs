@@ -207,12 +207,47 @@ bound style-sheet matching, `use` cycle checks and the re-conversion of shared
 clip paths, patterns and markers. `use` reference cycles are
 skipped (resvg instead fails the whole document); clip-path, mask and pattern
 cycles are broken. Embedded documents share the limits of the one around them
-and nest 8 deep. Only `data:` image URIs are loaded: no file or network
-access. `Tree::skipped` says what was left out.
+and nest 8 deep. By default only `data:` image URIs are loaded: no file or
+network access. `Tree::skipped` says what was left out.
+
+## Linked images and nested documents
+
+`Options::image_loader` takes an `ImageLoader`, asked once per distinct
+`<image>` / `feImage` reference before anything is decoded, with the source
+(a `data:` URI's MIME type and decoded bytes, or the URL text as written) and
+the nesting depth. It answers `Default` (as without a loader), `Skip`,
+`Fail` (the parse fails with `Error::ImageRefused`, for a strict caller) or
+`Data(bytes)`: PNG, JPEG, GIF or WebP by content, or else an SVG document,
+which is parsed with the same options, shares the element limit of the
+documents around it and asks the loader for its own images one level deeper.
+
+```rust,ignore
+#[derive(Debug)]
+struct Files(std::path::PathBuf);
+
+impl rusty_svgtree::ImageLoader for Files {
+    fn load(&self, r: &rusty_svgtree::ImageRequest) -> rusty_svgtree::ImageLoad {
+        use rusty_svgtree::{ImageLoad, ImageSource};
+        match r.source {
+            ImageSource::Url(href) => match std::fs::read(self.0.join(href)) {
+                Ok(data) => ImageLoad::Data(std::sync::Arc::new(data)),
+                Err(_) => ImageLoad::Skip,
+            },
+            _ => ImageLoad::Default,
+        }
+    }
+}
+```
+
+Against resvg 0.48.1 loading the same files from its `resources_dir`: the
+1,281 SVGs of the identity corpus (Vector's and Fig's corpora and real SVGs
+from the house repos) drawn as nested documents are 1,280 pixel-identical,
+the other 58.73 dB; linked copies of every `data:` image in them draw
+exactly as the embedded ones.
 
 ## Not done yet
 
-- No external `href`s (by design), no animation.
+- No animation; external `href`s only through `Options::image_loader`.
 - A house font stack: see Text.
 
 ## License
