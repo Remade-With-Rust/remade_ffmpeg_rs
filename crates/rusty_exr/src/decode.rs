@@ -1365,6 +1365,7 @@ impl std::fmt::Debug for DecodeScratch {
 struct RowBuf {
     h: Vec<u16>,
     w: Vec<u32>,
+    b: Vec<u8>,
 }
 
 /// Whether a `src` channel can be written to a `dst` plane.
@@ -1516,14 +1517,6 @@ fn put16_halves(dst: &mut [u16], a: &[u8], b: &[u8]) {
     }
 }
 
-/// 32-bit samples whose bytes 0/2 are in `a` and 1/3 in `b`.
-#[inline]
-fn put32_halves(dst: &mut [u32], a: &[u8], b: &[u8]) {
-    for ((d, x), y) in dst.iter_mut().zip(a.chunks_exact(2)).zip(b.chunks_exact(2)) {
-        *d = u32::from_le_bytes([x[0], y[0], x[1], y[1]]);
-    }
-}
-
 /// 32-bit samples from (low, high) 16-bit word pairs.
 #[inline]
 fn put32_words(dst: &mut [u32], src: &[u16]) {
@@ -1555,7 +1548,7 @@ fn seg16(dst: &mut [u16], seg: Seg<'_>) {
 fn seg32(dst: &mut [u32], seg: Seg<'_>) {
     match seg {
         Seg::Bytes(s) => put32(dst, s),
-        Seg::Halves(a, b) => put32_halves(dst, a, b),
+        Seg::Halves(..) => unreachable!("32-bit halves are interleaved first"),
         Seg::Words(w) => put32_words(dst, w),
     }
 }
@@ -1585,20 +1578,27 @@ fn put_row(
     seg: Seg<'_>,
     rows: &mut RowBuf,
 ) {
+    let RowBuf { h, w, b } = rows;
+    // A 32-bit row in the split-bytes layout (ZIP, RLE) is interleaved
+    // back into an L1-sized byte row first: that loop vectorizes, while
+    // gathering each sample's four bytes from the two halves did not.
+    let seg = match seg {
+        Seg::Halves(lo, hi) if src != SampleType::F16 => {
+            let row = compression::grow(b, 2 * lo.len());
+            for ((d, &x), &y) in row.chunks_exact_mut(2).zip(lo).zip(hi) {
+                d[0] = x;
+                d[1] = y;
+            }
+            Seg::Bytes(row)
+        }
+        seg => seg,
+    };
     match (dst, src) {
         (PlaneMut::F16(v), SampleType::F16) => seg16(&mut v[start..start + n], seg),
         (PlaneMut::U32(v), SampleType::U32) => seg32(&mut v[start..start + n], seg),
         (PlaneMut::F32(v), SampleType::F32) => match seg {
             Seg::Bytes(s) => put32f(&mut v[start..start + n], s),
-            Seg::Halves(a, b) => {
-                for ((d, x), y) in v[start..start + n]
-                    .iter_mut()
-                    .zip(a.chunks_exact(2))
-                    .zip(b.chunks_exact(2))
-                {
-                    *d = f32::from_le_bytes([x[0], y[0], x[1], y[1]]);
-                }
-            }
+            Seg::Halves(..) => unreachable!("32-bit halves are interleaved first"),
             Seg::Words(w) => {
                 for (d, s) in v[start..start + n].iter_mut().zip(w.chunks_exact(2)) {
                     *d = f32::from_bits(u32::from(s[0]) | (u32::from(s[1]) << 16));
@@ -1608,19 +1608,19 @@ fn put_row(
         // Conversions: the row is gathered into an L1-sized buffer, then
         // converted into the plane.
         (PlaneMut::F32(v), SampleType::F16) => {
-            let h = compression::grow(&mut rows.h, n);
+            let h = compression::grow(h, n);
             seg16(h, seg);
             halves_to_f32(crate::simd::isa(), h, &mut v[start..start + n]);
         }
         (PlaneMut::F32(v), SampleType::U32) => {
-            let u = compression::grow(&mut rows.w, n);
+            let u = compression::grow(w, n);
             seg32(u, seg);
             for (d, &s) in v[start..start + n].iter_mut().zip(&*u) {
                 *d = s as f32;
             }
         }
         (PlaneMut::F16(v), SampleType::F32) => {
-            let u = compression::grow(&mut rows.w, n);
+            let u = compression::grow(w, n);
             seg32(u, seg);
             for (d, &s) in v[start..start + n].iter_mut().zip(&*u) {
                 *d = crate::half::f32_to_f16(f32::from_bits(s));
