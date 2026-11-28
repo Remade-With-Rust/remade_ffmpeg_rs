@@ -462,13 +462,20 @@ impl Tile {
     }
 }
 
+/// Most coding passes a code-block can have, `3 * 37 - 2` for the deepest
+/// subband Part 1 allows (B.10.6); an unterminated codeword segment holds
+/// at most this many. A writer that signals more passes than a block's
+/// bit-planes can carry gives each further run of 109 its own length field,
+/// as OpenJPEG reads it (no conforming stream has such a run).
+const MAX_SEGMENT_PASSES: u32 = 109;
+
 /// Coding passes the codeword segment containing pass `p` still takes,
 /// counting `p` itself (D.4.2, Table D.9).
 fn segment_room(style: u8, p: u32) -> u32 {
     if style & STYLE_TERMALL != 0 {
         1
     } else if style & STYLE_BYPASS == 0 {
-        u32::MAX
+        MAX_SEGMENT_PASSES - p % MAX_SEGMENT_PASSES
     } else if p < 10 {
         10 - p
     } else if (p - 10) % 3 == 0 {
@@ -483,6 +490,7 @@ fn starts_segment(style: u8, p: u32) -> bool {
     p == 0
         || style & STYLE_TERMALL != 0
         || (style & STYLE_BYPASS != 0 && p >= 10 && (p - 10) % 3 != 1)
+        || (style & STYLE_BYPASS == 0 && p % MAX_SEGMENT_PASSES == 0)
 }
 
 /// One subband's part of a packet header (B.10). Appends the codeword
@@ -759,5 +767,30 @@ impl TileComp {
         let step = plane.reals.then_some(band.step);
         dequantize(&s.t1.data, (w, h), &mut plane.data[first..], stride, step);
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Without bypass or terminate-all a block's passes form one codeword
+    /// segment, of at most 109 passes; OpenJPEG reads a length field for each
+    /// further run of 109 (a stream that signals more passes than its
+    /// bit-planes allow: OpenJPEG's kodak_2layers_lrcp and issue135).
+    #[test]
+    fn unterminated_segments_hold_109_passes() {
+        assert_eq!(segment_room(0, 0), 109);
+        assert_eq!(segment_room(0, 21), 88);
+        assert_eq!(segment_room(0, 108), 1);
+        assert_eq!(segment_room(0, 109), 109);
+        assert!(starts_segment(0, 0) && starts_segment(0, 109) && starts_segment(0, 218));
+        assert!(!starts_segment(0, 1) && !starts_segment(0, 108));
+        // Bypass and terminate-all keep their own rules.
+        assert_eq!(segment_room(STYLE_BYPASS, 0), 10);
+        assert_eq!(segment_room(STYLE_BYPASS, 10), 2);
+        assert_eq!(segment_room(STYLE_BYPASS, 109), 2);
+        assert!(!starts_segment(STYLE_BYPASS, 109 + 1));
+        assert_eq!(segment_room(STYLE_TERMALL, 200), 1);
     }
 }

@@ -3,7 +3,9 @@
 
 use std::time::{Duration, Instant};
 
-use rusty_jpx::{decode_jpx, decode_jpx_with, info, DecodeOptions, JpxError, Limits};
+use rusty_jpx::{
+    decode_jpx, decode_jpx_with, info, ConcealmentKind, DecodeOptions, JpxError, Limits,
+};
 
 fn corpus() -> Vec<(String, Vec<u8>)> {
     files_in(&format!("{}/tests/data", env!("CARGO_MANIFEST_DIR")))
@@ -39,7 +41,8 @@ fn truncation_errors_or_is_harmless() {
         let step = (file.len() / 200).max(1);
         let tail = file.len().saturating_sub(40)..file.len();
         for n in (0..file.len()).step_by(step).chain(tail) {
-            if let Ok(j) = decode_jpx(&file[..n]) {
+            let strict = decode_jpx(&file[..n]);
+            if let Ok(j) = &strict {
                 assert_eq!(j.components, whole.components, "{name} cut at {n}");
             }
             let _ = info(&file[..n]);
@@ -47,6 +50,9 @@ fn truncation_errors_or_is_harmless() {
             if let Ok(j) = decode_jpx_with(&file[..n], &lenient) {
                 assert_eq!((j.width, j.height), (whole.width, whole.height));
                 assert!(j.truncated || j.components == whole.components);
+                // Damage is never concealed silently.
+                assert_eq!(j.truncated, !j.concealed.is_empty(), "{name} cut at {n}");
+                assert_eq!(j.truncated, strict.is_err(), "{name} cut at {n}");
             }
         }
         // Cutting into the packet data is always an error.
@@ -102,9 +108,25 @@ fn mutations_never_panic() {
                 .with_allow_truncated(round % 2 == 0)
                 .with_reduce((rng.below(8) == 0).into());
             let t = Instant::now();
-            let _ = decode_jpx_with(&d, &options);
+            let r = decode_jpx_with(&d, &options);
             let _ = info(&d);
             let t = t.elapsed();
+            if let Ok(j) = &r {
+                assert_eq!(j.truncated, !j.concealed.is_empty(), "{name} round {round}");
+                // What strict mode decodes, lenient mode decodes the same,
+                // with nothing concealed.
+                if options.allow_truncated {
+                    let strict = decode_jpx_with(&d, &options.clone().with_allow_truncated(false));
+                    match strict {
+                        Ok(s) => assert!(
+                            !j.truncated && s == *j,
+                            "{name} round {round}: {:?}",
+                            j.concealed
+                        ),
+                        Err(e) => assert!(j.truncated, "{name} round {round}: strict {e}"),
+                    }
+                }
+            }
             assert!(t < Duration::from_secs(30), "{name} round {round}: {t:?}");
             slowest = slowest.max(t);
         }
@@ -285,6 +307,93 @@ fn many_tiles_of_many_components() {
         d.extend([0, 0, 0, 14, 0, 1, 0xFF, 0x93]);
     }
     assert!(matches!(decode_in_time(&d), Err(JpxError::Limit(_))));
+}
+
+fn lenient() -> DecodeOptions {
+    DecodeOptions::new().with_allow_truncated(true)
+}
+
+/// A code-block whose data runs past the end of the tile, then the packets of
+/// the second layer missing, in a codestream that otherwise ends properly:
+/// once reported as whole (`truncated` false).
+#[test]
+fn a_cut_code_block_is_reported_even_at_a_clean_end() {
+    let mut h = Header::new((8, 8));
+    h.layers = 2;
+    // Packet header: not empty, included, no zero bit-planes, one pass, 7
+    // bytes; then only 2 of them.
+    let d = h.write(&[0b1110_0111, 0, 0]);
+    assert_eq!(decode_jpx(&d), Err(JpxError::Truncated));
+    let j = decode_jpx_with(&d, &lenient()).unwrap();
+    assert!(j.truncated);
+    assert!(j
+        .concealed
+        .iter()
+        .any(|c| c.tile == Some(0) && c.kind == ConcealmentKind::CodeBlocksCut));
+}
+
+#[test]
+fn missing_tiles_are_listed() {
+    let mut h = Header::new((4, 1));
+    h.tile = (1, 1);
+    let d = h.write(&[0]);
+    assert_eq!(decode_jpx(&d), Err(JpxError::Truncated));
+    let j = decode_jpx_with(&d, &lenient()).unwrap();
+    let missing: Vec<_> = j
+        .concealed
+        .iter()
+        .filter(|c| c.kind == ConcealmentKind::TileMissing)
+        .map(|c| c.tile)
+        .collect();
+    assert_eq!(missing, [Some(1), Some(2), Some(3)]);
+    // Zero coefficients: the DC level of 8-bit unsigned samples.
+    assert_eq!(j.components[0].data[1..], [128; 3]);
+    assert_eq!(
+        j.concealed[0].to_string(),
+        "tile 1: missing, zero coefficients"
+    );
+}
+
+/// A tile-part whose header is damaged is skipped; the tile-parts after it
+/// are still read.
+#[test]
+fn a_damaged_tile_part_header_is_skipped() {
+    let file = std::fs::read(format!(
+        "{}/tests/data/rgb8_tiles_rpcl.jp2",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    let whole = decode_jpx(&file).unwrap();
+    let sots: Vec<usize> = file
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == [0xFF, 0x90, 0, 10])
+        .map(|(i, _)| i)
+        .collect();
+    assert!(sots.len() >= 3, "{}", sots.len());
+    let sod = sots[1]
+        + file[sots[1]..]
+            .windows(2)
+            .position(|w| w == [0xFF, 0x93])
+            .unwrap();
+    let mut d = file.clone();
+    d[sod + 1] = 0x00; // SOD is gone: the header runs into the packet data
+    assert!(matches!(decode_jpx(&d), Err(JpxError::Format(_))));
+    let j = decode_jpx_with(&d, &lenient()).unwrap();
+    assert!(j.truncated);
+    assert!(matches!(
+        j.concealed[0].kind,
+        ConcealmentKind::TilePartSkipped(_)
+    ));
+    // The image is whole but for that tile.
+    let (w, h) = (
+        whole.components[0].width as usize,
+        whole.components[0].height as usize,
+    );
+    let differing = (0..w * h)
+        .filter(|&i| j.components[0].data[i] != whole.components[0].data[i])
+        .count();
+    assert!(differing > 0 && differing < w * h / 2, "{differing}");
 }
 
 #[test]

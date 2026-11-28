@@ -7,17 +7,18 @@ use crate::dwt::Plane;
 use crate::error::{try_vec, JpxError, JpxResult};
 use crate::kernels::{self, Level};
 use crate::tile::{Budget, PacketData, Scratch, Tile};
-use crate::DecodeOptions;
+use crate::{Concealment, ConcealmentKind, DecodeOptions};
 
 /// Decoded components, before any JP2 level processing.
 pub(crate) struct Decoded {
     pub siz: Siz,
     pub samples: Vec<Vec<i32>>,
-    pub truncated: bool,
+    /// What a lenient decode decoded around.
+    pub concealed: Vec<Concealment>,
 }
 
 pub(crate) fn decode(cs: &[u8], options: &DecodeOptions) -> JpxResult<Decoded> {
-    let stream = codestream::parse(cs, &options.limits)?;
+    let stream = codestream::parse(cs, &options.limits, options.allow_truncated)?;
     let reduce = u32::from(options.reduce);
     if reduce > 32 {
         return Err(JpxError::Usage("reduce exceeds the decomposition levels"));
@@ -50,43 +51,89 @@ pub(crate) fn decode(cs: &[u8], options: &DecodeOptions) -> JpxResult<Decoded> {
     if missing && !options.allow_truncated {
         return Err(JpxError::Truncated);
     }
+    let mut concealed: Vec<Concealment> = stream
+        .skipped
+        .iter()
+        .map(|&(tile, why)| Concealment {
+            tile,
+            kind: ConcealmentKind::TilePartSkipped(why),
+        })
+        .collect();
 
     // Allocated on first use, so that a single tile can hand its buffer over.
     let mut out: Vec<Vec<i32>> = vec![Vec::new(); siz.comps.len()];
-    let mut truncated = missing;
     let mut budget = Budget {
         structures: options.limits.max_structures,
         steps: (1 << 26) + 2 * cs.len() as u64,
     };
     let mut scratch = Scratch::default();
-    for (t, parts) in stream.tiles.iter().enumerate() {
-        let Some(parts) = parts else { continue };
-        let complete = decode_tile(
+    for (t, parts) in (0u32..).zip(&stream.tiles) {
+        let Some(parts) = parts else {
+            if !siz.tile_is_empty(t) {
+                concealed.push(Concealment {
+                    tile: Some(t),
+                    kind: ConcealmentKind::TileMissing,
+                });
+            }
+            continue;
+        };
+        decode_tile(
             cs,
             &stream,
-            t as u32,
+            t,
             parts,
             options,
             &sizes,
             &mut budget,
             &mut scratch,
             &mut out,
+            &mut concealed,
         )?;
-        truncated |= !complete;
     }
     for (o, &(w, h)) in out.iter_mut().zip(&sizes) {
         if o.is_empty() {
             *o = try_vec((w * h) as usize)?;
         }
     }
+    // Tiles with nothing decoded: zero coefficients, as for missing packets.
+    for c in &concealed {
+        if let (Some(t), ConcealmentKind::TileMissing | ConcealmentKind::TileUnreadable(_)) =
+            (c.tile, c.kind)
+        {
+            blank_tile(siz, t, reduce, &sizes, &mut out);
+        }
+    }
     Ok(Decoded {
         siz: stream.siz,
         samples: out,
-        truncated,
+        concealed,
     })
 }
 
-/// Decode one tile into `out`; `Ok(false)` when its data was incomplete.
+/// Fill tile `t` of every component with what zero coefficients decode to:
+/// the DC level shift (half the range for unsigned samples, 0 for signed).
+fn blank_tile(siz: &Siz, t: u32, reduce: u32, sizes: &[(u64, u64)], out: &mut [Vec<i32>]) {
+    let r = siz.tile(t);
+    for (c, (k, o)) in siz.comps.iter().zip(out.iter_mut()).enumerate() {
+        let origin = siz.comp_rect(c, reduce);
+        let edge = |v: u32, d: u32| codestream::ceil_shift(v.div_ceil(d), reduce);
+        let (x0, x1) = (edge(r[0], k.dx), edge(r[2], k.dx));
+        let (y0, y1) = (edge(r[1], k.dy), edge(r[3], k.dy));
+        let w = sizes[c].0 as usize;
+        if x0 >= x1 || y0 >= y1 || w == 0 {
+            continue;
+        }
+        let level = if k.signed { 0 } else { 1i32 << (k.bits - 1) };
+        let (x0, x1) = ((x0 - origin[0]) as usize, (x1 - origin[0]) as usize);
+        let (y0, y1) = ((y0 - origin[1]) as usize, (y1 - origin[1]) as usize);
+        for row in o.chunks_exact_mut(w).skip(y0).take(y1 - y0) {
+            row[x0..x1].fill(level);
+        }
+    }
+}
+
+/// Decode one tile into `out`, noting in `concealed` what a lenient decode
+/// had to decode around.
 #[allow(clippy::too_many_arguments)]
 fn decode_tile(
     cs: &[u8],
@@ -98,14 +145,40 @@ fn decode_tile(
     budget: &mut Budget,
     scratch: &mut Scratch,
     out: &mut [Vec<i32>],
-) -> JpxResult<bool> {
+    concealed: &mut Vec<Concealment>,
+) -> JpxResult<()> {
     let siz = &stream.siz;
     let reduce = u32::from(options.reduce);
+    let lenient = options.allow_truncated;
+    let conceal = |kind| Concealment {
+        tile: Some(t),
+        kind,
+    };
+    // Lenient: a tile whose own marker segments are malformed is left to
+    // decode as zero coefficients (`blank_tile`).
+    // Without any, the fault is the main header's, and every tile has it.
+    let own = lenient && !parts.markers.is_empty();
+    let unreadable = |e: JpxError| match e {
+        JpxError::Format(why) if own => Ok(conceal(ConcealmentKind::TileUnreadable(why))),
+        JpxError::Truncated if own => Ok(conceal(ConcealmentKind::TileUnreadable(
+            "marker segment cut short",
+        ))),
+        e => Err(e),
+    };
     let mut params = Cow::Borrowed(&stream.params);
     for (marker, body) in &parts.markers {
-        params.to_mut().apply(*marker, &cs[body.clone()], true)?;
+        if let Err(e) = params.to_mut().apply(*marker, &cs[body.clone()], true) {
+            concealed.push(unreadable(e)?);
+            return Ok(());
+        }
     }
-    let mut tile = Tile::new(siz, &params, siz.tile(t), reduce, budget)?;
+    let mut tile = match Tile::new(siz, &params, siz.tile(t), reduce, budget) {
+        Ok(tile) => tile,
+        Err(e) => {
+            concealed.push(unreadable(e)?);
+            return Ok(());
+        }
+    };
 
     let body: Cow<[u8]> = match parts.bodies.as_slice() {
         [] => Cow::Borrowed(&[]),
@@ -121,18 +194,29 @@ fn decode_tile(
         pos: 0,
         packed: packed.as_deref().map(|h| (h, 0)),
         pending: Vec::new(),
-        lenient: options.allow_truncated,
+        lenient,
         clean_end: false,
         cut: false,
     };
-    let complete = match tile.read_packets(&params, &mut data, budget) {
-        Ok(()) => !data.cut,
+    match tile.read_packets(&params, &mut data, budget) {
+        Ok(()) => {}
         // Fewer packets than the progression asks for, in a codestream that
-        // is whole: its writer dropped the rest (layers, usually).
-        Err(JpxError::Truncated) if data.clean_end && stream.ended && !parts.truncated => true,
-        Err(JpxError::Truncated | JpxError::Format(_)) if options.allow_truncated => false,
+        // is whole: its writer dropped the rest (layers, usually). Not when
+        // a lenient read already cut a code-block short: then the end of the
+        // data came early.
+        Err(JpxError::Truncated)
+            if data.clean_end && stream.ended && !parts.truncated && !data.cut => {}
+        Err(JpxError::Truncated) if lenient => {
+            concealed.push(conceal(ConcealmentKind::PacketsMissing("the data ends")));
+        }
+        Err(JpxError::Format(why)) if lenient => {
+            concealed.push(conceal(ConcealmentKind::PacketsMissing(why)));
+        }
         Err(e) => return Err(e),
-    };
+    }
+    if data.cut {
+        concealed.push(conceal(ConcealmentKind::CodeBlocksCut));
+    }
 
     let use_mct = params.mct && siz.comps.len() >= 3;
     let mut rest = 0..siz.comps.len();
@@ -176,7 +260,7 @@ fn decode_tile(
             &mut out[c],
         )?;
     }
-    Ok(complete)
+    Ok(())
 }
 
 /// Inverse RCT or ICT (G.2, G.3) on the first three components.
