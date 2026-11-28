@@ -426,58 +426,24 @@ fn encode_channels(
     };
 
     let nthreads = opts.threads.resolve().min(nchunks).max(1);
-    let mut packed: Vec<Option<Vec<u8>>> = vec![None; nchunks];
-    if nthreads == 1 {
-        let mut work = compression::Work::default();
-        for (i, slot) in packed.iter_mut().enumerate() {
-            *slot = Some(compress_one(i, &mut work)?);
-        }
-    } else {
-        let next = AtomicUsize::new(0);
-        let results: Vec<Vec<(usize, Result<Vec<u8>>)>> = std::thread::scope(|s| {
-            let handles: Vec<_> = (0..nthreads)
-                .map(|_| {
-                    s.spawn(|| {
-                        let mut v = Vec::new();
-                        let mut work = compression::Work::default();
-                        loop {
-                            let k = next.fetch_add(1, Ordering::Relaxed);
-                            if k >= nchunks {
-                                break;
-                            }
-                            v.push((k, compress_one(k, &mut work)));
-                        }
-                        v
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("encoder worker panicked"))
-                .collect()
-        });
-        let mut all: Vec<(usize, Result<Vec<u8>>)> = results.into_iter().flatten().collect();
-        all.sort_by_key(|(k, _)| *k);
-        for (k, r) in all {
-            packed[k] = Some(r?);
-        }
-    }
-
-    // The file's final size is known now: one allocation, instead of the
-    // output doubling (and copying itself) while the chunks are appended.
-    let chunk_head = if tiled { 20 } else { 8 };
-    let body: usize = packed
-        .iter()
-        .map(|d| chunk_head + d.as_ref().map_or(0, Vec::len))
-        .sum();
-    out.reserve_exact(body);
+    // Chunks in file order. Each is appended as soon as it and every chunk
+    // before it are compressed, so the copy into the file overlaps the
+    // compression of later chunks instead of following all of it.
     let order: Vec<usize> = match opts.line_order {
         LineOrder::Decreasing => (0..nchunks).rev().collect(),
         _ => (0..nchunks).collect(),
     };
+    // A stored chunk is never larger than its raw samples, so this bounds
+    // the file: one reservation, no doubling (pages are only touched as
+    // they are written).
+    let chunk_head = if tiled { 20 } else { 8 };
+    let raw_total: usize = channels
+        .iter()
+        .map(|c| c.width * c.height * c.desc.sample_type.bytes())
+        .sum();
+    out.reserve_exact(raw_total + nchunks * chunk_head);
     let mut offsets = vec![0u64; nchunks];
-    for i in order {
-        let data = packed[i].take().expect("every chunk compressed");
+    let mut emit = |out: &mut Vec<u8>, i: usize, data: &[u8]| {
         offsets[i] = out.len() as u64;
         if tiled {
             for v in [(i % ntx) as i32, (i / ntx) as i32, 0, 0] {
@@ -488,7 +454,66 @@ fn encode_channels(
             out.extend_from_slice(&y0.to_le_bytes());
         }
         out.extend_from_slice(&(data.len() as i32).to_le_bytes());
-        out.extend_from_slice(&data);
+        out.extend_from_slice(data);
+    };
+    // The error reported is the one of the lowest-numbered failing chunk,
+    // whatever the thread count or line order.
+    let mut first_err: Option<(usize, Error)> = None;
+    let mut note = |i: usize, e: Error| {
+        if first_err.as_ref().is_none_or(|(k, _)| i < *k) {
+            first_err = Some((i, e));
+        }
+    };
+    if nthreads == 1 {
+        let mut work = compression::Work::default();
+        for &i in &order {
+            match compress_one(i, &mut work) {
+                Ok(d) => emit(&mut out, i, &d),
+                Err(e) => note(i, e),
+            }
+        }
+    } else {
+        let next = AtomicUsize::new(0);
+        let order = &order;
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<Vec<u8>>)>();
+        std::thread::scope(|s| {
+            for _ in 0..nthreads {
+                let tx = tx.clone();
+                let next = &next;
+                let compress_one = &compress_one;
+                s.spawn(move || {
+                    let mut work = compression::Work::default();
+                    loop {
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+                        if k >= nchunks {
+                            break;
+                        }
+                        let r = compress_one(order[k], &mut work);
+                        if tx.send((k, r)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(tx);
+            // This thread writes: chunk `k` of the file order goes out once
+            // chunks 0..k have.
+            let mut pending: Vec<Option<Vec<u8>>> = vec![None; nchunks];
+            let mut want = 0usize;
+            for (k, r) in rx {
+                match r {
+                    Ok(d) => pending[k] = Some(d),
+                    Err(e) => note(order[k], e),
+                }
+                while let Some(d) = pending.get_mut(want).and_then(Option::take) {
+                    emit(&mut out, order[want], &d);
+                    want += 1;
+                }
+            }
+        });
+    }
+    if let Some((_, e)) = first_err {
+        return Err(e);
     }
     for (i, o) in offsets.iter().enumerate() {
         out[table_pos + i * 8..table_pos + i * 8 + 8].copy_from_slice(&o.to_le_bytes());
