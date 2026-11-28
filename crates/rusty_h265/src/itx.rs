@@ -238,7 +238,16 @@ pub fn inverse_transform(d: &mut [i32], tmp: &mut [i32], n: usize, nz_w: usize, 
     let bd_shift = 20 - bit_depth as u32;
     match kind {
         TransformKind::Bypass => {}
-        TransformKind::Skip => rusty_h265_accel::pixel::transform_skip(d, n, bd_shift),
+        TransformKind::Skip if n == 4 => rusty_h265_accel::pixel::transform_skip(d, n, bd_shift),
+        // Larger transform-skip blocks (`log2_max_transform_skip_block_size`,
+        // RExt): `tsShift = 5 + Log2(nTbS)` (§8.6.4.2) instead of the 4x4's 7.
+        TransformKind::Skip => {
+            let ts = 5 + n.trailing_zeros();
+            let add = 1i64 << (bd_shift - 1);
+            for v in d[..n * n].iter_mut() {
+                *v = ((((*v as i64) << ts) + add) >> bd_shift) as i32;
+            }
+        }
         // A DC-only DCT block is one number, not a transform.
         //
         // Row 0 of the DCT matrix is the constant 64, so with a single non-zero

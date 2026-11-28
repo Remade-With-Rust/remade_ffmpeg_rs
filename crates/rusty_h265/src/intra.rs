@@ -16,6 +16,32 @@ fn use_kernels() -> bool {
     !*F.get_or_init(|| std::env::var_os("RH265_SCALAR_INTRA").is_some())
 }
 
+/// Which intra filters apply to a block (§8.4.4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PredFilters {
+    /// §8.4.4.2.3 reference smoothing: luma, and chroma in 4:4:4; off under
+    /// `intra_smoothing_disabled_flag` (RExt).
+    pub smooth: bool,
+    /// The 32x32 bilinear form of it (`strong_intra_smoothing_enabled_flag`,
+    /// luma only).
+    pub strong: bool,
+    /// The DC / horizontal / vertical boundary smoothing (luma only).
+    pub edge: bool,
+}
+
+impl PredFilters {
+    /// Version 1 luma: smoothing and boundary filters, `strong` as signalled.
+    pub const fn luma(strong: bool) -> Self {
+        PredFilters { smooth: true, strong, edge: true }
+    }
+    /// Version 1 (4:2:0) chroma: none of them.
+    pub const CHROMA: Self = PredFilters {
+        smooth: false,
+        strong: false,
+        edge: false,
+    };
+}
+
 pub const MODE_PLANAR: u8 = 0;
 pub const MODE_DC: u8 = 1;
 pub const MODE_HOR: u8 = 10;
@@ -245,8 +271,18 @@ impl Default for RefSamples {
     }
 }
 
+/// Predicts an N×N block into `out` (row stride `stride`) with the
+/// version-1 filtering: luma (`c_idx == 0`) smoothed and edge-filtered,
+/// chroma neither. See [`predict_filtered`].
+#[allow(clippy::too_many_arguments)]
+pub fn predict(refs: &mut RefSamples, n: usize, mode: u8, c_idx: usize, bit_depth: u8, strong_intra_smoothing: bool, out: &mut [u16], stride: usize, residual_follows: bool) -> Option<u16> {
+    let pf = if c_idx == 0 { PredFilters::luma(strong_intra_smoothing) } else { PredFilters::CHROMA };
+    predict_filtered(refs, n, mode, pf, bit_depth, out, stride, residual_follows)
+}
+
 /// Predicts an N×N block into `out` (row stride `stride`). `refs` must have
-/// been substituted; filtering is applied here for `c_idx == 0`.
+/// been substituted; `pf` says which of the §8.4.4.2 filters apply (4:4:4
+/// chroma is smoothed like luma; the range extensions can turn filters off).
 ///
 /// Returns `Some(dc)` when it declined to write anything because the whole
 /// block is that one value and the caller said a residual follows: the fill and
@@ -254,12 +290,13 @@ impl Default for RefSamples {
 /// pass instead of two. Only offered when the DC predictor really is flat — the
 /// §8.4.4.2.5 edge fix-ups make luma blocks below 32×32 non-constant.
 #[allow(clippy::too_many_arguments)]
-pub fn predict(refs: &mut RefSamples, n: usize, mode: u8, c_idx: usize, bit_depth: u8, strong_intra_smoothing: bool, out: &mut [u16], stride: usize, residual_follows: bool) -> Option<u16> {
-    if c_idx == 0 {
+pub fn predict_filtered(refs: &mut RefSamples, n: usize, mode: u8, pf: PredFilters, bit_depth: u8, out: &mut [u16], stride: usize, residual_follows: bool) -> Option<u16> {
+    let edge_filters = pf.edge;
+    if pf.smooth {
         // Route: §8.4.4.2.3 smoothing depends on mode, size and bit depth —
         // the filter runs on some blocks and not others.
         let before = refs.corner;
-        refs.filter(n, mode, bit_depth, strong_intra_smoothing);
+        refs.filter(n, mode, bit_depth, pf.strong);
         // Compile-time gate: `route` reads a `OnceLock`, and this runs on
         // every luma intra block -- 3.0 M of them on intra-heavy content.
         if accel::census::ALWAYS {
@@ -298,7 +335,7 @@ pub fn predict(refs: &mut RefSamples, n: usize, mode: u8, c_idx: usize, bit_dept
             let dc = sum >> (log2n + 1);
             // Flat only without the edge fix-ups below.
             // Route: fuse the flat DC into the residual add, or fill it.
-            let defer = residual_follows && (c_idx != 0 || n >= 32);
+            let defer = residual_follows && (!edge_filters || n >= 32);
             if accel::census::ALWAYS {
                 accel::census::route(defer, &accel::census::RT_INTRA_DC_DEFERRED, &accel::census::RT_INTRA_DC_FILLED);
             }
@@ -314,7 +351,7 @@ pub fn predict(refs: &mut RefSamples, n: usize, mode: u8, c_idx: usize, bit_dept
                     }
                 }
             }
-            if c_idx == 0 && n < 32 {
+            if edge_filters && n < 32 {
                 out[0] = ((refs.left[0] as i32 + 2 * dc + refs.top[0] as i32 + 2) >> 2) as u16;
                 for x in 1..n {
                     out[x] = ((refs.top[x] as i32 + 3 * dc + 2) >> 2) as u16;
@@ -392,7 +429,7 @@ pub fn predict(refs: &mut RefSamples, n: usize, mode: u8, c_idx: usize, bit_dept
                         }
                     }
                 }
-                if mode == MODE_VER && c_idx == 0 && n < 32 {
+                if mode == MODE_VER && edge_filters && n < 32 {
                     for y in 0..n {
                         let v = top[0] as i32 + ((left[y] as i32 - corner as i32) >> 1);
                         out[y * stride] = v.clamp(0, max) as u16;
@@ -451,7 +488,7 @@ pub fn predict(refs: &mut RefSamples, n: usize, mode: u8, c_idx: usize, bit_dept
                         }
                     }
                 }
-                if mode == MODE_HOR && c_idx == 0 && n < 32 {
+                if mode == MODE_HOR && edge_filters && n < 32 {
                     for x in 0..n {
                         let v = left[0] as i32 + ((top[x] as i32 - corner as i32) >> 1);
                         out[x] = v.clamp(0, max) as u16;
@@ -548,7 +585,7 @@ mod tests {
             r.top[x] = x as u16 * 3;
         }
         let mut out = [0u16; 16];
-        predict(&mut r, 4, MODE_VER, 1, 8, false, &mut out, 4, false);
+        predict_filtered(&mut r, 4, MODE_VER, PredFilters::CHROMA, 8, &mut out, 4, false);
         for y in 0..4 {
             for x in 0..4 {
                 assert_eq!(out[y * 4 + x], x as u16 * 3);

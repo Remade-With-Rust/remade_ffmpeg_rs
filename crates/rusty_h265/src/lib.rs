@@ -1,11 +1,12 @@
 //! **rusty_h265** — a pure-Rust HEVC / H.265 video decoder, no C, no FFI.
 //!
 //! Written from ITU-T H.265 (with the JCT-VC HM reference decoder as the
-//! transcribable source) and gated on the JCT-VC HEVC_v1 conformance suite.
-//! Scope (v1): Main, Main 10 and Main Still Picture — 4:2:0 or 4:0:0
-//! (monochrome), 8 and 10 bit.
-//! Range extensions, screen content coding and layered profiles are parsed
-//! and refused with a named [`Error::Unsupported`].
+//! transcribable source) and gated on the JCT-VC HEVC_v1 and RExt conformance
+//! suites. Scope: Main, Main 10, Main Still Picture and the format range
+//! extensions — 4:0:0, 4:2:0, 4:2:2 and 4:4:4 at 8 to 12 bit, with the
+//! range-extension coding tools. Bit depths above 12, CABAC bypass alignment,
+//! separate colour planes, screen content coding and layered profiles are
+//! parsed and refused with a named [`Error::Unsupported`].
 //!
 //! The push/pull API mirrors FFmpeg's send/receive convention:
 //! [`Error::Again`] means "feed more input", [`Error::Eof`] means "drained".

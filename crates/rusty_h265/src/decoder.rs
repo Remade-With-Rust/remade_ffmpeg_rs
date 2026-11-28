@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::frame::{Frame, Picture};
 use crate::nal::{split_annex_b, unescape, NalHeader, NalType, Rbsp};
 use crate::pic::PicState;
-use crate::ps::{parse_pps, parse_sps, parse_vps, Pps, Sps, TileLayout, Vps, PROFILE_MAIN, PROFILE_MAIN10, PROFILE_MAIN_STILL, PROFILE_REXT};
+use crate::ps::{parse_pps, parse_sps, parse_vps, Pps, Sps, TileLayout, Vps, PROFILE_HIGH_THROUGHPUT, PROFILE_MAIN, PROFILE_MAIN10, PROFILE_MAIN_STILL, PROFILE_REXT};
 use crate::sei::{self, PictureHash};
 use crate::slice::{parse_slice_header, SliceHeader};
 
@@ -893,45 +893,52 @@ impl Decoder {
     }
 }
 
-/// v1 scope: Main / Main 10 / Main Still Picture, 4:2:0 or 4:0:0
-/// (monochrome), ≤ 10 bit, no extensions.
+/// Scope: Main / Main 10 / Main Still Picture and the format range
+/// extensions (`general_profile_idc` 4, and the high-throughput 4:4:4 profile
+/// 5) -- 4:0:0, 4:2:0, 4:2:2 and 4:4:4 at 8 to 12 bits.
 ///
-/// A format-range-extensions profile (`general_profile_idc` 4: Main Intra,
-/// Main 10 Intra, Main 4:4:4 ...) is admitted too, because every RExt coding
-/// tool is switched on by a flag in `sps_range_extension()` /
-/// `pps_range_extension()`: a 4:2:0, ≤ 10-bit stream whose SPS and PPS carry
-/// no extension decodes by exactly the version-1 process. The chroma,
-/// bit-depth and extension checks below still refuse anything that would
-/// need an RExt tool. (HEIF writers label still images "Main Intra" this way.)
+/// Every RExt coding tool is switched on by its own flag in
+/// `sps_range_extension()` / `pps_range_extension()`, so a stream is decided
+/// tool by tool: the ones implemented are admitted and each one that is not
+/// is refused BY NAME, never misdecoded. (A range-extensions stream whose SPS
+/// and PPS carry no extension decodes by the version-1 process plus the
+/// chroma-format rules; HEIF writers label still images "Main Intra" or
+/// "Main 4:2:2 10 Intra" this way.)
 ///
-/// 4:0:0 (`chroma_format_idc` 0) is the version-1 process with every chroma
-/// syntax element and chroma stage removed: `ChromaArrayType` 0 drops
-/// `cbf_cb`/`cbf_cr`, `intra_chroma_pred_mode`, the chroma PCM samples, the
-/// chroma SAO and weighted-prediction syntax, and chroma prediction,
-/// residual and deblocking. Monochrome is a range-extensions *profile*
-/// (Monochrome, Monochrome 10, ...), but it needs no RExt *tool*, so it is
-/// admitted under the same rule; HEIF codes alpha planes this way. 4:2:2
-/// and 4:4:4 stay refused.
+/// 4:0:0 drops every chroma syntax element and stage (`ChromaArrayType` 0).
+/// 4:2:2 and 4:4:4 add the chroma-format rules of §6.2, §7.3.8.8/10 (two
+/// chroma cbfs and blocks per transform unit in 4:2:2, chroma at 4x4 and a
+/// chroma mode per NxN partition in 4:4:4), §8.4.3 (Table 8-3), §8.6.1
+/// (QpC = Min(qPi, 51)), and the chroma deblocking and SAO geometry.
 fn check_scope(sps: &Sps, pps: &Pps) -> Result<()> {
     let prof = sps.ptl.profile();
-    if !matches!(prof, 0 | PROFILE_MAIN | PROFILE_MAIN10 | PROFILE_MAIN_STILL | PROFILE_REXT) {
+    if !matches!(prof, 0 | PROFILE_MAIN | PROFILE_MAIN10 | PROFILE_MAIN_STILL | PROFILE_REXT | PROFILE_HIGH_THROUGHPUT) {
         return Err(Error::unsupported(format!(
-            "general_profile_idc {prof} (only Main / Main 10 / Main Still Picture, or a range-extensions profile using no RExt tool)"
+            "general_profile_idc {prof} (only Main / Main 10 / Main Still Picture and the range-extensions profiles)"
         )));
     }
-    if sps.chroma_format_idc > 1 {
-        return Err(Error::unsupported(format!("chroma_format_idc {} (only 4:2:0 and 4:0:0)", sps.chroma_format_idc)));
+    if sps.separate_colour_plane_flag {
+        return Err(Error::unsupported("separate_colour_plane_flag (4:4:4 coded as three colour planes)"));
     }
     // A monochrome stream still codes `bit_depth_chroma_minus8`, but no
-    // process reads it, so only a stream with chroma is held to it.
-    if sps.bit_depth_luma > 10 || (sps.chroma_format_idc != 0 && sps.bit_depth_chroma > 10) {
-        return Err(Error::unsupported(format!("bit depth {}/{} (max 10)", sps.bit_depth_luma, sps.bit_depth_chroma)));
+    // process reads it, so only a stream with chroma is held to it. Above 12
+    // bits the 16-bit intermediates of §8.5.3.3.3 and §8.6.4 no longer hold
+    // (that is what `extended_precision_processing_flag` is for).
+    if sps.bit_depth_luma > 12 || (sps.chroma_format_idc != 0 && sps.bit_depth_chroma > 12) {
+        return Err(Error::unsupported(format!("bit depth {}/{} (max 12)", sps.bit_depth_luma, sps.bit_depth_chroma)));
     }
-    if sps.range_extension || sps.multilayer_extension || sps.ext_3d || sps.scc_extension {
-        return Err(Error::unsupported("SPS extensions (RExt/SHVC/3D/SCC)"));
+    if sps.multilayer_extension || sps.ext_3d || sps.scc_extension {
+        return Err(Error::unsupported("SPS extensions (SHVC/3D/SCC)"));
     }
-    if pps.range_extension || pps.multilayer_extension || pps.ext_3d || pps.scc_extension {
-        return Err(Error::unsupported("PPS extensions (RExt/SHVC/3D/SCC)"));
+    if pps.multilayer_extension || pps.ext_3d || pps.scc_extension {
+        return Err(Error::unsupported("PPS extensions (SHVC/3D/SCC)"));
+    }
+    if let Some(tool) = unsupported_rext_tool(sps, pps) {
+        return Err(Error::unsupported(format!("range-extension tool {tool}")));
+    }
+    let max_sao_scale = |bd: u8| bd.saturating_sub(10);
+    if pps.log2_sao_offset_scale_luma > max_sao_scale(sps.bit_depth_luma) || pps.log2_sao_offset_scale_chroma > max_sao_scale(sps.bit_depth_chroma) {
+        return Err(Error::invalid("log2_sao_offset_scale_luma/chroma"));
     }
     if pps.sps_id != sps.id {
         return Err(Error::invalid("PPS/SPS id mismatch"));
@@ -941,6 +948,24 @@ fn check_scope(sps: &Sps, pps: &Pps) -> Result<()> {
         return Err(Error::unsupported("picture larger than level 6.2"));
     }
     Ok(())
+}
+
+/// The first range-extension tool the stream switches on that this decoder
+/// does not implement, by its syntax-element name.
+fn unsupported_rext_tool(sps: &Sps, pps: &Pps) -> Option<&'static str> {
+    let r = &sps.rext;
+    // Implemented: transform_skip_rotation / transform_skip_context,
+    // implicit and explicit RDPCM, intra_smoothing_disabled,
+    // high_precision_offsets, persistent_rice_adaptation, larger transform
+    // skip, cross-component prediction, the chroma QP offset lists and the
+    // SAO offset scale. Refused: the two tools for > 12-bit / high-throughput
+    // coding, which FFmpeg does not implement either and no HEIF writer uses.
+    let _ = pps;
+    let refused = [
+        (r.extended_precision_processing, "extended_precision_processing_flag"),
+        (r.cabac_bypass_alignment, "cabac_bypass_alignment_enabled_flag"),
+    ];
+    refused.iter().find(|(on, _)| *on).map(|(_, name)| *name)
 }
 
 /// §8.3.2 (8-5): the five POC lists. Long-term entries carry their
@@ -1084,4 +1109,131 @@ fn build_ref_lists(dpb: &[DpbEntry], sh: &SliceHeader, cur: &CurrentPicture) -> 
         l1 = pick(&temp1, &sh.ref_pic_list_modification_l1, sh.num_ref_idx_l1_active as usize)?;
     }
     Ok(RefLists { l0, l1 })
+}
+
+#[cfg(test)]
+mod rext_scope_tests {
+    use super::*;
+
+    /// An SPS with `sps_range_extension_flag` set and the given extension flags,
+    /// 4:4:4 8-bit 64x64, wrapped as an Annex-B NAL.
+    fn sps_with_rext(flags: [bool; 9]) -> Vec<u8> {
+        struct W {
+            out: Vec<u8>,
+            cur: u8,
+            n: u8,
+        }
+        impl W {
+            fn bit(&mut self, b: bool) {
+                self.cur = (self.cur << 1) | b as u8;
+                self.n += 1;
+                if self.n == 8 {
+                    self.out.push(self.cur);
+                    self.cur = 0;
+                    self.n = 0;
+                }
+            }
+            fn bits(&mut self, v: u32, n: u32) {
+                for i in (0..n).rev() {
+                    self.bit((v >> i) & 1 == 1);
+                }
+            }
+            fn ue(&mut self, v: u32) {
+                let x = v + 1;
+                let len = 32 - x.leading_zeros();
+                self.bits(0, len - 1);
+                self.bits(x, len);
+            }
+        }
+        let mut w = W { out: Vec::new(), cur: 0, n: 0 };
+        w.bits(0, 4); // sps_video_parameter_set_id
+        w.bits(0, 3); // sps_max_sub_layers_minus1
+        w.bit(true); // sps_temporal_id_nesting_flag
+                     // profile_tier_level: general_profile_idc 4 (RExt), compatibility bit 4.
+        w.bits(0, 2);
+        w.bit(false);
+        w.bits(4, 5);
+        w.bits(1 << (31 - 4), 32);
+        w.bits(0, 4); // progressive/interlaced/non-packed/frame-only
+        w.bits(0, 32); // 43 reserved/constraint bits + inbld/reserved
+        w.bits(0, 12);
+        w.bits(120, 8); // general_level_idc
+        w.ue(0); // sps_seq_parameter_set_id
+        w.ue(3); // chroma_format_idc
+        w.bit(false); // separate_colour_plane_flag
+        w.ue(64); // pic_width_in_luma_samples
+        w.ue(64); // pic_height_in_luma_samples
+        w.bit(false); // conformance_window_flag
+        w.ue(0); // bit_depth_luma_minus8
+        w.ue(0); // bit_depth_chroma_minus8
+        w.ue(4); // log2_max_pic_order_cnt_lsb_minus4
+        w.bit(false); // sps_sub_layer_ordering_info_present_flag
+        w.ue(0);
+        w.ue(0);
+        w.ue(0);
+        w.ue(0); // log2_min_luma_coding_block_size_minus3
+        w.ue(1); // log2_diff_max_min_luma_coding_block_size
+        w.ue(0); // log2_min_luma_transform_block_size_minus2
+        w.ue(2); // log2_diff_max_min_luma_transform_block_size
+        w.ue(1); // max_transform_hierarchy_depth_inter
+        w.ue(1); // max_transform_hierarchy_depth_intra
+        w.bit(false); // scaling_list_enabled_flag
+        w.bit(false); // amp_enabled_flag
+        w.bit(false); // sample_adaptive_offset_enabled_flag
+        w.bit(false); // pcm_enabled_flag
+        w.ue(0); // num_short_term_ref_pic_sets
+        w.bit(false); // long_term_ref_pics_present_flag
+        w.bit(false); // sps_temporal_mvp_enabled_flag
+        w.bit(false); // strong_intra_smoothing_enabled_flag
+        w.bit(false); // vui_parameters_present_flag
+        w.bit(true); // sps_extension_present_flag
+        w.bit(true); // sps_range_extension_flag
+        w.bits(0, 7); // multilayer, 3d, scc, 4bits
+        for f in flags {
+            w.bit(f);
+        }
+        w.bit(true); // rbsp_stop_one_bit
+        while w.n != 0 {
+            w.bit(false);
+        }
+        let mut nal = vec![0, 0, 0, 1, 33 << 1, 1];
+        for (i, &b) in w.out.iter().enumerate() {
+            // emulation prevention
+            let l = nal.len();
+            if i > 0 && b <= 3 && nal[l - 1] == 0 && nal[l - 2] == 0 {
+                nal.push(3);
+            }
+            nal.push(b);
+        }
+        nal
+    }
+
+    /// The two range-extension tools this decoder does not implement are refused
+    /// by name when a picture activates the SPS; every other tool is admitted.
+    #[test]
+    fn unimplemented_rext_tools_are_refused_by_name() {
+        for (idx, tool) in [(4usize, "extended_precision_processing_flag"), (8, "cabac_bypass_alignment_enabled_flag")] {
+            let mut flags = [false; 9];
+            flags[idx] = true;
+            let sps = sps_with_rext(flags);
+            // Parses (the flags are read) ...
+            let nal = crate::nal::split_annex_b(&sps)[0];
+            let rbsp = crate::nal::unescape(&nal[2..]);
+            let parsed = crate::ps::parse_sps(&rbsp.data).expect("SPS parses");
+            assert_eq!(parsed.chroma_format_idc, 3);
+            assert!(parsed.range_extension);
+            // ... and the activation check names the tool.
+            let pps = Pps::default();
+            match check_scope(&parsed, &pps) {
+                Err(Error::Unsupported(m)) => assert!(m.contains(tool), "{tool}: {m}"),
+                other => panic!("{tool}: expected a refusal, got {other:?}"),
+            }
+        }
+        // All the implemented tools at once: admitted.
+        let sps = sps_with_rext([true, true, true, true, false, true, true, true, false]);
+        let nal = crate::nal::split_annex_b(&sps)[0];
+        let parsed = crate::ps::parse_sps(&crate::nal::unescape(&nal[2..]).data).expect("SPS parses");
+        assert!(parsed.rext.persistent_rice_adaptation && parsed.rext.transform_skip_rotation);
+        assert!(check_scope(&parsed, &Pps::default()).is_ok());
+    }
 }

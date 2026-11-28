@@ -18,9 +18,9 @@
 //! * **metadata** — the Exif and XMP items, as raw bytes;
 //! * **depth maps and thumbnails** — decoded on request.
 //!
-//! Not covered: encoding, image sequences (`msf1` tracks), overlays
-//! (`iovl`), and HEVC range extensions beyond monochrome (4:2:2, 4:4:4,
-//! 12-bit), which `rusty_h265` refuses by name. Gain maps are reported, not applied.
+//! HEVC items decode in 4:0:0, 4:2:0, 4:2:2 and 4:4:4 at 8 to 12 bits.
+//! Not covered: encoding, image sequences (`msf1` tracks) and overlays
+//! (`iovl`). Gain maps are reported, not applied.
 //!
 //! ```no_run
 //! let data = std::fs::read("photo.heic").unwrap();

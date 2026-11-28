@@ -148,6 +148,12 @@ fn deblock(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps) {
     let bd_y = sps.bit_depth_luma;
     let bd_c = sps.bit_depth_chroma;
     let chroma = sps.chroma_array_type != 0;
+    let cat = sps.chroma_array_type;
+    // Chroma subsampling per axis, and the chroma edge grid in 4x4 luma
+    // units: chroma edges sit every 8 CHROMA samples (§8.7.2), i.e. every
+    // 16 luma samples along a subsampled axis and every 8 along a full one.
+    let (sx, sy) = ((sps.sub_width_c >> 1) as usize, (sps.sub_height_c >> 1) as usize);
+    let (gx, gy) = (2usize << sx, 2usize << sy);
     // The boundary strengths were derived during the parse, by the coding,
     // prediction and transform units that own each edge (`SliceDecoder::
     // bs_edges`). The per-picture scan that re-derived them from the per-4x4
@@ -225,17 +231,33 @@ fn deblock(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps) {
                 let (st_, mx) = (pl.stride, (1i32 << bd_y) - 1);
                 accel::deblock::luma_edge(&mut pl.data, st_, x4 * 4, y4 * 4, dir, beta, tc, no_p, no_q, mx);
 
-                // Chroma: bS == 2 on the chroma 8-grid (the luma 16-grid).
-                // None at all in 4:0:0.
-                let on_chroma_grid = if dir == 0 { x4 % 4 == 0 } else { y4 % 4 == 0 };
+                // Chroma: bS == 2 on the chroma 8-grid. None at all in 4:0:0.
+                //
+                // Each 4-sample luma segment filters the chroma samples it
+                // covers: 4 >> s lines along the edge. §8.7.2.5.2 reads one bS
+                // and one QP per 4 CHROMA lines, which along a subsampled axis
+                // spans two luma segments -- but both always lie in the same
+                // 8x8-aligned pair of coding blocks on each side (coding blocks
+                // are at least 8x8, and a transform edge on the 8-grid that
+                // stops half-way would need a transform block straddling it),
+                // so the two readings agree and per-segment filtering is exact.
+                // `gx`/`gy` are powers of two: a mask, not a runtime `%`.
+                let on_chroma_grid = if dir == 0 { x4 & (gx - 1) == 0 } else { y4 & (gy - 1) == 0 };
                 if b == 2 && on_chroma_grid && chroma {
                     if accel::census::ALWAYS {
                         accel::census::arm(&accel::census::RT_DEBLOCK_CHROMA);
                     }
+                    let lines = if dir == 0 { 4 >> sy } else { 4 >> sx };
                     for c in 1..3usize {
+                        // §8.7.2.5.5: cQpPicOffset is the PPS offset alone,
+                        // and QpC follows ChromaArrayType: Table 8-10 for
+                        // 4:2:0 (which continues as qPi - 6 past 57),
+                        // Min(qPi, 51) otherwise.
                         let off = if c == 1 { pps.cb_qp_offset } else { pps.cr_qp_offset };
                         let qpi = qp + off;
-                        let qpc = if qpi < 0 {
+                        let qpc = if cat != 1 {
+                            qpi.min(51)
+                        } else if qpi < 0 {
                             qpi
                         } else if qpi > 57 {
                             qpi - 6
@@ -244,7 +266,12 @@ fn deblock(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps) {
                         };
                         let qt = (qpc + 2 + ((f.tc_offset_div2 as i32) << 1)).clamp(0, 53);
                         let tc = (TC_TABLE[qt as usize] as i32) << (bd_c - 8);
-                        filter_chroma_edge(&mut planes[c], x4 * 2, y4 * 2, dir, tc, no_p, no_q, bd_c);
+                        let (xc, yc) = ((x4 * 4) >> sx, (y4 * 4) >> sy);
+                        if lines == 2 {
+                            filter_chroma_edge::<2>(&mut planes[c], xc, yc, dir, tc, no_p, no_q, bd_c);
+                        } else {
+                            filter_chroma_edge::<4>(&mut planes[c], xc, yc, dir, tc, no_p, no_q, bd_c);
+                        }
                     }
                 }
                 x4 += xstep;
@@ -254,9 +281,12 @@ fn deblock(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps) {
     }
 }
 
-/// §8.7.2.5.5 / 8.7.2.5.8 for one 2-line chroma edge segment.
+/// §8.7.2.5.5 / 8.7.2.5.8 for one chroma edge segment of `L` lines: 2 for a
+/// subsampled axis along the edge, 4 for a full-resolution one. A constant,
+/// so the 4:2:0 loop stays unrolled.
 #[allow(clippy::too_many_arguments)]
-fn filter_chroma_edge(pl: &mut Plane, x: usize, y: usize, dir: usize, tc: i32, no_p: bool, no_q: bool, bd: u8) {
+fn filter_chroma_edge<const L: usize>(pl: &mut Plane, x: usize, y: usize, dir: usize, tc: i32, no_p: bool, no_q: bool, bd: u8) {
+    let lines = L;
     let stride = pl.stride;
     let max = (1i32 << bd) - 1;
     let origin = y * stride + x;
@@ -286,10 +316,11 @@ fn filter_chroma_edge(pl: &mut Plane, x: usize, y: usize, dir: usize, tc: i32, n
     // it is worth removing when something else pays for it, not on its own.
     if dir == 0 {
         // Vertical edge: a line is four CONTIGUOUS samples at x-2..=x+1, on
-        // rows y and y+1. Window `stride + 4` long, index `k * stride + j`.
+        // rows y..y+lines. Window `(lines-1) * stride + 4` long, index
+        // `k * stride + j`.
         let lo = origin - 2;
-        let w = &mut pl.data[lo..lo + stride + 4];
-        for k in 0..2 {
+        let w = &mut pl.data[lo..lo + (lines - 1) * stride + 4];
+        for k in 0..lines {
             let b = k * stride;
             let (p1, p0, q0, q1) = (w[b] as i32, w[b + 1] as i32, w[b + 2] as i32, w[b + 3] as i32);
             let d = line(p1, p0, q0, q1, tc);
@@ -304,8 +335,8 @@ fn filter_chroma_edge(pl: &mut Plane, x: usize, y: usize, dir: usize, tc: i32, n
         // Horizontal edge: a line is a COLUMN, rows y-2..=y+1 at columns x and
         // x+1. Window `3 * stride + 2` long, index `i * stride + k`.
         let lo = origin - 2 * stride;
-        let w = &mut pl.data[lo..lo + 3 * stride + 2];
-        for k in 0..2 {
+        let w = &mut pl.data[lo..lo + 3 * stride + lines];
+        for k in 0..lines {
             let (p1, p0, q0, q1) = (w[k] as i32, w[stride + k] as i32, w[2 * stride + k] as i32, w[3 * stride + k] as i32);
             let d = line(p1, p0, q0, q1, tc);
             if !no_p {
@@ -354,7 +385,8 @@ fn sao(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps, scratch: &m
     let use_kernel = !has_bypass && !scalar_sao();
     let ctb = 1usize << st.log2_ctb;
     for c in 0..3usize {
-        let ss = if c == 0 { 0 } else { 1 };
+        // Subsampling per axis: (1, 1) 4:2:0, (1, 0) 4:2:2, (0, 0) 4:4:4.
+        let (sx, sy) = if c == 0 { (0, 0) } else { ((sps.sub_width_c >> 1) as usize, (sps.sub_height_c >> 1) as usize) };
         let bd = if c == 0 { sps.bit_depth_luma } else { sps.bit_depth_chroma };
         let max = (1i32 << bd) - 1;
         let (pw, ph, pstride) = {
@@ -424,7 +456,7 @@ fn sao(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps, scratch: &m
             // union is the full width. Fewer, longer copies. When every
             // block-row is fully active this degenerates to exactly the
             // whole-plane copy it replaced, so it is never worse.
-            let bs = ctb >> ss;
+            let (bsx, bsy) = (ctb >> sx, ctb >> sy);
             for ry in 0..st.ctb_h {
                 let (mut lo, mut hi) = (usize::MAX, 0usize);
                 for rx in 0..st.ctb_w {
@@ -432,14 +464,14 @@ fn sao(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps, scratch: &m
                     if st.slice_addr[rs] < 0 || st.sao[rs][c].type_idx == 0 {
                         continue;
                     }
-                    lo = lo.min((rx * bs).saturating_sub(1));
-                    hi = hi.max((rx * bs + bs + 1).min(pw));
+                    lo = lo.min((rx * bsx).saturating_sub(1));
+                    hi = hi.max((rx * bsx + bsx + 1).min(pw));
                 }
                 if lo == usize::MAX {
                     continue; // no SAO anywhere on this block-row
                 }
-                let y0 = (ry * bs).saturating_sub(1);
-                let y1 = (ry * bs + bs + 1).min(ph);
+                let y0 = (ry * bsy).saturating_sub(1);
+                let y1 = (ry * bsy + bsy + 1).min(ph);
                 if lo == 0 && hi == pw && pstride == pw {
                     // The span is whole rows and the rows are contiguous: one
                     // copy for the entire band.
@@ -460,7 +492,7 @@ fn sao(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps, scratch: &m
         }
         let src = &scratch[..];
         let dst = &mut planes[c];
-        let cs = ctb >> ss;
+        let (csx, csy) = (ctb >> sx, ctb >> sy);
         for ry in 0..st.ctb_h {
             for rx in 0..st.ctb_w {
                 let rs = ry * st.ctb_w + rx;
@@ -485,10 +517,10 @@ fn sao(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps, scratch: &m
                 if prm.type_idx == 0 {
                     continue;
                 }
-                let x0 = rx * cs;
-                let y0 = ry * cs;
-                let x1 = (x0 + cs).min(pw);
-                let y1 = (y0 + cs).min(ph);
+                let x0 = rx * csx;
+                let y0 = ry * csy;
+                let x1 = (x0 + csx).min(pw);
+                let y1 = (y0 + csy).min(ph);
                 let fq = &st.ctb_filter[rs];
 
                 if prm.type_idx == 1 {
@@ -508,7 +540,7 @@ fn sao(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps, scratch: &m
                     }
                     for y in y0..y1 {
                         for x in x0..x1 {
-                            if has_bypass && st.cell[st.idx4(x << ss, y << ss)].filter_bypass != 0 {
+                            if has_bypass && st.cell[st.idx4(x << sx, y << sy)].filter_bypass != 0 {
                                 continue;
                             }
                             let v = src[y * pstride + x] as i32;
@@ -542,7 +574,7 @@ fn sao(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps, scratch: &m
                 // picture boundary is a separate rule (no offset at all) and
                 // is applied by the `inside` test or by trimming the rectangle.
                 let lfs = fq.lf_across_slices;
-                let (xl, yl) = (x0 << ss, y0 << ss);
+                let (xl, yl) = (x0 << sx, y0 << sy);
                 let mut usable = [true; 9];
                 let mut all_usable = true;
                 for dy in -1i32..=1 {
@@ -620,7 +652,7 @@ fn sao(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps, scratch: &m
                         let arow = (y as i32 + da.1) as usize * pstride;
                         let brow = (y as i32 + db.1) as usize * pstride;
                         for x in ix0..ix1 {
-                            if has_bypass && st.cell[st.idx4(x << ss, y << ss)].filter_bypass != 0 {
+                            if has_bypass && st.cell[st.idx4(x << sx, y << sy)].filter_bypass != 0 {
                                 continue;
                             }
                             let v = src[row + x] as i32;
@@ -644,7 +676,7 @@ fn sao(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps, scratch: &m
                             x = ix1;
                             continue;
                         }
-                        if !(has_bypass && st.cell[st.idx4(x << ss, y << ss)].filter_bypass != 0) {
+                        if !(has_bypass && st.cell[st.idx4(x << sx, y << sy)].filter_bypass != 0) {
                             let (ax, ay) = (x as i32 + da.0, y as i32 + da.1);
                             let (bx, by) = (x as i32 + db.0, y as i32 + db.1);
                             let inside = ax >= 0 && ay >= 0 && bx >= 0 && by >= 0 && ax < pw as i32 && ay < ph as i32 && bx < pw as i32 && by < ph as i32;

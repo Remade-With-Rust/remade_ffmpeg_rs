@@ -320,6 +320,29 @@ pub static CHROMA_QP_420: [u8; 58] = [
     45, 46, 47, 48, 49, 50, 51,
 ];
 
+/// `QpC` from `qPi` (§8.6.1): Table 8-10 for ChromaArrayType 1, otherwise
+/// `Min(qPi, 51)`. `qpi` is already clipped to `-QpBdOffsetC..=57`.
+#[inline]
+pub fn chroma_qp(qpi: i32, chroma_array_type: u8) -> i32 {
+    if qpi < 0 {
+        qpi
+    } else if chroma_array_type == 1 {
+        CHROMA_QP_420[qpi as usize] as i32
+    } else {
+        qpi.min(51)
+    }
+}
+
+/// Table 8-3: the 4:2:2 chroma intra mode for each derived mode 0..=34.
+///
+/// The corrected table (H.265 v3 onwards, HM 16, FFmpeg): modes 11 and 14
+/// map to 12 and 17. The 2014 edition printed 11 and 16 there, which breaks
+/// the table's own symmetry about mode 10 (9 -> 8 but 11 -> 11); streams
+/// decode bit-exact against FFmpeg only with the corrected values.
+pub static INTRA_MODE_422: [u8; 35] = [
+    0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31,
+];
+
 /// `levelScale[qP % 6]` (§8.6.3).
 pub static LEVEL_SCALE: [i32; 6] = [40, 45, 51, 57, 64, 72];
 

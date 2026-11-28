@@ -145,10 +145,42 @@ pub struct SliceDecoder<'a> {
     part_mode: PartMode,
     intra_split: bool,
     max_trafo_depth: u8,
-    intra_chroma_mode: u8,
+    /// `IntraPredModeC` per prediction block (z order). One value for the
+    /// whole coding unit except 4:4:4 NxN, which codes four; already mapped
+    /// through Table 8-3 in 4:2:2.
+    intra_chroma_modes: [u8; 4],
+    /// Whether each prediction block coded `intra_chroma_pred_mode` 4 (DM),
+    /// which gates cross-component prediction.
+    intra_chroma_dm: [bool; 4],
+    /// `cross_component_prediction_enabled_flag` in a 4:4:4 picture.
+    pub(super) ccp_active: bool,
+    /// `ResScaleVal` of Cb and Cr for the current transform unit.
+    pub(super) res_scale: [i32; 2],
+    /// The current transform unit's luma residual, kept for cross-component
+    /// prediction (allocated only when it is enabled).
+    pub(super) res_y: Vec<i32>,
     /// `ChromaArrayType != 0`: false for a 4:0:0 stream, which codes no
     /// chroma syntax and has no chroma planes to write.
     chroma: bool,
+    /// `ChromaArrayType` (0, 1, 2 or 3).
+    cat: u8,
+    /// log2 of `SubWidthC` / `SubHeightC`: (1, 1) for 4:2:0, (1, 0) for
+    /// 4:2:2, (0, 0) for 4:4:4.
+    ssx: usize,
+    ssy: usize,
+    /// Subsampling and intra filters for luma and chroma blocks, fixed for
+    /// the slice.
+    pub(super) intra_comp: [IntraComp; 2],
+    /// The slice needs the range-extension intra rules
+    /// (`SliceDecoder::intra_predict_any`).
+    pub(super) intra_range: bool,
+    /// Any range-extension residual tool on (`SliceDecoder::rext_residual_tools`).
+    pub(super) rext_residual: bool,
+    /// `cu_chroma_qp_offset_enabled_flag` of the slice (RExt).
+    cu_chroma_qp_offset_enabled: bool,
+    is_cu_chroma_qp_offset_coded: bool,
+    /// `CuQpOffsetCb` / `CuQpOffsetCr`.
+    cu_qp_offset_c: [i32; 2],
     coeffs: Vec<i32>,
     /// Stage-1 scratch for the inverse transform, reused across blocks.
     itx_tmp: Vec<i32>,
@@ -167,6 +199,15 @@ pub struct SliceDecoder<'a> {
     pub(crate) iref: crate::intra::RefSamples,
     /// Reciprocal of `ctb_w`, so the CTB loop needs no hardware divide.
     ctb_div: CtbDiv,
+}
+
+/// A component's geometry and intra filters for `intra_predict`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IntraComp {
+    /// log2 of `SubWidthC` / `SubHeightC` (0 for luma).
+    pub sx: usize,
+    pub sy: usize,
+    pub pf: crate::intra::PredFilters,
 }
 
 /// Which pixel stages to skip. Parsing is never ablated — HEVC's entropy
@@ -367,8 +408,46 @@ impl<'a> SliceDecoder<'a> {
             part_mode: PartMode::Part2Nx2N,
             intra_split: false,
             max_trafo_depth: 0,
-            intra_chroma_mode: 0,
+            intra_chroma_modes: [0; 4],
+            intra_chroma_dm: [false; 4],
+            ccp_active: inp.pps.cross_component_prediction_enabled && inp.sps.chroma_array_type == 3,
+            res_scale: [0; 2],
+            res_y: if inp.pps.cross_component_prediction_enabled { vec![0; 32 * 32] } else { Vec::new() },
             chroma: inp.sps.chroma_array_type != 0,
+            cat: inp.sps.chroma_array_type,
+            ssx: (inp.sps.sub_width_c >> 1) as usize,
+            ssy: (inp.sps.sub_height_c >> 1) as usize,
+            intra_comp: {
+                use crate::intra::PredFilters;
+                let sps = inp.sps;
+                let smooth = !sps.rext.intra_smoothing_disabled;
+                [
+                    IntraComp {
+                        sx: 0,
+                        sy: 0,
+                        pf: PredFilters {
+                            smooth,
+                            ..PredFilters::luma(sps.strong_intra_smoothing_enabled)
+                        },
+                    },
+                    IntraComp {
+                        sx: (sps.sub_width_c >> 1) as usize,
+                        sy: (sps.sub_height_c >> 1) as usize,
+                        pf: PredFilters {
+                            smooth: smooth && sps.chroma_array_type == 3,
+                            ..PredFilters::CHROMA
+                        },
+                    },
+                ]
+            },
+            intra_range: inp.sps.chroma_array_type >= 2 || inp.sps.rext.intra_smoothing_disabled || inp.sps.rext.implicit_rdpcm,
+            rext_residual: {
+                let r = &inp.sps.rext;
+                r.implicit_rdpcm || r.explicit_rdpcm || r.transform_skip_context || r.transform_skip_rotation || r.persistent_rice_adaptation
+            },
+            cu_chroma_qp_offset_enabled: sh.cu_chroma_qp_offset_enabled,
+            is_cu_chroma_qp_offset_coded: false,
+            cu_qp_offset_c: [0; 2],
             coeffs: vec![0; 32 * 32],
             itx_tmp: vec![0; 32 * 32],
             dbg_cu: std::env::var_os("RH265_DBG_CU").is_some(),
@@ -568,7 +647,11 @@ impl<'a> SliceDecoder<'a> {
             for a in abs.iter_mut() {
                 *a = self.cab.bypass_ones(cmax) as i32;
             }
-            let shift = bit_depth - bit_depth.min(10);
+            // `SaoOffsetVal = offset << log2OffsetScale` (§7.4.9.3.2): the
+            // PPS range extension's `log2_sao_offset_scale_luma/chroma`, 0
+            // when absent. (Version 1 wrote `BitDepth - Min(BitDepth, 10)`,
+            // which no version-1 profile could make non-zero.)
+            let shift = if c == 0 { self.pps.log2_sao_offset_scale_luma } else { self.pps.log2_sao_offset_scale_chroma };
             if type_idx == 1 {
                 for a in abs.iter_mut() {
                     if *a != 0 && self.cab.bypass() == 1 {
@@ -635,6 +718,11 @@ impl<'a> SliceDecoder<'a> {
                 _ => qp_prev,
             };
             self.qp_y_pred = (qp_a + qp_b + 1) >> 1;
+        }
+        // §7.3.8.4: the chroma QP offset group is every node of at least
+        // `Log2MinCuChromaQpOffsetSize` (RExt).
+        if self.cu_chroma_qp_offset_enabled && log2cb >= self.sps.log2_ctb_size as usize - self.pps.diff_cu_chroma_qp_offset_depth as usize {
+            self.is_cu_chroma_qp_offset_coded = false;
         }
         if split {
             let half = size / 2;
@@ -796,7 +884,7 @@ impl<'a> SliceDecoder<'a> {
                 } else {
                     self.sps.max_transform_hierarchy_depth_inter
                 };
-                self.transform_tree(x0, y0, x0, y0, log2cb, 0, 0, true, true)?;
+                self.transform_tree(x0, y0, x0, y0, log2cb, 0, 0, 0, 0)?;
             }
         }
         // The coding block boundary, after every prediction and transform
@@ -897,24 +985,58 @@ impl<'a> SliceDecoder<'a> {
         // The NxN split's internal prediction block edges coincide with its
         // transform block edges (an intra NxN coding unit always splits its
         // transform tree), so the transform units derive them; nothing to do.
-        // intra_chroma_pred_mode (once for 4:2:0; absent in 4:0:0)
+        // intra_chroma_pred_mode: once per coding unit, except four times
+        // for a 4:4:4 NxN unit (one per prediction block); absent in 4:0:0.
         if !self.chroma {
             return Ok(());
         }
-        let icpm = if self.cab.decode(CTX_INTRA_CHROMA_PRED_MODE) == 0 { 4 } else { self.cab.bypass_bits(2) as u8 };
-        let luma0 = self.st.cell[self.st.idx4(x0, y0)].intra_mode;
-        self.intra_chroma_mode = match icpm {
-            4 => luma0,
-            _ => {
-                let m = [0u8, 26, 10, 1][icpm as usize];
-                if m == luma0 {
-                    34
-                } else {
-                    m
+        let nc = if self.cat == 3 && parts == 4 { 4 } else { 1 };
+        for j in 0..nc {
+            let icpm = if self.cab.decode(CTX_INTRA_CHROMA_PRED_MODE) == 0 { 4 } else { self.cab.bypass_bits(2) as u8 };
+            let (xp, yp) = (x0 + (j & 1) * pb, y0 + (j >> 1) * pb);
+            let luma = self.st.cell[self.st.idx4(xp, yp)].intra_mode;
+            let mut m = match icpm {
+                4 => luma,
+                _ => {
+                    let m = [0u8, 26, 10, 1][icpm as usize];
+                    if m == luma {
+                        34
+                    } else {
+                        m
+                    }
                 }
+            };
+            // §8.4.3: 4:2:2 maps the mode through Table 8-3 so the angle
+            // suits the half-width chroma grid.
+            if self.cat == 2 {
+                m = crate::tables::INTRA_MODE_422[m as usize];
             }
-        };
+            self.intra_chroma_modes[j] = m;
+            self.intra_chroma_dm[j] = icpm == 4;
+        }
+        if nc == 1 {
+            self.intra_chroma_modes = [self.intra_chroma_modes[0]; 4];
+            self.intra_chroma_dm = [self.intra_chroma_dm[0]; 4];
+        }
         Ok(())
+    }
+
+    /// Whether the prediction block holding luma (x, y) coded chroma mode DM.
+    pub(super) fn intra_chroma_dm_at(&self, x: usize, y: usize) -> bool {
+        if !self.intra_split {
+            return self.intra_chroma_dm[0];
+        }
+        let h = self.cu_size >> 1;
+        self.intra_chroma_dm[(((y - self.cu_y) >= h) as usize) << 1 | ((x - self.cu_x) >= h) as usize]
+    }
+
+    /// `IntraPredModeC` of the prediction block holding luma (x, y).
+    pub(super) fn intra_chroma_mode_at(&self, x: usize, y: usize) -> u8 {
+        if !self.intra_split {
+            return self.intra_chroma_modes[0];
+        }
+        let h = self.cu_size >> 1;
+        self.intra_chroma_modes[(((y - self.cu_y) >= h) as usize) << 1 | ((x - self.cu_x) >= h) as usize]
     }
 
     fn mpm_candidates(&self, xp: usize, yp: usize) -> [u8; 3] {
@@ -981,12 +1103,13 @@ impl<'a> SliceDecoder<'a> {
         }
         // No chroma samples when ChromaArrayType is 0.
         let ncomp = if self.chroma { 3 } else { 1 };
+        let (sx, sy) = (self.ssx, self.ssy);
         for c in 1..ncomp {
             let pl = &mut self.pic.planes[c];
-            for y in 0..n / 2 {
-                for x in 0..n / 2 {
+            for y in 0..n >> sy {
+                for x in 0..n >> sx {
                     let v = br.read_bits(sps.pcm_bit_depth_chroma as u32)?;
-                    pl.set(x0 / 2 + x, y0 / 2 + y, (v << shift_c) as u16);
+                    pl.set((x0 >> sx) + x, (y0 >> sy) + y, (v << shift_c) as u16);
                 }
             }
         }

@@ -10,13 +10,19 @@ ITU-T H.265 with the JCT-VC HM reference decoder (BSD-3) as the transcribable
 source, and gated on the **JCT-VC HEVC_v1 conformance suite** (147 streams,
 published YUV md5 + the decoded-picture-hash SEI of every picture).
 
-Scope (v1): **Main, Main 10 and Main Still Picture** — 4:2:0 or 4:0:0
-(monochrome), 8 and 10 bit,
+Scope: **Main, Main 10, Main Still Picture and the format range
+extensions** — 4:0:0, 4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 bit — with
 every version-1 tool: CABAC, all intra modes, merge/AMVP/TMVP, weighted
 prediction, PCM, lossless, transform skip, scaling lists, sign data hiding,
 deblocking, SAO, slices, dependent slice segments, tiles and wavefront
-parallel processing. Range extensions, screen content coding and the
-layered profiles are parsed and refused with a named `Error::Unsupported`.
+parallel processing; and the range-extension tools: transform-skip rotation
+and context, implicit/explicit RDPCM, cross-component prediction, persistent
+Rice adaptation, large transform skip, chroma QP offset lists,
+high-precision offsets, intra smoothing disabled and the SAO offset scale.
+Gated on the JCT-VC RExt conformance streams as well. Bit depths above 12
+(`extended_precision_processing_flag`), `cabac_bypass_alignment_enabled_flag`,
+separate colour planes, screen content coding and the layered profiles are
+refused with a named `Error::Unsupported`.
 
 ## Decoding
 
