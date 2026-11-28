@@ -48,6 +48,9 @@ fn main() {
                             print!(" {best:.3} ms");
                         }
                         println!();
+                        for c in &j.concealed {
+                            println!("  concealed: {c}");
+                        }
                         if let Some(prefix) = &raw {
                             for (i, c) in j.components.iter().enumerate() {
                                 let b: Vec<u8> =

@@ -54,8 +54,24 @@ Malformed input returns `JpxError`; it does not panic. Allocations and work
 are bounded by `Limits` (output samples, components, and the number of
 resolutions, precincts and code-blocks). A truncated file is
 `JpxError::Truncated` unless everything the image needs is present (a missing
-EOC marker alone is accepted). With `allow_truncated` the image decoded so far
-comes back with `Jpx::truncated` set.
+EOC marker alone is accepted).
+
+`allow_truncated` decodes damaged files the way OpenJPEG does with strict mode
+off: packets and code-block data past the damage decode as zero coefficients,
+a tile-part whose header is damaged is skipped (reading goes on at the next
+SOT marker), and missing tiles decode as zero coefficients. Nothing is
+concealed silently: every such step is listed in `Jpx::concealed` (tile and
+kind, printable), and `Jpx::truncated` is set exactly when that list is not
+empty. A file that decodes without the option decodes to the same image with
+it, with nothing concealed.
+
+```rust
+let options = rusty_jpx::DecodeOptions::new().with_allow_truncated(true);
+let image = rusty_jpx::decode_jpx_with(&file, &options)?;
+for c in &image.concealed {
+    eprintln!("concealed: {c}"); // e.g. "tile 3: packets missing from here on (the data ends), zero coefficients"
+}
+```
 
 One bound to know about: a code-block's bit-planes may be signalled in a few
 bits, so a small hostile file can ask for up to about 90 passes over every
@@ -86,7 +102,11 @@ order and OpenJPEG does not decode its own file. 1 asks for a precinct size
 the standard does not allow.
 
 On OpenJPEG's non-regression corpus (the decodable part), differences
-are limited to files that break the standard; damaged files give errors.
+are limited to files that break the standard; damaged files give errors
+(or, with `allow_truncated`, what they still hold). A writer that signals more
+coding passes for a code-block than its bit-planes allow (`kodak_2layers_lrcp`,
+`issue135`) is read as OpenJPEG reads it, a length field per 109 passes, and
+decodes within 1 of OpenJPEG.
 
 ## Speed against OpenJPEG 2.5.4
 

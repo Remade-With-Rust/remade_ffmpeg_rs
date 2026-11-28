@@ -68,9 +68,14 @@ pub struct DecodeOptions {
     /// Resolutions to discard: each halves width and height. Must not exceed
     /// any tile-component's decomposition levels ([`Info::max_reduce`]).
     pub reduce: u8,
-    /// Return what could be decoded of incomplete or damaged packet data
-    /// (with [`Jpx::truncated`] set) instead of an error. Tiles that are
-    /// missing altogether are zero.
+    /// Return what could be decoded of incomplete or damaged data instead of
+    /// an error, as OpenJPEG does with strict mode off: packets and
+    /// code-block data past the damage decode as zero coefficients, a
+    /// tile-part whose header is damaged is skipped, and tiles that are
+    /// missing altogether decode as zero coefficients too. Every such concealment is listed in
+    /// [`Jpx::concealed`] (and sets [`Jpx::truncated`]). A file that decodes
+    /// without this option decodes to the same image with it, with nothing
+    /// concealed.
     pub allow_truncated: bool,
     /// Expand a palette (`pclr`/`cmap` boxes) into its channels. Default on.
     pub apply_palette: bool,
@@ -234,8 +239,13 @@ pub struct Jpx {
     /// Whether a channel holds opacity: see [`Jpx::alpha`].
     pub has_alpha: bool,
     /// Packet data was incomplete or damaged (only with
-    /// [`DecodeOptions::allow_truncated`]).
+    /// [`DecodeOptions::allow_truncated`]): exactly when
+    /// [`Jpx::concealed`] is not empty.
     pub truncated: bool,
+    /// What a lenient decode ([`DecodeOptions::allow_truncated`]) found
+    /// missing or damaged and decoded around, one entry per tile and kind,
+    /// in the order found. Empty when the codestream was read whole.
+    pub concealed: Vec<Concealment>,
     /// Image origin on the (reduced) reference grid.
     x0: u32,
     y0: u32,
@@ -289,6 +299,59 @@ impl Jpx {
             out.extend(columns.iter().map(|&x| row[x]));
         }
         Some(std::borrow::Cow::Owned(out))
+    }
+}
+
+/// Damage that a lenient decode ([`DecodeOptions::allow_truncated`]) decoded
+/// around instead of failing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Concealment {
+    /// The tile, when the damage belongs to one.
+    pub tile: Option<u32>,
+    /// What was concealed.
+    pub kind: ConcealmentKind,
+}
+
+/// What a lenient decode concealed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConcealmentKind {
+    /// The tile has no tile-part: it decodes as zero coefficients (the DC
+    /// level: mid-grey for unsigned samples).
+    TileMissing,
+    /// A tile-part header could not be read (the reason): that tile-part was
+    /// skipped, and reading went on at the next SOT marker.
+    TilePartSkipped(&'static str),
+    /// The tile's packets stop early (the reason: the data ends, or a packet
+    /// header is malformed). Code-blocks keep the coding passes read before
+    /// that point; the rest decode as zero coefficients.
+    PacketsMissing(&'static str),
+    /// Some code-block data was cut short by the end of the tile's data and
+    /// decoded as far as it goes.
+    CodeBlocksCut,
+    /// The tile's own marker segments are malformed (the reason): it
+    /// decodes as zero coefficients.
+    TileUnreadable(&'static str),
+}
+
+impl std::fmt::Display for Concealment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.tile {
+            Some(t) => write!(f, "tile {t}: ")?,
+            None => f.write_str("codestream: ")?,
+        }
+        match self.kind {
+            ConcealmentKind::TileMissing => f.write_str("missing, zero coefficients"),
+            ConcealmentKind::TilePartSkipped(why) => write!(f, "tile-part skipped ({why})"),
+            ConcealmentKind::PacketsMissing(why) => {
+                write!(f, "packets missing from here on ({why}), zero coefficients")
+            }
+            ConcealmentKind::CodeBlocksCut => f.write_str("code-block data cut short"),
+            ConcealmentKind::TileUnreadable(why) => {
+                write!(f, "unreadable ({why}), zero coefficients")
+            }
+        }
     }
 }
 
@@ -429,7 +492,8 @@ pub fn decode_jpx_with(data: &[u8], options: &DecodeOptions) -> JpxResult<Jpx> {
         color: first_color(&container),
         icc: container.icc.map(<[u8]>::to_vec),
         has_alpha,
-        truncated: decoded.truncated,
+        truncated: !decoded.concealed.is_empty(),
+        concealed: decoded.concealed,
         x0: grid[0],
         y0: grid[1],
     })
