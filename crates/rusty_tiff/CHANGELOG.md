@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_tiff-v0.1.10...rusty_tiff-v0.1.11) - 2026-11-28
+
+### Other
+
+- *(jpeg)* move to rusty_jpeg 0.5 (same pixels on every CPU) ([#255](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/255))
+
 ## [0.1.10](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_tiff-v0.1.9...rusty_tiff-v0.1.10) - 2026-11-28
 
 ### Other

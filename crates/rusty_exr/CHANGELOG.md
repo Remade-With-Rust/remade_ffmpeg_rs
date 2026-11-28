@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_exr-v0.2.2...rusty_exr-v0.2.3) - 2026-11-28
+
+### Added
+
+- *(exr)* decode into caller buffers, encode from borrowed planes; at or ahead of exr 1.74.2 on Effect's paths ([#254](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/254))
+
 ## [0.2.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_exr-v0.2.1...rusty_exr-v0.2.2) - 2026-11-28
 
 ### Other
