@@ -415,6 +415,19 @@ pub(crate) struct Codestream {
     pub tiles: Vec<Option<TileParts>>,
     /// There is an EOC marker where the last tile-part ends.
     pub ended: bool,
+    /// Tile-parts a lenient parse skipped: (tile when known, why).
+    pub skipped: Vec<(Option<u32>, &'static str)>,
+}
+
+/// Where a lenient parse picks the tile-parts up again after a damaged one:
+/// the next SOT marker segment (`FF 90 00 0A`), which packet data cannot
+/// contain (a byte after `FF` there is below `0x90`).
+fn resync(cs: &[u8], from: usize) -> Option<usize> {
+    let start = from.min(cs.len());
+    cs[start..]
+        .windows(4)
+        .position(|w| w == [0xFF, 0x90, 0x00, 0x0A])
+        .map(|i| start + i)
 }
 
 /// Parse the main header only.
@@ -480,31 +493,68 @@ fn main_header(cs: &[u8], limits: &Limits) -> JpxResult<(Siz, Params, PpmParts, 
     }
 }
 
-/// Parse the whole codestream's headers.
-pub(crate) fn parse(cs: &[u8], limits: &Limits) -> JpxResult<Codestream> {
+/// Tile index and length of a tile-part (A.4.2).
+fn read_sot(body: &[u8]) -> JpxResult<(usize, usize)> {
+    let mut f = Fields(body);
+    let t = f.u16()? as usize;
+    let psot = f.u32()? as usize;
+    let _part_index = f.u8()?;
+    let _part_count = f.u8()?;
+    Ok((t, psot))
+}
+
+/// Parse the whole codestream's headers. `lenient` skips a damaged tile-part
+/// (noted in [`Codestream::skipped`]) and goes on at the next SOT marker
+/// instead of failing.
+pub(crate) fn parse(cs: &[u8], limits: &Limits, lenient: bool) -> JpxResult<Codestream> {
     let (siz, params, ppm, mut pos) = main_header(cs, limits)?;
     let n_tiles = (siz.tiles_x * siz.tiles_y) as usize;
     let mut tiles: Vec<Option<TileParts>> = Vec::new();
     tiles.resize_with(n_tiles, || None);
     let mut ppm = PpmReader::new(cs, ppm);
+    let mut skipped = Vec::new();
+    // A damaged tile-part: an error, or (lenient) skip to the next SOT.
+    macro_rules! damaged {
+        ($tile:expr, $err:expr, $sot:expr) => {{
+            if !lenient {
+                return Err($err);
+            }
+            skipped.push(($tile, err_text(&$err)));
+            match resync(cs, $sot + 2) {
+                Some(p) => {
+                    pos = p;
+                    continue;
+                }
+                None => break,
+            }
+        }};
+    }
     // Whatever ends the run of tile-parts (EOC, the end of the data, garbage),
     // those read so far stand; missing packets show up when they are needed.
+    // (Not even a lenient parse looks for tile-parts past that point: what
+    // strict mode decodes, lenient mode must decode the same.)
     while let Ok(SOT) = next_marker(cs, pos) {
+        let sot = pos;
         let Ok(body) = segment(cs, pos) else {
             break;
         };
-        let mut f = Fields(&cs[body.clone()]);
-        let t = f.u16()? as usize;
-        let psot = f.u32()? as usize;
-        let _part_index = f.u8()?;
-        let _part_count = f.u8()?;
+        let (t, psot) = match read_sot(&cs[body.clone()]) {
+            Ok(v) => v,
+            Err(e) => damaged!(None, e, sot),
+        };
         if psot != 0 && psot < 14 {
-            return Err(JpxError::Format("tile-part length"));
+            damaged!(
+                u32::try_from(t).ok(),
+                JpxError::Format("tile-part length"),
+                sot
+            );
         }
-        let slot = tiles
-            .get_mut(t)
-            .ok_or(JpxError::Format("tile index out of range"))?;
+        let Some(slot) = tiles.get_mut(t) else {
+            damaged!(None, JpxError::Format("tile index out of range"), sot);
+        };
         let tile = slot.get_or_insert_with(TileParts::default);
+        // What this tile-part adds, taken back if it turns out damaged.
+        let (marks, ppts) = (tile.markers.len(), tile.ppt.len());
         let mut end = if psot == 0 {
             // Up to EOC, for the last tile-part.
             match cs.last_chunk::<2>() {
@@ -521,6 +571,7 @@ pub(crate) fn parse(cs: &[u8], limits: &Limits) -> JpxResult<Codestream> {
         let index = tile.bodies.len();
         pos = body.end;
         let mut complete = false;
+        let mut failure = None;
         while let Ok(marker) = next_marker(&cs[..end], pos) {
             if marker == SOD {
                 pos += 2;
@@ -535,24 +586,41 @@ pub(crate) fn parse(cs: &[u8], limits: &Limits) -> JpxResult<Codestream> {
                 break;
             };
             match marker {
-                SOT | EOC | SIZ => return Err(JpxError::Format("marker in a tile-part header")),
-                PPT => {
-                    let z = Fields(&cs[body.clone()]).u8()?;
-                    tile.ppt.push((index, z, body.start + 1..body.end));
+                SOT | EOC | SIZ => {
+                    failure = Some(JpxError::Format("marker in a tile-part header"));
+                    break;
                 }
+                PPT => match Fields(&cs[body.clone()]).u8() {
+                    Ok(z) => tile.ppt.push((index, z, body.start + 1..body.end)),
+                    Err(e) => {
+                        failure = Some(e);
+                        break;
+                    }
+                },
                 COD | COC | QCD | QCC | RGN | POC => tile.markers.push((marker, body.clone())),
                 _ => {}
             }
             pos = body.end;
         }
-        if !complete {
-            if !tile.truncated {
-                return Err(JpxError::Format("tile-part header"));
+        if failure.is_none() && !complete {
+            if tile.truncated {
+                break;
             }
-            break;
+            failure = Some(JpxError::Format("tile-part header"));
         }
-        if let Some(headers) = ppm.next_part()? {
-            tile.ppm.push(headers);
+        if let Some(e) = failure {
+            tile.markers.truncate(marks);
+            tile.ppt.truncate(ppts);
+            damaged!(u32::try_from(t).ok(), e, sot);
+        }
+        match ppm.next_part() {
+            Ok(Some(headers)) => tile.ppm.push(headers),
+            Ok(None) => {}
+            Err(e) => {
+                tile.markers.truncate(marks);
+                tile.ppt.truncate(ppts);
+                damaged!(u32::try_from(t).ok(), e, sot)
+            }
         }
         tile.bodies.push(pos..end.max(pos));
         pos = end.max(pos);
@@ -562,7 +630,18 @@ pub(crate) fn parse(cs: &[u8], limits: &Limits) -> JpxResult<Codestream> {
         params,
         tiles,
         ended: next_marker(cs, pos) == Ok(EOC),
+        skipped,
     })
+}
+
+fn err_text(e: &JpxError) -> &'static str {
+    match e {
+        JpxError::Format(m)
+        | JpxError::Unsupported(m)
+        | JpxError::Limit(m)
+        | JpxError::Usage(m) => m,
+        JpxError::Truncated => "tile-part header cut short",
+    }
 }
 
 /// Splits the concatenated PPM data into one range list per tile-part (A.7.4).
