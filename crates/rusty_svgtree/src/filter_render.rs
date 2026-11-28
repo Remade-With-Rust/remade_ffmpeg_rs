@@ -429,7 +429,7 @@ fn run_primitive<'a>(
                 Transform::from_row(sx, 0.0, 0.0, sy, subregion.x() as f32, subregion.y() as f32);
             let bounds = IntRect::from_xywh(0, 0, region.width(), region.height())?;
             let old = ctx.swap_max_bbox(bounds);
-            crate::render::render_nodes(&fe.root, ctx, t, &mut p.as_mut());
+            crate::render::render_nodes(&fe.root.children, ctx, t, &mut p.as_mut());
             ctx.swap_max_bbox(old);
             out(p, srgb)
         }

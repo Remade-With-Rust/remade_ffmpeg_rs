@@ -729,4 +729,11 @@ impl Image {
     pub fn is_visible(&self) -> bool {
         self.visible
     }
+    /// Decodes a raster image into premultiplied RGBA8 pixels, or `None`:
+    /// larger than `max_pixels`, broken, an SVG document (draw it with
+    /// [`render`](crate::render)), or the `raster-images` feature is off.
+    /// The first frame of a GIF.
+    pub fn decode(&self, max_pixels: u64) -> Option<rusty_raster::Pixmap> {
+        crate::image::decode(&self.kind, max_pixels)
+    }
 }

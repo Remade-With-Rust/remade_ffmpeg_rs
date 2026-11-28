@@ -191,6 +191,9 @@ pub struct Tree {
     max_layer_bytes: u64,
     max_image_pixels: u64,
     max_filter_work: u64,
+    /// The provider the text was laid out with.
+    #[cfg(feature = "text")]
+    fonts: Option<std::sync::Arc<dyn text::FontProvider>>,
 }
 
 impl Tree {
@@ -251,6 +254,8 @@ impl Tree {
             max_layer_bytes: opt.max_layer_bytes,
             max_image_pixels: opt.max_image_pixels,
             max_filter_work: opt.max_filter_work,
+            #[cfg(feature = "text")]
+            fonts: opt.fonts.clone(),
         })
     }
 
@@ -299,6 +304,14 @@ impl Tree {
     pub fn root(&self) -> &Group {
         &self.root
     }
+
+    /// The font provider the tree's text was laid out with
+    /// ([`Options::fonts`]): the one the [`FontId`](text::FontId)s of
+    /// [`Text::glyph_runs`](text::Text::glyph_runs) belong to.
+    #[cfg(feature = "text")]
+    pub fn fonts(&self) -> Option<&std::sync::Arc<dyn text::FontProvider>> {
+        self.fonts.as_ref()
+    }
 }
 
 /// Renders `tree` onto `pixmap` with `transform` applied to the canvas.
@@ -312,5 +325,29 @@ pub fn render(tree: &Tree, transform: Transform, pixmap: &mut PixmapMut) {
     ) else {
         return;
     };
-    render::render_nodes(&tree.root, &mut ctx, transform, pixmap);
+    render::render_nodes(&tree.root.children, &mut ctx, transform, pixmap);
+}
+
+/// Renders one node of `tree` (or of a tree inside it: a clip path's, a
+/// mask's, a pattern's or an embedded document's) onto `pixmap`, with the
+/// limits `tree` was parsed with. As `resvg::render_node`: the node's own
+/// transform, opacity, blend mode, clip path, mask and filters apply, its
+/// parents' do not, and `transform` maps the parent's coordinates to the
+/// pixmap.
+///
+/// To rasterise a filtered group at scale `s` (a PDF writer drawing what it
+/// cannot express): take its [`Group::layer_bounding_box`] through its
+/// [`Group::transform`], size a pixmap to that box times `s`, and render
+/// with `Transform::from_scale(s, s).pre_translate(-box.x(), -box.y())`.
+pub fn render_node(tree: &Tree, node: &Node, transform: Transform, pixmap: &mut PixmapMut) {
+    let Some(mut ctx) = render::Context::new(
+        pixmap.width(),
+        pixmap.height(),
+        tree.max_layer_bytes,
+        tree.max_image_pixels,
+        tree.max_filter_work,
+    ) else {
+        return;
+    };
+    render::render_nodes(std::slice::from_ref(node), &mut ctx, transform, pixmap);
 }

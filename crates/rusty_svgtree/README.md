@@ -142,6 +142,34 @@ let opt = rusty_svgtree::Options {
 };
 ```
 
+## Drawing the tree elsewhere (a PDF, a vector surface)
+
+The tree is a public, read-only view of the resolved document (after CSS,
+`use` expansion and unit resolution), the stage a usvg tree gives krilla-svg.
+A writer walks `Tree::root()`: groups (transform, opacity, blend mode,
+isolation, clip path, mask, filters), paths (`Path::data().segments()` in
+user space, fill, stroke), paints (colour, linear and radial gradients and
+patterns, all already in user space: `objectBoundingBox` is folded into their
+transforms), images (encoded bytes, so JPEG passes through; `ImageKind::Svg`
+is a nested `Tree`) and text. Structs have accessor methods; `Node`,
+`ImageKind`, `filter::Kind` and the new types are `#[non_exhaustive]`.
+
+| what | needs | for |
+|---|---|---|
+| `Text::glyph_runs()`: shaped glyphs (font id, glyph id, placement, the source text of the cluster) and the decoration paths | `text` | text kept as text, with `ToUnicode` |
+| `FontProvider::font_data()`, `FontData`, `Tree::fonts()` | `text` | embedding the fonts: a provided method, `None` unless the provider gives the file |
+| `Fonts`' `font_data` (the file's bytes, read once, shared) | `fonts` | |
+| `render_node(&Tree, &Node, Transform, &mut PixmapMut)` | none | rasterising what a writer cannot express (a filtered group), as `resvg::render_node` |
+| `Image::decode(max_pixels)` | `raster-images` (default) | premultiplied RGBA8 pixels; `None` without the feature |
+
+With `default-features = false, features = ["text"]` and an application's
+own `FontProvider` in `Options::fonts`, glyph runs and `font_data` work
+without `fontdb` or a system-font scan. A provider's `FontId` is the key to
+de-duplicate fonts on: the same provider and id are the same face in every
+tree parsed with it (nested `ImageKind::Svg` trees included). A run's
+`variations` (plus `opsz` from `optical_size`) are the axis values its glyphs
+were shaped and drawn with.
+
 ## Writing SVG
 
 `Tree::to_svg_string` writes the tree back with every style resolved. All 1718

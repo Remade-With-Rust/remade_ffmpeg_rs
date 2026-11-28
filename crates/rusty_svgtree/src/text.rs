@@ -36,6 +36,8 @@ pub struct Text {
     pub(crate) bounding_box: Option<Rect>,
     pub(crate) stroke_bounding_box: Option<Rect>,
     pub(crate) flattened: Option<Box<Group>>,
+    #[cfg(feature = "text")]
+    pub(crate) glyph_runs: Option<Vec<GlyphRun>>,
 }
 
 impl Text {
@@ -55,6 +57,75 @@ impl Text {
     pub fn flattened(&self) -> Option<&Group> {
         self.flattened.as_deref()
     }
+
+    /// The shaped glyphs, one run per laid-out span, in paint order; `None`
+    /// when the text was not laid out. They draw what [`Text::flattened`]
+    /// draws, for a writer that keeps text as text (a PDF): glyph ids of the
+    /// [`FontProvider`] the tree was parsed with ([`Tree::fonts`]), where
+    /// they are, and the text they stand for.
+    ///
+    /// [`Tree::fonts`]: crate::Tree::fonts
+    #[cfg(feature = "text")]
+    pub fn glyph_runs(&self) -> Option<&[GlyphRun]> {
+        self.glyph_runs.as_deref()
+    }
+}
+
+/// The glyphs of one span of a laid-out text (see [`Text::glyph_runs`]).
+///
+/// Its style is the span's, `Text::chunks[chunk].spans[span]`: font size,
+/// fill and stroke (resolved to user space; a glyph fill always uses the
+/// nonzero rule, whatever the span's `fill-rule`), paint order and
+/// visibility. A run is drawn in this order: overline, underline, the
+/// glyphs, line-through.
+#[cfg(feature = "text")]
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct GlyphRun {
+    /// The chunk, an index into [`Text::chunks`].
+    pub chunk: usize,
+    /// The span, an index into the chunk's [`TextChunk::spans`].
+    pub span: usize,
+    /// The axis values the glyphs were shaped and drawn with: the span's
+    /// `font-variation-settings`, plus `opsz` set to `optical_size` when that
+    /// is `Some`, the font has that axis and the list does not set it (the
+    /// rule of [`ShapeRequest::optical_sizing`]).
+    pub variations: Vec<FontVariation>,
+    /// The font size, when `font-optical-sizing` is `auto`.
+    pub optical_size: Option<f32>,
+    /// The glyphs, in visual order. Fallback fonts make one run hold glyphs
+    /// of several fonts.
+    pub glyphs: Vec<PositionedGlyph>,
+    /// The span's overline, a filled or stroked path in the text's
+    /// coordinates.
+    pub overline: Option<crate::tree::Path>,
+    /// The span's underline.
+    pub underline: Option<crate::tree::Path>,
+    /// The span's line-through.
+    pub line_through: Option<crate::tree::Path>,
+}
+
+/// A glyph of a [`GlyphRun`], placed.
+#[cfg(feature = "text")]
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct PositionedGlyph {
+    /// The font, of the provider the text was laid out with.
+    pub font: FontId,
+    /// The glyph in it (0 for a missing glyph, which draws `.notdef`).
+    pub id: u32,
+    /// The font's units per em.
+    pub units_per_em: u16,
+    /// The font size.
+    pub font_size: f32,
+    /// The bytes of the cluster the glyph belongs to, in the chunk's
+    /// [`TextChunk::text`] (for a PDF's `ToUnicode` / `ActualText`).
+    /// Glyphs of one cluster share it.
+    pub text: std::ops::Range<usize>,
+    /// From font units (y up, the glyph origin at `0,0`) to the text's
+    /// coordinates, the coordinates of [`Text::flattened`]. Size, position,
+    /// rotation, text-on-path and vertical writing are all in it.
+    pub transform: Transform,
 }
 
 /// A run of text with one anchor.
@@ -445,4 +516,49 @@ pub trait FontProvider: std::fmt::Debug + Send + Sync {
         variations: &[FontVariation],
         optical_size: Option<f32>,
     ) -> Option<GlyphData>;
+
+    /// The font file, to embed the font in a document (a PDF). `None` (the
+    /// default) when the provider cannot give it.
+    ///
+    /// A provider's [`FontId`]s name its faces for as long as it lives, so
+    /// they are what to de-duplicate on: the same provider and the same id
+    /// are the same face in every tree parsed with it.
+    fn font_data(&self, font: FontId) -> Option<FontData> {
+        let _ = font;
+        None
+    }
+}
+
+/// A font file and the face in it (see [`FontProvider::font_data`]).
+#[cfg(feature = "text")]
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct FontData {
+    /// The file's bytes (a font or a collection).
+    pub data: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    /// The face's index in a collection; 0 for a single font.
+    pub index: u32,
+}
+
+#[cfg(feature = "text")]
+impl FontData {
+    /// The file's bytes and a face index.
+    pub fn new(data: Arc<dyn AsRef<[u8]> + Send + Sync>, index: u32) -> FontData {
+        FontData { data, index }
+    }
+
+    /// The file's bytes.
+    pub fn bytes(&self) -> &[u8] {
+        (*self.data).as_ref()
+    }
+}
+
+#[cfg(feature = "text")]
+impl std::fmt::Debug for FontData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FontData")
+            .field("len", &self.bytes().len())
+            .field("index", &self.index)
+            .finish()
+    }
 }

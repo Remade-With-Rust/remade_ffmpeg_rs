@@ -124,17 +124,17 @@ impl Context {
 }
 
 pub(crate) fn render_nodes(
-    parent: &Group,
+    nodes: &[Node],
     ctx: &mut Context,
     ts: Transform,
     pixmap: &mut PixmapMut,
 ) {
-    for node in &parent.children {
+    for node in nodes {
         render_node(node, ctx, ts, pixmap);
     }
 }
 
-fn render_node(node: &Node, ctx: &mut Context, ts: Transform, pixmap: &mut PixmapMut) {
+pub(crate) fn render_node(node: &Node, ctx: &mut Context, ts: Transform, pixmap: &mut PixmapMut) {
     match node {
         Node::Group(g) => {
             render_group(g, ctx, ts, pixmap);
@@ -145,7 +145,7 @@ fn render_node(node: &Node, ctx: &mut Context, ts: Transform, pixmap: &mut Pixma
         }
         Node::Text(t) => {
             if let Some(g) = &t.flattened {
-                render_nodes(g, ctx, ts, pixmap);
+                render_nodes(&g.children, ctx, ts, pixmap);
             }
         }
     }
@@ -168,7 +168,7 @@ fn render_group(
 ) -> Option<()> {
     let ts = ts.pre_concat(group.transform);
     if !group.should_isolate() {
-        render_nodes(group, ctx, ts, pixmap);
+        render_nodes(&group.children, ctx, ts, pixmap);
         return Some(());
     }
     let bbox = group.layer_bounding_box.transform(ts)?;
@@ -197,7 +197,7 @@ fn render_group(
     let ts = shift.pre_concat(ts);
 
     let mut sub = ctx.alloc(ibbox.width(), ibbox.height())?;
-    render_nodes(group, ctx, ts, &mut sub.as_mut());
+    render_nodes(&group.children, ctx, ts, &mut sub.as_mut());
     for filter in &group.filters {
         crate::filter_render::apply(filter, ctx, ts, &mut sub);
     }
@@ -464,7 +464,7 @@ fn render_pattern_pixmap(
     }
     let mut pixmap = ctx.alloc(w, h)?;
     let tile_ts = Transform::from_scale(sx, sy);
-    render_nodes(&pat.root, ctx, tile_ts, &mut pixmap.as_mut());
+    render_nodes(&pat.root.children, ctx, tile_ts, &mut pixmap.as_mut());
     ctx.free(&pixmap);
     let pts = Transform::identity()
         .pre_concat(pat.transform)
@@ -763,7 +763,7 @@ fn apply_mask(mask: &tree::Mask, ctx: &mut Context, ts: Transform, pixmap: &mut 
             true,
             ts,
         );
-        render_nodes(&mask.root, ctx, ts, &mut mask_pixmap.as_mut());
+        render_nodes(&mask.root.children, ctx, ts, &mut mask_pixmap.as_mut());
         mask_pixmap.apply_mask(&alpha_mask);
         ctx.free_mask(w, h);
     }
@@ -786,7 +786,7 @@ fn render_document(
 ) -> Option<()> {
     let mut sub = ctx.alloc(pixmap.width(), pixmap.height())?;
     let old = ctx.swap_max_bbox(max_bbox(sub.width(), sub.height())?);
-    render_nodes(tree.root(), ctx, ts, &mut sub.as_mut());
+    render_nodes(&tree.root().children, ctx, ts, &mut sub.as_mut());
     ctx.swap_max_bbox(old);
     pixmap.draw_pixmap(
         0,
