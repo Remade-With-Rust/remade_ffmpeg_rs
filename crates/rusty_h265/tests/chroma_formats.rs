@@ -1,6 +1,7 @@
 //! 4:2:2 and 4:4:4 decode, gated bit-exact against FFmpeg 9.1.
 //!
-//! Each fixture is a small libx265 stream; the expected md5 is of FFmpeg's
+//! Each fixture is a small libx265 stream (the five newest encode FFmpeg's
+//! synthetic `testsrc2` / `mandelbrot` sources); the expected md5 is of FFmpeg's
 //! `-pix_fmt yuv422p` / `yuv444p[10le|12le]` output over the whole stream,
 //! which is the layout `Frame::write_yuv` writes. All but the two oldest
 //! fixtures also carry an MD5 decoded-picture-hash SEI per picture (x265
@@ -50,7 +51,7 @@ const FIXTURES: &[Fixture] = &[
         data: include_bytes!("fixtures/yuv422_x265_odd34x18_10b.hevc"),
         chroma_format_idc: 2,
         bit_depth: 10,
-        md5: "95af9238e1a6e5ab352d1b4859d4fa18",
+        md5: "3f9c7f073f73239ff878980e2d0f0552",
         frames: 6,
         sei: true,
     },
@@ -60,18 +61,18 @@ const FIXTURES: &[Fixture] = &[
         data: include_bytes!("fixtures/yuv444_x265_odd33x18_12b.hevc"),
         chroma_format_idc: 3,
         bit_depth: 12,
-        md5: "67bda592aba96e6aea77a41eca5e7fa3",
+        md5: "a20e12dcf60b42bc5a6d70c633164fc0",
         frames: 6,
         sei: true,
     },
-    // 16x16 CTUs, transform skip, constrained intra, deep transform trees
+    // 16x16 CTUs, constrained intra, deep transform trees
     // (the 4:2:2 second chroma cbf and the 4x8 chroma of 4x4 luma blocks).
     Fixture {
         name: "422_tskip_ctu16_8b",
         data: include_bytes!("fixtures/yuv422_x265_tskip_ctu16_8b.hevc"),
         chroma_format_idc: 2,
         bit_depth: 8,
-        md5: "75d026a6dbbe74f20f4f68bc0fcd5fa5",
+        md5: "388de868e591e997c3ac7df7a2a4348f",
         frames: 6,
         sei: true,
     },
@@ -82,7 +83,7 @@ const FIXTURES: &[Fixture] = &[
         data: include_bytes!("fixtures/yuv444_x265_aq_cqp_10b.hevc"),
         chroma_format_idc: 3,
         bit_depth: 10,
-        md5: "31cf339773c094410c31e7fe1e004234",
+        md5: "0ba0e1c99a9378ad4a85fc249c9c6eb8",
         frames: 8,
         sei: true,
     },
@@ -93,7 +94,7 @@ const FIXTURES: &[Fixture] = &[
         data: include_bytes!("fixtures/yuv422_x265_scaling_12b.hevc"),
         chroma_format_idc: 2,
         bit_depth: 12,
-        md5: "a360ca67d8919f395043cd220594d8d4",
+        md5: "34d647e926a844b0b3d0790da7e7df9c",
         frames: 5,
         sei: true,
     },
