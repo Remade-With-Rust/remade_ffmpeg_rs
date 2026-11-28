@@ -565,7 +565,7 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    fn chunk_rect(info: &PartInfo, pos: ChunkPos) -> (i32, i32, usize, usize) {
+    fn rect_of(info: &PartInfo, pos: ChunkPos) -> (i32, i32, usize, usize) {
         match pos {
             ChunkPos::Scanline { y } => {
                 let lpb = info.compression.lines_per_block() as i64;
@@ -636,7 +636,7 @@ impl<'a> Decoder<'a> {
             )));
         }
         let pos = Self::chunk_pos(&p.info, index)?;
-        let rect = Self::chunk_rect(&p.info, pos);
+        let rect = Self::rect_of(&p.info, pos);
         let off = p.offsets[index];
         if off >= self.data.len() as u64 || off < 8 {
             return Err(Error::invalid(format!(
@@ -714,11 +714,241 @@ impl<'a> Decoder<'a> {
     /// Decode one resolution level of part `i`.
     pub fn decode_level(&self, i: usize, lx: usize, ly: usize) -> Result<Image> {
         let p = self.part(i)?;
+        let lv = self.level_layout(p, lx, ly)?;
+        let mut channels: Vec<Channel> = p
+            .info
+            .channels
+            .iter()
+            .zip(&lv.sizes)
+            .map(|(d, &(w, h))| Channel {
+                desc: d.clone(),
+                width: w,
+                height: h,
+                samples: match d.sample_type {
+                    SampleType::F16 => Samples::F16(vec![0; w * h]),
+                    SampleType::F32 => Samples::F32(vec![0.0; w * h]),
+                    SampleType::U32 => Samples::U32(vec![0; w * h]),
+                },
+            })
+            .collect();
+        let strides: Vec<usize> = lv.sizes.iter().map(|s| s.0).collect();
+        let window = lv.window;
+        let planes = channels
+            .iter_mut()
+            .map(|c| Some(PlaneMut::from(&mut c.samples)))
+            .collect();
+        self.run_bands(p, i, lv, planes, &strides)?;
+        Ok(Image {
+            header: p.header.clone(),
+            data_window: window,
+            level: (lx, ly),
+            channels,
+        })
+    }
+
+    /// Decode part `i` (level 0 for multi-level tiled parts) straight into
+    /// the caller's planes, one [`ChannelSink`] per channel in channel-list
+    /// (sorted) order. Each chunk is decompressed and written to its rows of
+    /// the planes in one pass, converting the sample type on the way where
+    /// the sink asks for it; nothing is allocated per plane.
+    ///
+    /// Plane `c` is [`Self::plane_sizes`]`[c]` samples wide and high (the
+    /// data window divided by the channel's sampling). Uses the decoder's
+    /// [`Threads`] setting; the planes come out the same for any worker
+    /// count, and the same as [`Self::decode_part`]'s (converted, where a
+    /// sink converts, exactly as [`Samples::to_f32`] or [`crate::f32_to_f16`]
+    /// would). On error the planes may hold part of the image.
+    ///
+    /// ```no_run
+    /// use rusty_exr::{ChannelSink, Decoder};
+    /// let bytes = std::fs::read("in.exr").unwrap();
+    /// let dec = Decoder::new(&bytes).unwrap();
+    /// let (w, h) = dec.plane_sizes(0, 0, 0).unwrap()[0];
+    /// let [mut r, mut g, mut b, mut a] = [(); 4].map(|()| vec![0f32; w * h]);
+    /// // Channels come in name order; skip any you do not want.
+    /// let mut sinks: Vec<ChannelSink> = Vec::new();
+    /// let (mut ra, mut rb, mut rg, mut rr) = (Some(&mut a), Some(&mut b), Some(&mut g), Some(&mut r));
+    /// for c in dec.header(0).unwrap().channels() {
+    ///     let plane = match c.name.as_str() {
+    ///         "A" => ra.take(),
+    ///         "B" => rb.take(),
+    ///         "G" => rg.take(),
+    ///         "R" => rr.take(),
+    ///         _ => None,
+    ///     };
+    ///     // HALF, FLOAT and UINT channels all convert into an f32 plane.
+    ///     sinks.push(plane.map_or_else(ChannelSink::skip, |p| ChannelSink::f32(p)));
+    /// }
+    /// dec.decode_part_into(0, &mut sinks).unwrap();
+    /// ```
+    pub fn decode_part_into(&self, i: usize, sinks: &mut [ChannelSink<'_>]) -> Result<()> {
+        self.decode_level_into(i, 0, 0, sinks)
+    }
+
+    /// [`Self::decode_part_into`] for one resolution level of part `i`.
+    pub fn decode_level_into(
+        &self,
+        i: usize,
+        lx: usize,
+        ly: usize,
+        sinks: &mut [ChannelSink<'_>],
+    ) -> Result<()> {
+        let p = self.part(i)?;
+        let lv = self.level_layout(p, lx, ly)?;
+        let strides = check_sinks(&p.info.channels, &lv.sizes, sinks)?;
+        let planes = sinks.iter_mut().map(ChannelSink::reborrow).collect();
+        self.run_bands(p, i, lv, planes, &strides)
+    }
+
+    /// [`Self::decode_level_into`] as independent jobs, for callers that run
+    /// them on their own thread pool: one [`DecodeBand`] per row band (a
+    /// scanline block, or a row of tiles), each holding its own disjoint
+    /// rows of the sinks' planes. Run every band once, in any order and on
+    /// any thread, with a [`DecodeScratch`] per thread; the planes then hold
+    /// what [`Self::decode_level_into`] writes. The decoder's [`Threads`]
+    /// setting is not used.
+    ///
+    /// A persistent pool (rayon's, say) skips the per-call thread start-up
+    /// that [`Threads::Auto`] pays, which is most of the cost of decoding a
+    /// cheap codec (None, RLE) on many cores.
+    ///
+    /// ```no_run
+    /// use rusty_exr::{ChannelSink, DecodeScratch, Decoder};
+    /// let bytes = std::fs::read("in.exr").unwrap();
+    /// let dec = Decoder::new(&bytes).unwrap();
+    /// let sizes = dec.plane_sizes(0, 0, 0).unwrap();
+    /// let mut planes: Vec<Vec<f32>> = sizes.iter().map(|&(w, h)| vec![0.0; w * h]).collect();
+    /// let mut sinks: Vec<ChannelSink> = planes.iter_mut().map(|p| ChannelSink::f32(p)).collect();
+    /// let bands = dec.decode_bands(0, 0, 0, &mut sinks).unwrap();
+    /// // With rayon: bands.into_par_iter().try_for_each_init(DecodeScratch::default, |s, b| b.decode(s))
+    /// let queue = std::sync::Mutex::new(bands.into_iter());
+    /// std::thread::scope(|s| {
+    ///     for _ in 0..4 {
+    ///         s.spawn(|| {
+    ///             let mut scratch = DecodeScratch::default();
+    ///             while let Some(band) = { let next = queue.lock().unwrap().next(); next } {
+    ///                 band.decode(&mut scratch).unwrap();
+    ///             }
+    ///         });
+    ///     }
+    /// });
+    /// ```
+    pub fn decode_bands<'s>(
+        &'s self,
+        i: usize,
+        lx: usize,
+        ly: usize,
+        sinks: &'s mut [ChannelSink<'_>],
+    ) -> Result<Vec<DecodeBand<'s, 'a>>> {
+        let p = self.part(i)?;
+        let lv = self.level_layout(p, lx, ly)?;
+        let strides = check_sinks(&p.info.channels, &lv.sizes, sinks)?;
+        let planes = sinks.iter_mut().map(ChannelSink::reborrow).collect();
+        Ok(Self::band_tasks(p, lv.bands, planes, &strides)
+            .into_iter()
+            .map(|task| DecodeBand {
+                dec: self,
+                part: i,
+                task,
+            })
+            .collect())
+    }
+
+    /// Per channel (channel-list order): the `(width, height)` in samples of
+    /// its plane at resolution level (`lx`, `ly`) of part `i`, the sizes
+    /// [`Self::decode_level_into`] expects.
+    pub fn plane_sizes(&self, i: usize, lx: usize, ly: usize) -> Result<Vec<(usize, usize)>> {
+        let p = self.part(i)?;
+        Ok(self.level_layout(p, lx, ly)?.sizes)
+    }
+
+    /// The pixel rectangle chunk `index` of part `part` covers, without
+    /// reading it.
+    pub fn chunk_rect(&self, part: usize, index: usize) -> Result<ChunkRect> {
+        let p = self.part(part)?;
+        if index >= p.info.chunk_count {
+            return Err(Error::usage(format!(
+                "chunk {index} of {}",
+                p.info.chunk_count
+            )));
+        }
+        let pos = Self::chunk_pos(&p.info, index)?;
+        let (x0, y0, width, height) = Self::rect_of(&p.info, pos);
+        Ok(ChunkRect {
+            pos,
+            x0,
+            y0,
+            width,
+            height,
+        })
+    }
+
+    /// Read and decompress chunk `index` of part `part` straight into the
+    /// caller's buffers: one [`ChannelSink`] per channel (channel-list
+    /// order) holding that channel's samples *of this chunk only*,
+    /// [`ChunkRect::channel_size`] wide and high, row by row (`with_stride`
+    /// lets a sink be a window into a larger plane). `scratch` keeps its
+    /// buffers and inflater from call to call; give each thread its own.
+    ///
+    /// The samples are the ones [`Self::decode_chunk`] returns (converted
+    /// where a sink converts), without the intermediate [`Block`].
+    ///
+    /// ```no_run
+    /// use rusty_exr::{ChannelSink, DecodeScratch, Decoder};
+    /// let bytes = std::fs::read("in.exr").unwrap();
+    /// let dec = Decoder::new(&bytes).unwrap();
+    /// let channels = dec.header(0).unwrap().channels().to_vec();
+    /// let (w, h) = dec.plane_sizes(0, 0, 0).unwrap()[0];
+    /// let mut planes: Vec<Vec<f32>> = channels.iter().map(|_| vec![0.0; w * h]).collect();
+    /// let mut scratch = DecodeScratch::default();
+    /// for k in 0..dec.chunk_count(0).unwrap() {
+    ///     let r = dec.chunk_rect(0, k).unwrap();
+    ///     let row0 = (r.y0 - dec.header(0).unwrap().data_window().unwrap().y_min) as usize;
+    ///     // A scanline chunk spans whole rows: hand over exactly those rows.
+    ///     let mut sinks: Vec<ChannelSink> = planes
+    ///         .iter_mut()
+    ///         .map(|p| ChannelSink::f32(&mut p[row0 * w..(row0 + r.height) * w]))
+    ///         .collect();
+    ///     dec.decode_chunk_into(0, k, &mut sinks, &mut scratch).unwrap();
+    /// }
+    /// ```
+    pub fn decode_chunk_into(
+        &self,
+        part: usize,
+        index: usize,
+        sinks: &mut [ChannelSink<'_>],
+        scratch: &mut DecodeScratch,
+    ) -> Result<ChunkRect> {
+        let r = self.chunk_rect(part, index)?;
+        let p = self.part(part)?;
+        let sizes: Vec<(usize, usize)> =
+            p.info.channels.iter().map(|c| r.channel_size(c)).collect();
+        let strides = check_sinks(&p.info.channels, &sizes, sinks)?;
+        let mut task = Task {
+            y0: r.y0,
+            x0: r.x0,
+            chunks: Vec::new(),
+            planes: sinks.iter_mut().map(ChannelSink::reborrow).collect(),
+            strides,
+        };
+        self.decode_into(
+            p,
+            part,
+            index,
+            &mut task,
+            &mut scratch.inner,
+            &mut scratch.rows,
+        )?;
+        Ok(r)
+    }
+
+    /// Row bands, window, plane sizes and decoded size of one level.
+    fn level_layout(&self, p: &Part, lx: usize, ly: usize) -> Result<LevelLayout> {
         let info = &p.info;
         let dw = info.data_window;
         // Row bands: disjoint row ranges of the output, each with the chunks
         // that fill it. A scanline block is one band; a row of tiles is one.
-        let (bands, lw, lh): (Vec<Band>, usize, usize) = match &info.levels {
+        let (bands, lw, lh): (Vec<BandRows>, usize, usize) = match &info.levels {
             None => {
                 if lx != 0 || ly != 0 {
                     return Err(Error::usage("scanline parts have one level"));
@@ -753,7 +983,7 @@ impl<'a> Decoder<'a> {
                 (bands, lv.widths[lx], lh)
             }
         };
-        let level_window = Box2i {
+        let window = Box2i {
             x_min: dw.x_min,
             y_min: dw.y_min,
             x_max: dw.x_min + lw as i32 - 1,
@@ -770,51 +1000,73 @@ impl<'a> Decoder<'a> {
             }
             sizes.push((cw, ch));
         }
-        let mut channels: Vec<Channel> = info
-            .channels
-            .iter()
-            .zip(&sizes)
-            .map(|(d, &(w, h))| Channel {
-                desc: d.clone(),
-                width: w,
-                height: h,
-                samples: match d.sample_type {
-                    SampleType::F16 => Samples::F16(vec![0; w * h]),
-                    SampleType::F32 => Samples::F32(vec![0.0; w * h]),
-                    SampleType::U32 => Samples::U32(vec![0; w * h]),
-                },
-            })
-            .collect();
+        Ok(LevelLayout {
+            bands,
+            window,
+            sizes,
+            total,
+        })
+    }
 
+    /// Split `planes` (per channel, `None` to skip it; `strides[c]`
+    /// samples per row) into the level's row bands: one task per band.
+    fn band_tasks<'p>(
+        p: &Part,
+        bands: Vec<BandRows>,
+        planes: Vec<Option<PlaneMut<'p>>>,
+        strides: &[usize],
+    ) -> Vec<Task<'p>> {
+        let dw = p.info.data_window;
         // Split every channel plane into the bands' row ranges.
-        let mut per_band: Vec<Vec<PlaneMut<'_>>> = (0..bands.len()).map(|_| Vec::new()).collect();
-        for ch in &mut channels {
-            let ys = ch.desc.y_sampling;
-            let w = ch.width;
-            let mut rest = PlaneMut::from(&mut ch.samples);
+        let mut per_band: Vec<Vec<Option<PlaneMut<'p>>>> = (0..bands.len())
+            .map(|_| Vec::with_capacity(planes.len()))
+            .collect();
+        for ((plane, desc), &stride) in planes.into_iter().zip(&p.info.channels).zip(strides) {
+            let ys = desc.y_sampling;
+            let mut rest = plane;
             for (b, (y0, lines, _)) in bands.iter().enumerate() {
-                let rows = count_sampled(*y0, *lines, ys);
-                let (head, tail) = rest.split_at(rows * w);
-                per_band[b].push(head);
-                rest = tail;
+                let Some(r) = rest.take() else {
+                    per_band[b].push(None);
+                    continue;
+                };
+                // The last row of a strided plane may stop at its width.
+                let n = (count_sampled(*y0, *lines, ys) * stride).min(r.len());
+                let (head, tail) = r.split_at(n);
+                per_band[b].push(Some(head));
+                rest = Some(tail);
             }
         }
-        let tasks: Vec<Task<'_>> = bands
+        bands
             .into_iter()
             .zip(per_band)
             .map(|((y0, _, chunks), planes)| Task {
                 y0,
+                x0: dw.x_min,
                 chunks,
                 planes,
-                widths: sizes.iter().map(|s| s.0).collect(),
+                strides: strides.to_vec(),
             })
-            .collect();
+            .collect()
+    }
 
+    /// Decode every chunk of a level into `planes` (see [`Self::band_tasks`]),
+    /// sharing the bands out over the decoder's workers.
+    fn run_bands(
+        &self,
+        p: &Part,
+        i: usize,
+        lv: LevelLayout,
+        planes: Vec<Option<PlaneMut<'_>>>,
+        strides: &[usize],
+    ) -> Result<()> {
+        let LevelLayout { bands, total, .. } = lv;
+        let tasks = Self::band_tasks(p, bands, planes, strides);
         let nthreads = self.threads.workers(tasks.len(), total);
         let errors: std::sync::Mutex<Vec<(usize, Error)>> = std::sync::Mutex::new(Vec::new());
         let queue = std::sync::Mutex::new(tasks.into_iter());
         let work = || {
             let mut scratch = compression::Scratch::default();
+            let mut rows = RowBuf::default();
             loop {
                 let task = {
                     let mut q = queue
@@ -825,7 +1077,7 @@ impl<'a> Decoder<'a> {
                 let Some(mut task) = task else { break };
                 let chunks = std::mem::take(&mut task.chunks);
                 for &ci in &chunks {
-                    if let Err(e) = self.decode_into(p, i, ci, &mut task, &mut scratch) {
+                    if let Err(e) = self.decode_into(p, i, ci, &mut task, &mut scratch, &mut rows) {
                         errors
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -851,15 +1103,10 @@ impl<'a> Decoder<'a> {
             errors.sort_by_key(|(k, _)| *k);
             return Err(errors.swap_remove(0).1);
         }
-        Ok(Image {
-            header: p.header.clone(),
-            data_window: level_window,
-            level: (lx, ly),
-            channels,
-        })
+        Ok(())
     }
 
-    /// Decode chunk `ci` straight into a band's planes.
+    /// Decode chunk `ci` straight into a task's planes.
     fn decode_into(
         &self,
         p: &Part,
@@ -867,28 +1114,36 @@ impl<'a> Decoder<'a> {
         ci: usize,
         task: &mut Task<'_>,
         scratch: &mut compression::Scratch,
+        rows: &mut RowBuf,
     ) -> Result<()> {
         let (_, (x0, y0, w, lines), packed) = self.chunk_data(p, part, ci)?;
         let geom = Self::geom(&p.info, x0, y0, w, lines)?;
-        // DWA can decode HALF lossy channels straight into the band's rows
-        // when the chunk spans whole plane rows (scanline parts).
+        // DWA can decode HALF and FLOAT lossy channels straight into the
+        // output rows when the chunk spans whole plane rows (scanline parts)
+        // and the plane holds the channel's own sample type.
         let mut direct: Vec<Option<compression::Direct<'_>>> = Vec::new();
         if matches!(p.info.compression, Compression::Dwaa | Compression::Dwab)
             && geom.chans.iter().any(|g| g.ty != SampleType::U32)
         {
-            let cols = chunk_cols(&p.info, &geom, x0, task);
+            let cols = chunk_cols(&geom, x0, task);
             direct = task
                 .planes
                 .iter_mut()
                 .zip(&cols)
                 .zip(&geom.chans)
                 .map(|((plane, &(pw, col, row0)), g)| match plane {
-                    PlaneMut::F16(v) if col == 0 && g.width == pw => v
-                        .get_mut(row0 * pw..(row0 + g.height) * pw)
-                        .map(compression::Direct::F16),
-                    PlaneMut::F32(v) if col == 0 && g.width == pw => v
-                        .get_mut(row0 * pw..(row0 + g.height) * pw)
-                        .map(compression::Direct::F32),
+                    Some(PlaneMut::F16(v))
+                        if g.ty == SampleType::F16 && col == 0 && g.width == pw =>
+                    {
+                        v.get_mut(row0 * pw..(row0 + g.height) * pw)
+                            .map(compression::Direct::F16)
+                    }
+                    Some(PlaneMut::F32(v))
+                        if g.ty == SampleType::F32 && col == 0 && g.width == pw =>
+                    {
+                        v.get_mut(row0 * pw..(row0 + g.height) * pw)
+                            .map(compression::Direct::F32)
+                    }
                     _ => None,
                 })
                 .collect();
@@ -902,13 +1157,260 @@ impl<'a> Decoder<'a> {
             &mut direct,
         )?;
         drop(direct);
-        place(&p.info, &geom, x0, task, &layout);
+        place(&geom, x0, task, &layout, rows);
         Ok(())
     }
 }
 
+/// Row bands, window, plane sizes and decoded size of one level.
+struct LevelLayout {
+    bands: Vec<BandRows>,
+    window: Box2i,
+    sizes: Vec<(usize, usize)>,
+    total: u64,
+}
+
 /// A row band: first line, line count, chunk indices.
-type Band = (i32, usize, Vec<usize>);
+type BandRows = (i32, usize, Vec<usize>);
+
+/// The pixel rectangle of one chunk (see [`Decoder::chunk_rect`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkRect {
+    pub pos: ChunkPos,
+    /// Top-left pixel (absolute coordinates; for levels > 0, relative to
+    /// the data window origin scaled to that level).
+    pub x0: i32,
+    pub y0: i32,
+    /// Size in pixels.
+    pub width: usize,
+    pub height: usize,
+}
+
+impl ChunkRect {
+    /// `(samples per row, sample rows)` of a channel inside this chunk.
+    #[must_use]
+    pub fn channel_size(&self, c: &ChannelDesc) -> (usize, usize) {
+        (
+            count_sampled(self.x0, self.width, c.x_sampling),
+            count_sampled(self.y0, self.height, c.y_sampling),
+        )
+    }
+}
+
+/// One row band of a level and its rows of the caller's planes, from
+/// [`Decoder::decode_bands`].
+pub struct DecodeBand<'a, 'd> {
+    dec: &'a Decoder<'d>,
+    part: usize,
+    task: Task<'a>,
+}
+
+impl DecodeBand<'_, '_> {
+    /// Decode the band's chunks into its rows. Errors are the ones
+    /// [`Decoder::decode_level`] reports for those chunks.
+    pub fn decode(mut self, scratch: &mut DecodeScratch) -> Result<()> {
+        let p = &self.dec.parts[self.part];
+        let chunks = std::mem::take(&mut self.task.chunks);
+        for &ci in &chunks {
+            self.dec.decode_into(
+                p,
+                self.part,
+                ci,
+                &mut self.task,
+                &mut scratch.inner,
+                &mut scratch.rows,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// First line (absolute y) of the band.
+    #[must_use]
+    pub fn y0(&self) -> i32 {
+        self.task.y0
+    }
+
+    /// Chunk indices the band decodes.
+    #[must_use]
+    pub fn chunks(&self) -> &[usize] {
+        &self.task.chunks
+    }
+}
+
+impl std::fmt::Debug for DecodeBand<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodeBand")
+            .field("part", &self.part)
+            .field("y0", &self.task.y0)
+            .field("chunks", &self.task.chunks)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where one channel goes in [`Decoder::decode_part_into`],
+/// [`Decoder::decode_level_into`] and [`Decoder::decode_chunk_into`]: a
+/// caller-owned plane of `f16` bits, `f32` or `u32` samples, or nowhere.
+///
+/// The plane is row-major, one row every `stride` samples (by default the
+/// channel's width, so rows are packed). Its type may differ from the
+/// channel's: any channel converts into an `f32` plane (HALF exactly, UINT
+/// numerically, as [`Samples::to_f32`]), and a FLOAT channel into an `f16`
+/// plane (rounded to nearest, as [`crate::f32_to_f16`]). Other pairs are
+/// refused with [`Error::Usage`].
+pub struct ChannelSink<'a> {
+    plane: Option<PlaneMut<'a>>,
+    stride: Option<usize>,
+}
+
+impl<'a> ChannelSink<'a> {
+    /// A plane of half-float bit patterns.
+    #[must_use]
+    pub fn f16(plane: &'a mut [u16]) -> Self {
+        Self {
+            plane: Some(PlaneMut::F16(plane)),
+            stride: None,
+        }
+    }
+
+    /// A plane of `f32`.
+    #[must_use]
+    pub fn f32(plane: &'a mut [f32]) -> Self {
+        Self {
+            plane: Some(PlaneMut::F32(plane)),
+            stride: None,
+        }
+    }
+
+    /// A plane of `u32`.
+    #[must_use]
+    pub fn u32(plane: &'a mut [u32]) -> Self {
+        Self {
+            plane: Some(PlaneMut::U32(plane)),
+            stride: None,
+        }
+    }
+
+    /// Decode the channel's data but store it nowhere.
+    #[must_use]
+    pub fn skip() -> Self {
+        Self {
+            plane: None,
+            stride: None,
+        }
+    }
+
+    /// Rows start every `stride` samples (at least the channel's width), so
+    /// the plane can be a window into a wider buffer. The last row needs
+    /// only the channel's width.
+    #[must_use]
+    pub fn with_stride(mut self, stride: usize) -> Self {
+        self.stride = Some(stride);
+        self
+    }
+
+    /// The plane's sample type (`None` for [`Self::skip`]).
+    #[must_use]
+    pub fn sample_type(&self) -> Option<SampleType> {
+        self.plane.as_ref().map(PlaneMut::sample_type)
+    }
+
+    fn reborrow(&mut self) -> Option<PlaneMut<'_>> {
+        self.plane.as_mut().map(|p| match p {
+            PlaneMut::F16(v) => PlaneMut::F16(v),
+            PlaneMut::F32(v) => PlaneMut::F32(v),
+            PlaneMut::U32(v) => PlaneMut::U32(v),
+        })
+    }
+}
+
+impl std::fmt::Debug for ChannelSink<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChannelSink")
+            .field("sample_type", &self.sample_type())
+            .field("len", &self.plane.as_ref().map(PlaneMut::len))
+            .field("stride", &self.stride)
+            .finish()
+    }
+}
+
+/// Reusable buffers (and the zlib inflater) for
+/// [`Decoder::decode_chunk_into`]. Keep one per thread.
+#[derive(Default)]
+pub struct DecodeScratch {
+    inner: compression::Scratch,
+    rows: RowBuf,
+}
+
+impl std::fmt::Debug for DecodeScratch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodeScratch").finish_non_exhaustive()
+    }
+}
+
+/// Per-worker rows for sample-type conversion (kept, never re-zeroed: each
+/// use writes every element it reads).
+#[derive(Default)]
+struct RowBuf {
+    h: Vec<u16>,
+    w: Vec<u32>,
+}
+
+/// Whether a `src` channel can be written to a `dst` plane.
+fn converts(src: SampleType, dst: SampleType) -> bool {
+    src == dst || dst == SampleType::F32 || (src, dst) == (SampleType::F32, SampleType::F16)
+}
+
+/// Check one sink per channel (types, strides, lengths for planes of
+/// `sizes`) and return each sink's stride.
+fn check_sinks(
+    chans: &[ChannelDesc],
+    sizes: &[(usize, usize)],
+    sinks: &[ChannelSink<'_>],
+) -> Result<Vec<usize>> {
+    if sinks.len() != chans.len() {
+        return Err(Error::usage(format!(
+            "{} sinks for {} channels",
+            sinks.len(),
+            chans.len()
+        )));
+    }
+    let mut strides = Vec::with_capacity(sinks.len());
+    for ((c, &(w, h)), s) in chans.iter().zip(sizes).zip(sinks) {
+        let stride = s.stride.unwrap_or(w);
+        if let Some(plane) = &s.plane {
+            let dst = plane.sample_type();
+            if !converts(c.sample_type, dst) {
+                return Err(Error::usage(format!(
+                    "channel {} holds {:?} samples, which a {dst:?} sink cannot take",
+                    c.name, c.sample_type
+                )));
+            }
+            if stride < w {
+                return Err(Error::usage(format!(
+                    "channel {}: stride {stride} below its width {w}",
+                    c.name
+                )));
+            }
+            let need = if w == 0 || h == 0 {
+                Some(0)
+            } else {
+                (h - 1).checked_mul(stride).and_then(|n| n.checked_add(w))
+            };
+            match need {
+                Some(n) if plane.len() >= n => {}
+                _ => {
+                    return Err(Error::usage(format!(
+                    "channel {}: a {w}x{h} plane with stride {stride} does not fit in {} samples",
+                    c.name,
+                    plane.len()
+                )))
+                }
+            }
+        }
+        strides.push(stride);
+    }
+    Ok(strides)
+}
 
 /// A mutable view of one channel plane (or a row range of it).
 enum PlaneMut<'a> {
@@ -923,6 +1425,20 @@ impl<'a> PlaneMut<'a> {
             Samples::F16(v) => Self::F16(v),
             Samples::F32(v) => Self::F32(v),
             Samples::U32(v) => Self::U32(v),
+        }
+    }
+    fn len(&self) -> usize {
+        match self {
+            Self::F16(v) => v.len(),
+            Self::F32(v) => v.len(),
+            Self::U32(v) => v.len(),
+        }
+    }
+    fn sample_type(&self) -> SampleType {
+        match self {
+            Self::F16(_) => SampleType::F16,
+            Self::F32(_) => SampleType::F32,
+            Self::U32(_) => SampleType::U32,
         }
     }
     fn split_at(self, n: usize) -> (Self, Self) {
@@ -943,15 +1459,18 @@ impl<'a> PlaneMut<'a> {
     }
 }
 
-/// One band of output rows and the chunks that fill it.
+/// Output rows and the chunks that fill them: a row band of a level, or
+/// one chunk's own rectangle (the chunk API).
 struct Task<'a> {
-    /// First line (absolute y) of the band.
+    /// First line (absolute y) of the planes' row 0.
     y0: i32,
+    /// First pixel column (absolute x) of the planes' column 0.
+    x0: i32,
     chunks: Vec<usize>,
-    /// Per channel: the band's rows of that channel's plane.
-    planes: Vec<PlaneMut<'a>>,
-    /// Per channel: plane width in samples.
-    widths: Vec<usize>,
+    /// Per channel: the rows of that channel's plane (`None`: skipped).
+    planes: Vec<Option<PlaneMut<'a>>>,
+    /// Per channel: samples from one plane row to the next.
+    strides: Vec<usize>,
 }
 
 /// Little-endian 16-bit samples from bytes.
@@ -1002,52 +1521,111 @@ fn put32_words(dst: &mut [u32], src: &[u16]) {
 }
 
 /// Source of one row segment.
+#[derive(Clone, Copy)]
 enum Seg<'s> {
     Bytes(&'s [u8]),
     Halves(&'s [u8], &'s [u8]),
     Words(&'s [u16]),
 }
 
-fn put_row(dst: &mut PlaneMut<'_>, start: usize, n: usize, seg: Seg<'_>) {
-    match (dst, seg) {
-        (PlaneMut::F16(v), Seg::Bytes(s)) => put16(&mut v[start..start + n], s),
-        (PlaneMut::F16(v), Seg::Halves(a, b)) => put16_halves(&mut v[start..start + n], a, b),
-        (PlaneMut::F16(v), Seg::Words(w)) => v[start..start + n].copy_from_slice(&w[..n]),
-        (PlaneMut::U32(v), Seg::Bytes(s)) => put32(&mut v[start..start + n], s),
-        (PlaneMut::U32(v), Seg::Halves(a, b)) => put32_halves(&mut v[start..start + n], a, b),
-        (PlaneMut::U32(v), Seg::Words(w)) => put32_words(&mut v[start..start + n], w),
-        (PlaneMut::F32(v), Seg::Bytes(s)) => put32f(&mut v[start..start + n], s),
-        (PlaneMut::F32(v), Seg::Halves(a, b)) => {
-            for ((d, x), y) in v[start..start + n]
-                .iter_mut()
-                .zip(a.chunks_exact(2))
-                .zip(b.chunks_exact(2))
-            {
-                *d = f32::from_le_bytes([x[0], y[0], x[1], y[1]]);
-            }
-        }
-        (PlaneMut::F32(v), Seg::Words(w)) => {
-            for (d, s) in v[start..start + n].iter_mut().zip(w.chunks_exact(2)) {
-                *d = f32::from_bits(u32::from(s[0]) | (u32::from(s[1]) << 16));
-            }
+/// A row of 16-bit samples into `dst` (all of it).
+#[inline]
+fn seg16(dst: &mut [u16], seg: Seg<'_>) {
+    match seg {
+        Seg::Bytes(s) => put16(dst, s),
+        Seg::Halves(a, b) => put16_halves(dst, a, b),
+        Seg::Words(w) => dst.copy_from_slice(&w[..dst.len()]),
+    }
+}
+
+/// A row of 32-bit samples into `dst` (all of it).
+#[inline]
+fn seg32(dst: &mut [u32], seg: Seg<'_>) {
+    match seg {
+        Seg::Bytes(s) => put32(dst, s),
+        Seg::Halves(a, b) => put32_halves(dst, a, b),
+        Seg::Words(w) => put32_words(dst, w),
+    }
+}
+
+/// `out[i] = f16_to_f32(h[i])`. The SIMD twin converts whole NaN-free groups
+/// of 8 (identical results there: both conversions are exact); the scalar
+/// code, its oracle, takes a declined group and the tail, handing back to
+/// the twin at the next group boundary.
+fn halves_to_f32(isa: crate::simd::Isa, h: &[u16], out: &mut [f32]) {
+    let n = h.len();
+    let mut i = crate::simd::dwa_f32(isa, h, out);
+    while i < n {
+        out[i] = crate::half::f16_to_f32(h[i]);
+        i += 1;
+        if i % 8 == 0 && i + 8 <= n {
+            i += crate::simd::dwa_f32(isa, &h[i..], &mut out[i..]);
         }
     }
 }
 
-/// Per channel of a chunk: plane width, the chunk's first column, and the
-/// band row index of the chunk's first sampled line.
-fn chunk_cols(
-    info: &PartInfo,
-    geom: &BlockGeom<'_>,
-    x0: i32,
-    task: &Task<'_>,
-) -> Vec<(usize, usize, usize)> {
-    let dw = info.data_window;
+/// One row of `n` samples of a `src` channel into a plane at `start`.
+fn put_row(
+    dst: &mut PlaneMut<'_>,
+    start: usize,
+    n: usize,
+    src: SampleType,
+    seg: Seg<'_>,
+    rows: &mut RowBuf,
+) {
+    match (dst, src) {
+        (PlaneMut::F16(v), SampleType::F16) => seg16(&mut v[start..start + n], seg),
+        (PlaneMut::U32(v), SampleType::U32) => seg32(&mut v[start..start + n], seg),
+        (PlaneMut::F32(v), SampleType::F32) => match seg {
+            Seg::Bytes(s) => put32f(&mut v[start..start + n], s),
+            Seg::Halves(a, b) => {
+                for ((d, x), y) in v[start..start + n]
+                    .iter_mut()
+                    .zip(a.chunks_exact(2))
+                    .zip(b.chunks_exact(2))
+                {
+                    *d = f32::from_le_bytes([x[0], y[0], x[1], y[1]]);
+                }
+            }
+            Seg::Words(w) => {
+                for (d, s) in v[start..start + n].iter_mut().zip(w.chunks_exact(2)) {
+                    *d = f32::from_bits(u32::from(s[0]) | (u32::from(s[1]) << 16));
+                }
+            }
+        },
+        // Conversions: the row is gathered into an L1-sized buffer, then
+        // converted into the plane.
+        (PlaneMut::F32(v), SampleType::F16) => {
+            let h = compression::grow(&mut rows.h, n);
+            seg16(h, seg);
+            halves_to_f32(crate::simd::isa(), h, &mut v[start..start + n]);
+        }
+        (PlaneMut::F32(v), SampleType::U32) => {
+            let u = compression::grow(&mut rows.w, n);
+            seg32(u, seg);
+            for (d, &s) in v[start..start + n].iter_mut().zip(&*u) {
+                *d = s as f32;
+            }
+        }
+        (PlaneMut::F16(v), SampleType::F32) => {
+            let u = compression::grow(&mut rows.w, n);
+            seg32(u, seg);
+            for (d, &s) in v[start..start + n].iter_mut().zip(&*u) {
+                *d = crate::half::f32_to_f16(f32::from_bits(s));
+            }
+        }
+        _ => unreachable!("sink types are checked before decoding"),
+    }
+}
+
+/// Per channel of a chunk: plane stride, the chunk's first column, and the
+/// task row index of the chunk's first sampled line.
+fn chunk_cols(geom: &BlockGeom<'_>, x0: i32, task: &Task<'_>) -> Vec<(usize, usize, usize)> {
     let mut cols = Vec::with_capacity(geom.chans.len());
     for (c, g) in geom.chans.iter().enumerate() {
         let col = count_sampled(
-            dw.x_min,
-            (i64::from(x0) - i64::from(dw.x_min)) as usize,
+            task.x0,
+            (i64::from(x0) - i64::from(task.x0)) as usize,
             g.x_sampling,
         );
         let row0 = count_sampled(
@@ -1055,21 +1633,20 @@ fn chunk_cols(
             (i64::from(geom.y0) - i64::from(task.y0)) as usize,
             g.y_sampling,
         );
-        let pw = task.widths[c];
-        cols.push((pw, col, row0));
+        cols.push((task.strides[c], col, row0));
     }
     cols
 }
 
-/// Copy a decompressed chunk into a band's planes.
+/// Copy a decompressed chunk into a task's planes.
 fn place(
-    info: &PartInfo,
     geom: &BlockGeom<'_>,
     x0: i32,
     task: &mut Task<'_>,
     layout: &compression::Layout<'_>,
+    rows_buf: &mut RowBuf,
 ) {
-    let cols = chunk_cols(info, geom, x0, task);
+    let cols = chunk_cols(geom, x0, task);
     match *layout {
         compression::Layout::Raw(_) | compression::Layout::Halves(_) => {
             let (raw, half) = match *layout {
@@ -1090,13 +1667,15 @@ fn place(
                     let (pw, col, row0) = cols[c];
                     let start = (row0 + rows[c]) * pw + col;
                     rows[c] += 1;
-                    let seg = if half == 0 {
-                        Seg::Bytes(&raw[off..off + nb])
-                    } else {
-                        let h = off / 2;
-                        Seg::Halves(&raw[h..h + nb / 2], &raw[half + h..half + h + nb / 2])
-                    };
-                    put_row(&mut task.planes[c], start, n, seg);
+                    if let Some(plane) = &mut task.planes[c] {
+                        let seg = if half == 0 {
+                            Seg::Bytes(&raw[off..off + nb])
+                        } else {
+                            let h = off / 2;
+                            Seg::Halves(&raw[h..h + nb / 2], &raw[half + h..half + h + nb / 2])
+                        };
+                        put_row(plane, start, n, g.ty, seg, rows_buf);
+                    }
                     off += nb;
                 }
             }
@@ -1106,13 +1685,19 @@ fn place(
             for (c, g) in geom.chans.iter().enumerate() {
                 let (pw, col, row0) = cols[c];
                 let rb = g.row_bytes();
+                let Some(plane) = &mut task.planes[c] else {
+                    off += rb * g.height;
+                    continue;
+                };
                 for r in 0..g.height {
                     let start = (row0 + r) * pw + col;
                     put_row(
-                        &mut task.planes[c],
+                        plane,
                         start,
                         g.width,
+                        g.ty,
                         Seg::Bytes(&bytes[off..off + rb]),
+                        rows_buf,
                     );
                     off += rb;
                 }
@@ -1123,18 +1708,24 @@ fn place(
             for (c, g) in geom.chans.iter().enumerate() {
                 let (pw, col, row0) = cols[c];
                 let rw = g.width * g.ty.bytes() / 2;
-                if placed.get(c) == Some(&true) {
-                    // Already decoded into the band's rows.
+                let plane = match &mut task.planes[c] {
+                    // Already decoded into the output rows, or not wanted.
+                    _ if placed.get(c) == Some(&true) => None,
+                    p => p.as_mut(),
+                };
+                let Some(plane) = plane else {
                     off += rw * g.height;
                     continue;
-                }
+                };
                 for r in 0..g.height {
                     let start = (row0 + r) * pw + col;
                     put_row(
-                        &mut task.planes[c],
+                        plane,
                         start,
                         g.width,
+                        g.ty,
                         Seg::Words(&words[off..off + rw]),
+                        rows_buf,
                     );
                     off += rw;
                 }

@@ -91,6 +91,154 @@ impl Channel {
     }
 }
 
+/// Borrowed samples: a view of a caller's plane, for [`crate::encode_ref`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SamplesRef<'a> {
+    /// Half floats as raw bit patterns.
+    F16(&'a [u16]),
+    F32(&'a [f32]),
+    U32(&'a [u32]),
+}
+
+impl SamplesRef<'_> {
+    /// Number of samples.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::F16(v) => v.len(),
+            Self::F32(v) => v.len(),
+            Self::U32(v) => v.len(),
+        }
+    }
+
+    /// True when empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Sample type.
+    #[must_use]
+    pub fn sample_type(&self) -> SampleType {
+        match self {
+            Self::F16(_) => SampleType::F16,
+            Self::F32(_) => SampleType::F32,
+            Self::U32(_) => SampleType::U32,
+        }
+    }
+}
+
+impl<'a> From<&'a Samples> for SamplesRef<'a> {
+    fn from(s: &'a Samples) -> Self {
+        match s {
+            Samples::F16(v) => Self::F16(v),
+            Samples::F32(v) => Self::F32(v),
+            Samples::U32(v) => Self::U32(v),
+        }
+    }
+}
+
+/// A channel whose samples are borrowed (see [`ImageRef`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelRef<'a> {
+    pub desc: ChannelDesc,
+    /// Samples per row (data-window width divided by x sampling).
+    pub width: usize,
+    /// Sample rows.
+    pub height: usize,
+    pub samples: SamplesRef<'a>,
+}
+
+impl<'a> ChannelRef<'a> {
+    /// A full-resolution channel over borrowed samples. `samples.len()`
+    /// must be `width * height`.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        width: usize,
+        height: usize,
+        samples: SamplesRef<'a>,
+    ) -> Self {
+        Self {
+            desc: ChannelDesc::new(name, samples.sample_type()),
+            width,
+            height,
+            samples,
+        }
+    }
+}
+
+impl<'a> From<&'a Channel> for ChannelRef<'a> {
+    fn from(c: &'a Channel) -> Self {
+        Self {
+            desc: c.desc.clone(),
+            width: c.width,
+            height: c.height,
+            samples: SamplesRef::from(&c.samples),
+        }
+    }
+}
+
+/// An image to encode whose channel planes the caller keeps: the borrowed
+/// twin of [`Image`] for [`crate::encode_ref`], so writing a file needs no
+/// copy of the planes. [`crate::encode_ref`] writes the same bytes as
+/// [`crate::encode`] of an [`Image`] holding the same samples.
+///
+/// ```no_run
+/// use rusty_exr::{EncodeOptions, ImageRef, SamplesRef};
+/// let (w, h) = (1920u32, 1080u32);
+/// let r = vec![0.5f32; (w * h) as usize];
+/// let (g, b) = (r.clone(), r.clone());
+/// let image = ImageRef::new(w, h)
+///     .with_channel("R", SamplesRef::F32(&r))
+///     .with_channel("G", SamplesRef::F32(&g))
+///     .with_channel("B", SamplesRef::F32(&b));
+/// let bytes = rusty_exr::encode_ref(&image, &EncodeOptions::default()).unwrap();
+/// # let _ = bytes;
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageRef<'a> {
+    /// Header attributes (as for [`Image::header`]).
+    pub header: Header,
+    pub data_window: Box2i,
+    /// Channels in any order (the writer sorts them by name).
+    pub channels: Vec<ChannelRef<'a>>,
+}
+
+impl<'a> ImageRef<'a> {
+    /// An empty `width` x `height` image (data and display window at the
+    /// origin) to add channels to.
+    #[must_use]
+    pub fn new(width: u32, height: u32) -> Self {
+        let image = Image::new(width, height);
+        Self {
+            header: image.header,
+            data_window: image.data_window,
+            channels: Vec::new(),
+        }
+    }
+
+    /// Add a full-resolution channel over borrowed samples (builder style).
+    #[must_use]
+    pub fn with_channel(mut self, name: impl Into<String>, samples: SamplesRef<'a>) -> Self {
+        let (w, h) = (self.width(), self.height());
+        self.channels.push(ChannelRef::new(name, w, h, samples));
+        self
+    }
+
+    /// Data-window width.
+    #[must_use]
+    pub fn width(&self) -> usize {
+        self.data_window.width().max(0) as usize
+    }
+
+    /// Data-window height.
+    #[must_use]
+    pub fn height(&self) -> usize {
+        self.data_window.height().max(0) as usize
+    }
+}
+
 /// One part (or one level of a tiled part), decoded.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Image {
