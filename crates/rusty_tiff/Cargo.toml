@@ -34,7 +34,11 @@ bytemuck = "1"
 # inflate onto the end of the image, so that was a memset of the rest of the
 # image per strip (1024 one-row strips of a 1536x1024 RGB image: 101 ms
 # against 26 ms to inflate them; the `tiff` crate took 30 ms).
-flate2 = { version = "1.1.11", default-features = false, features = ["zlib-rs"] }
+# `runtime_detection` is what turns on zlib-rs's `std` feature, and zlib-rs only
+# compiles its runtime CPU detection under `std`: without it the AVX2 inflate
+# loop and window copies never run (output is identical, so no test notices,
+# and a workspace that pulls flate2 with default features masks it).
+flate2 = { version = "1.1.11", default-features = false, features = ["zlib-rs", "runtime_detection"] }
 rusty_jpeg = { version = "0.4.12", optional = true }
 
 [dev-dependencies]
