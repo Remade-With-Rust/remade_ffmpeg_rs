@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_exr-v0.2.1...rusty_exr-v0.2.2) - 2026-11-28
+
+### Other
+
+- *(exr)* DWA decode faster than OpenEXR 3.5.5 single-threaded, byte-identical to 0.2.1 (-29..-39% Ir, 0.77-0.88x OpenEXR wall) ([#249](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/249))
+
 ## [0.2.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_exr-v0.2.0...rusty_exr-v0.2.1) - 2026-11-27
 
 ### Other

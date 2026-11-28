@@ -128,7 +128,7 @@ rusty_mp3 = { path = "crates/rusty_mp3", version = "1.2.2" }
 rusty_aac = { path = "crates/rusty_aac", version = "2.3.0" }
 # exr: our own rusty_exr, pure-Rust OpenEXR decode + encode (wrapped by
 # rff-codec-exr / rff-format-exr).
-rusty_exr = { path = "crates/rusty_exr", version = "0.2.1" }
+rusty_exr = { path = "crates/rusty_exr", version = "0.2.2" }
 rusty_vorbis = { path = "crates/rusty_vorbis", version = "0.1.5" }
 # jpeg: our own rusty_jpeg, from crates.io (the vendored copy is gone: one
 # repository publishes it — github.com/Remade-With-Rust/rusty_jpeg).
