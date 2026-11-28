@@ -256,6 +256,46 @@ pub(crate) fn rgba_f16(
 }
 
 // ---------------------------------------------------------------------------
+// DWA decode: lossy FLOAT channels (halves to float words).
+
+/// `words[2 i]`, `words[2 i + 1]` = low and high 16 bits of
+/// `dwa::imath_h2f_bits(halves[i])`, for a prefix of whole 8-sample groups
+/// whose halves are all non-NaN (Imath keeps a NaN's payload unquieted; the
+/// hardware conversion would quiet it). Returns the number of samples done;
+/// the caller finishes from there with the scalar code. `words` holds at
+/// least `2 * halves.len()` words.
+pub(crate) fn dwa_f32_words(isa: Isa, halves: &[u16], words: &mut [u16]) -> usize {
+    assert!(words.len() >= 2 * halves.len());
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SSE2 is part of x86-64; `words` holds 2 * halves.len()
+        // u16 (checked above), the same bytes as halves.len() floats, and
+        // the kernel stores unaligned.
+        Isa::Sse2 => unsafe { x86::dwa_f32_sse2(halves, words.as_mut_ptr().cast()) },
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: as above, and AVX2 + F16C were detected.
+        Isa::Avx2 => unsafe { x86::dwa_f32_avx2(halves, words.as_mut_ptr().cast()) },
+        _ => 0,
+    }
+}
+
+/// [`dwa_f32_words`] into floats: `out[i] = f32::from_bits(
+/// dwa::imath_h2f_bits(halves[i]))` for the same NaN-free prefix of whole
+/// 8-sample groups. `out` holds at least `halves.len()` floats.
+pub(crate) fn dwa_f32(isa: Isa, halves: &[u16], out: &mut [f32]) -> usize {
+    assert!(out.len() >= halves.len());
+    match isa {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SSE2 is part of x86-64; length checked above.
+        Isa::Sse2 => unsafe { x86::dwa_f32_sse2(halves, out.as_mut_ptr()) },
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: as above, and AVX2 + F16C were detected.
+        Isa::Avx2 => unsafe { x86::dwa_f32_avx2(halves, out.as_mut_ptr()) },
+        _ => 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DWA encode: block load (+ colour transform) and coefficient rounding.
 
 /// Load an 8x8 block of each component in `comps` (1 or 3; rows start at
@@ -814,14 +854,65 @@ mod x86 {
         }
     }
 
+    /// [`row_pass`] on two consecutive rows at once (`r[0..8]` and
+    /// `r[8..16]`), one per 128-bit lane: every in-lane operation is the
+    /// 128-bit pass's own, so the results are identical. Returns the two
+    /// rows' outputs, each as one 256-bit vector (outputs 0..8).
+    #[inline]
+    #[target_feature(enable = "avx2,f16c")]
+    unsafe fn row_pass2(r: *const f32) -> (__m256, __m256) {
+        let lo = _mm256_set_m128(_mm_loadu_ps(r.add(8)), _mm_loadu_ps(r));
+        let hi = _mm256_set_m128(_mm_loadu_ps(r.add(12)), _mm_loadu_ps(r.add(4)));
+        let both = |v: &[f32; 4]| {
+            let x = _mm_loadu_ps(v.as_ptr());
+            _mm256_set_m128(x, x)
+        };
+        let (m0, m1, m2, m3) = (both(&M1[0]), both(&M1[1]), both(&M1[2]), both(&M1[3]));
+        let (n0, n1, n2, n3) = (both(&M2[0]), both(&M2[1]), both(&M2[2]), both(&M2[3]));
+        let e = _mm256_add_ps(
+            _mm256_add_ps(
+                _mm256_mul_ps(_mm256_shuffle_ps::<0x00>(lo, lo), m0),
+                _mm256_mul_ps(_mm256_shuffle_ps::<0xaa>(lo, lo), m1),
+            ),
+            _mm256_add_ps(
+                _mm256_mul_ps(_mm256_shuffle_ps::<0x00>(hi, hi), m2),
+                _mm256_mul_ps(_mm256_shuffle_ps::<0xaa>(hi, hi), m3),
+            ),
+        );
+        let o = _mm256_add_ps(
+            _mm256_add_ps(
+                _mm256_mul_ps(_mm256_shuffle_ps::<0x55>(lo, lo), n0),
+                _mm256_mul_ps(_mm256_shuffle_ps::<0xff>(lo, lo), n1),
+            ),
+            _mm256_add_ps(
+                _mm256_mul_ps(_mm256_shuffle_ps::<0x55>(hi, hi), n2),
+                _mm256_mul_ps(_mm256_shuffle_ps::<0xff>(hi, hi), n3),
+            ),
+        );
+        let s = _mm256_add_ps(e, o);
+        let d = _mm256_sub_ps(e, o);
+        let dr = _mm256_shuffle_ps::<0x1b>(d, d);
+        (
+            _mm256_permute2f128_ps::<0x20>(s, dr),
+            _mm256_permute2f128_ps::<0x31>(s, dr),
+        )
+    }
+
     #[inline]
     #[target_feature(enable = "avx2,f16c")]
     unsafe fn idct_avx2(d: &mut [f32; 64], zr: usize) {
         let present = 8 - zr;
         let mut rows = [_mm256_setzero_ps(); 8];
-        for i in 0..present {
-            let (lo, hi) = row_pass(d.as_ptr().add(i * 8));
-            rows[i] = _mm256_set_m128(hi, lo);
+        // Row pairs at full width (a row past `present` is zero input and
+        // never read by the column pass); a lone first row (zr == 7) on the
+        // 128-bit pass.
+        if present == 1 {
+            let (lo, hi) = row_pass(d.as_ptr());
+            rows[0] = _mm256_set_m128(hi, lo);
+        } else {
+            for i in (0..present).step_by(2) {
+                (rows[i], rows[i + 1]) = row_pass2(d.as_ptr().add(i * 8));
+            }
         }
         let p = d.as_mut_ptr();
         if zr == 7 {
@@ -1227,6 +1318,45 @@ mod x86 {
             out[4 * i + 2] = crate::half::f16_to_f32(b[i]);
             out[4 * i + 3] = a.map_or(1.0, |a| crate::half::f16_to_f32(a[i]));
         }
+    }
+
+    /// True when any of the 8 halves in `v` is a NaN.
+    #[inline(always)]
+    unsafe fn any_nan8(v: __m128i) -> bool {
+        // |h| > 0x7c00 (as signed 16-bit: |h| <= 0x7fff).
+        let a = _mm_and_si128(v, _mm_set1_epi16(0x7fff));
+        _mm_movemask_epi8(_mm_cmpgt_epi16(a, _mm_set1_epi16(0x7c00))) != 0
+    }
+
+    /// `o` must be valid for `h.len()` unaligned f32 stores.
+    pub(super) unsafe fn dwa_f32_sse2(h: &[u16], o: *mut f32) -> usize {
+        let z = _mm_setzero_si128();
+        let mut i = 0;
+        while i + 8 <= h.len() {
+            let v = _mm_loadu_si128(h.as_ptr().add(i).cast());
+            if any_nan8(v) {
+                break;
+            }
+            _mm_storeu_ps(o.add(i), h2f4(_mm_unpacklo_epi16(v, z)));
+            _mm_storeu_ps(o.add(i + 4), h2f4(_mm_unpackhi_epi16(v, z)));
+            i += 8;
+        }
+        i
+    }
+
+    /// `o` must be valid for `h.len()` unaligned f32 stores.
+    #[target_feature(enable = "avx2,f16c")]
+    pub(super) unsafe fn dwa_f32_avx2(h: &[u16], o: *mut f32) -> usize {
+        let mut i = 0;
+        while i + 8 <= h.len() {
+            let v = _mm_loadu_si128(h.as_ptr().add(i).cast());
+            if any_nan8(v) {
+                break;
+            }
+            _mm256_storeu_ps(o.add(i), _mm256_cvtph_ps(v));
+            i += 8;
+        }
+        i
     }
 
     pub(super) unsafe fn rgba_f16_sse2(

@@ -10,6 +10,7 @@ const MAX_RUN: usize = 127;
 /// Decode run-length tokens into exactly `out_len` bytes. A signed count
 /// byte `n < 0` is followed by `-n` literal bytes; `n >= 0` by one byte
 /// repeated `n + 1` times.
+#[cfg(test)]
 pub(crate) fn unpack(src: &[u8], out_len: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     unpack_into(src, out_len, &mut out)?;
@@ -18,42 +19,91 @@ pub(crate) fn unpack(src: &[u8], out_len: usize) -> Result<Vec<u8>> {
 
 /// [`unpack`] into a reused buffer.
 pub(crate) fn unpack_into(src: &[u8], out_len: usize, out: &mut Vec<u8>) -> Result<()> {
-    out.clear();
-    out.reserve_exact(out_len);
+    // Every byte is written on success (checked below), so a reused
+    // buffer is not re-zeroed.
+    if out.len() > out_len {
+        out.truncate(out_len);
+    } else {
+        out.resize(out_len, 0);
+    }
+    let n = unpack_slice(src, out)?;
+    if n != out_len {
+        return Err(Error::invalid(format!(
+            "RLE data decodes to {n} bytes, expected {out_len}"
+        )));
+    }
+    Ok(())
+}
+
+/// Decode run-length tokens into the front of `out`, returning how many
+/// bytes they produced. Errors (in the same order and with the same text as
+/// a growing-`Vec` decoder) when a run would pass the end of `src` or of
+/// `out`. Writing into a sized slice keeps the per-token work to one bounds
+/// check and one copy or fill (a `Vec` re-checked its length and capacity
+/// for every token).
+fn unpack_slice(src: &[u8], out: &mut [u8]) -> Result<usize> {
     let mut i = 0;
+    let mut o = 0;
+    // Fast loop while a whole 128-byte window fits after the count byte in
+    // `src` and at the write position in `out`: a token decodes to at most
+    // 128 bytes, so it is copied or filled in whole 16-byte blocks without
+    // any check (a call to `memcpy`/`memset` per short token was most of
+    // the cost). The bytes a block writes past the token's end are before
+    // `out`'s end and are overwritten by the tokens that follow; a stream
+    // that stops short is an error, so they are never returned.
+    while i + 129 <= src.len() && o + 128 <= out.len() {
+        let n = src[i] as i8;
+        let s: &[u8; 128] = src[i + 1..i + 129].try_into().expect("128 bytes");
+        let d: &mut [u8; 128] = (&mut out[o..o + 128]).try_into().expect("128 bytes");
+        if n < 0 {
+            let n = usize::from(n.unsigned_abs());
+            for (dc, sc) in d
+                .chunks_exact_mut(16)
+                .zip(s.chunks_exact(16))
+                .take(n.div_ceil(16))
+            {
+                dc.copy_from_slice(sc);
+            }
+            i += 1 + n;
+            o += n;
+        } else {
+            let n = n as usize + 1;
+            let v = [s[0]; 16];
+            for dc in d.chunks_exact_mut(16).take(n.div_ceil(16)) {
+                dc.copy_from_slice(&v);
+            }
+            i += 2;
+            o += n;
+        }
+    }
     while i < src.len() {
         let n = src[i] as i8;
         i += 1;
         if n < 0 {
             let n = usize::from(n.unsigned_abs());
-            if i + n > src.len() {
+            let Some(lit) = src.get(i..i + n) else {
                 return Err(Error::invalid("RLE literal run past end of data"));
-            }
-            if out.len() + n > out_len {
+            };
+            let Some(d) = out.get_mut(o..o + n) else {
                 return Err(Error::invalid("RLE data decodes past its size"));
-            }
-            out.extend_from_slice(&src[i..i + n]);
+            };
+            d.copy_from_slice(lit);
             i += n;
+            o += n;
         } else {
             let n = n as usize + 1;
-            if i >= src.len() {
+            let Some(&v) = src.get(i) else {
                 return Err(Error::invalid("RLE repeat run past end of data"));
-            }
-            if out.len() + n > out_len {
+            };
+            let Some(d) = out.get_mut(o..o + n) else {
                 return Err(Error::invalid("RLE data decodes past its size"));
-            }
-            let v = src[i];
+            };
             i += 1;
-            out.resize(out.len() + n, v);
+            d.fill(v);
+            o += n;
         }
     }
-    if out.len() != out_len {
-        return Err(Error::invalid(format!(
-            "RLE data decodes to {} bytes, expected {out_len}",
-            out.len()
-        )));
-    }
-    Ok(())
+    Ok(o)
 }
 
 /// Encode bytes as run-length tokens (byte-identical to OpenEXR's and the
@@ -180,6 +230,89 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// The growing-`Vec` decoder `unpack_into` replaced: the oracle.
+    fn unpack_reference(src: &[u8], out_len: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < src.len() {
+            let n = src[i] as i8;
+            i += 1;
+            if n < 0 {
+                let n = usize::from(n.unsigned_abs());
+                if i + n > src.len() {
+                    return Err(Error::invalid("RLE literal run past end of data"));
+                }
+                if out.len() + n > out_len {
+                    return Err(Error::invalid("RLE data decodes past its size"));
+                }
+                out.extend_from_slice(&src[i..i + n]);
+                i += n;
+            } else {
+                let n = n as usize + 1;
+                if i >= src.len() {
+                    return Err(Error::invalid("RLE repeat run past end of data"));
+                }
+                if out.len() + n > out_len {
+                    return Err(Error::invalid("RLE data decodes past its size"));
+                }
+                let v = src[i];
+                i += 1;
+                out.resize(out.len() + n, v);
+            }
+        }
+        if out.len() != out_len {
+            return Err(Error::invalid(format!(
+                "RLE data decodes to {} bytes, expected {out_len}",
+                out.len()
+            )));
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn unpack_matches_reference_on_damaged_streams() {
+        let mut seed = 0x1234_5678u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for case in 0..4000 {
+            let len = (next() % 600) as usize;
+            let data: Vec<u8> = (0..len)
+                .map(|i| {
+                    if next() % 3 == 0 {
+                        (i / 7) as u8
+                    } else {
+                        next() as u8
+                    }
+                })
+                .collect();
+            let mut p = pack(&data);
+            // Damage: flip, truncate or extend some streams.
+            match case % 4 {
+                1 if !p.is_empty() => {
+                    let k = next() as usize % p.len();
+                    p[k] ^= 1 << (next() % 8);
+                }
+                2 => p.truncate(next() as usize % (p.len() + 1)),
+                3 => p.push(next() as u8),
+                _ => {}
+            }
+            for want in [len, len.saturating_sub(1), len + 3] {
+                let mut out = vec![9u8; 5];
+                let got = unpack_into(&p, want, &mut out).map(|()| out);
+                let refr = unpack_reference(&p, want);
+                assert_eq!(
+                    format!("{got:?}"),
+                    format!("{refr:?}"),
+                    "case {case} want {want}"
+                );
             }
         }
     }

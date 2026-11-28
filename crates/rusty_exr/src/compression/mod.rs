@@ -158,6 +158,7 @@ pub(crate) struct Scratch {
     pub w: Vec<u16>,
     pub lut: Vec<u16>,
     pub huf: huffman::HufScratch,
+    pub dwa: dwa::DwaScratch,
     inflater: Option<flate2::Decompress>,
 }
 
@@ -171,8 +172,10 @@ pub(crate) enum Layout<'s> {
     /// Channel-planar little-endian bytes (each channel's rows contiguous,
     /// channels in list order).
     Planar(&'s [u8]),
-    /// Channel-planar 16-bit words (32-bit samples as low, high pairs).
-    PlanarU16(&'s [u16]),
+    /// Channel-planar 16-bit words (32-bit samples as low, high pairs),
+    /// and per channel whether the decoder already wrote it to the output
+    /// (its words are then not valid; empty when none was).
+    PlanarU16(&'s [u16], &'s [bool]),
 }
 
 /// Inflate a zlib stream into `out`, which ends up exactly `n` bytes long.
@@ -215,6 +218,36 @@ impl Scratch {
     }
 }
 
+/// [`inflate_exact`] with the worker's reused inflater, into the first `n`
+/// bytes of `out` (grown, never re-zeroed: every byte is written on
+/// success). Same checks and error text as [`inflate_exact`].
+pub(crate) fn inflate_exact_reuse(
+    inflater: &mut Option<flate2::Decompress>,
+    src: &[u8],
+    out: &mut Vec<u8>,
+    n: usize,
+) -> Result<()> {
+    let d = match inflater {
+        Some(d) => {
+            d.reset(true);
+            d
+        }
+        None => inflater.insert(flate2::Decompress::new(true)),
+    };
+    let out = grow(out, n);
+    let status = d
+        .decompress(src, out, flate2::FlushDecompress::Finish)
+        .map_err(|e| Error::invalid(format!("zlib data: {e}")))?;
+    if status != flate2::Status::StreamEnd || d.total_out() != n as u64 {
+        return Err(Error::invalid(format!(
+            "zlib data inflates to {} bytes, expected {}",
+            d.total_out(),
+            n
+        )));
+    }
+    Ok(())
+}
+
 /// Inflate a zlib stream into exactly `out.len()` bytes.
 pub(crate) fn inflate_exact(src: &[u8], out: &mut [u8]) -> Result<()> {
     let mut d = flate2::Decompress::new(true);
@@ -255,13 +288,23 @@ pub(crate) fn deflate(data: &[u8], deflater: crate::Deflate) -> Vec<u8> {
     }
 }
 
+/// One channel's output rows for a chunk (whole plane rows, row-major).
+pub(crate) enum Direct<'a> {
+    F16(&'a mut [u16]),
+    F32(&'a mut [f32]),
+}
+
 /// Decompress one chunk, leaving the result in `data` or `scratch`.
+/// `direct` may hold, per channel, the output rows the chunk covers; a
+/// decoder that can write a channel there does so and flags it in the
+/// layout (DWA: HALF and FLOAT lossy channels). Empty: none.
 pub(crate) fn decompress_layout<'a>(
     compression: Compression,
     geom: &BlockGeom<'_>,
     data: &'a [u8],
     max_chunk_bytes: u64,
     scratch: &'a mut Scratch,
+    direct: &mut [Option<Direct<'_>>],
 ) -> Result<Layout<'a>> {
     if geom.raw_size as u64 > max_chunk_bytes {
         return Err(Error::limit(format!("chunk of {} bytes", geom.raw_size)));
@@ -290,7 +333,7 @@ pub(crate) fn decompress_layout<'a>(
         }
         Compression::Piz => {
             piz::decompress(geom, data, scratch)?;
-            Ok(Layout::PlanarU16(&scratch.w))
+            Ok(Layout::PlanarU16(&scratch.w, &[]))
         }
         Compression::Pxr24 => {
             pxr24::decompress(geom, data, scratch)?;
@@ -302,8 +345,11 @@ pub(crate) fn decompress_layout<'a>(
             Ok(Layout::Planar(&scratch.a[..geom.raw_size]))
         }
         Compression::Dwaa | Compression::Dwab => {
-            scratch.a = dwa::decompress(geom, data)?;
-            Ok(Layout::Planar(&scratch.a))
+            dwa::decompress(geom, data, scratch, direct)?;
+            Ok(Layout::PlanarU16(
+                &scratch.w[..geom.raw_size / 2],
+                &scratch.dwa.placed,
+            ))
         }
     }
 }
@@ -317,7 +363,14 @@ pub(crate) fn decompress(
 ) -> Result<Vec<u8>> {
     let mut scratch = Scratch::default();
     Ok(
-        match decompress_layout(compression, geom, data, max_chunk_bytes, &mut scratch)? {
+        match decompress_layout(
+            compression,
+            geom,
+            data,
+            max_chunk_bytes,
+            &mut scratch,
+            &mut [],
+        )? {
             Layout::Raw(r) => r.to_vec(),
             Layout::Halves(h) => {
                 let mut out = vec![0u8; h.len()];
@@ -325,7 +378,7 @@ pub(crate) fn decompress(
                 out
             }
             Layout::Planar(p) => geom.planar_to_raw(p),
-            Layout::PlanarU16(w) => {
+            Layout::PlanarU16(w, _) => {
                 let bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
                 geom.planar_to_raw(&bytes)
             }

@@ -158,6 +158,55 @@ pub(crate) struct HufScratch {
     codes: Vec<(u32, u64)>,
     short: Vec<u32>,
     syms: Vec<u32>,
+    pair: Vec<u64>,
+}
+
+/// Index bits of the fast loop's pair table.
+const PAIR_BITS: u32 = 12;
+const PAIR_SIZE: usize = 1 << PAIR_BITS;
+/// Pair-table entry kinds (bits 8..10 of an entry): the number of codes.
+const ONE: u64 = 1;
+const TWO: u64 = 2;
+
+/// The fast loop's table, indexed by the next `PAIR_BITS` bits: every
+/// prefix that holds a whole code, or two whole codes, of the stream. An
+/// entry is `bits | kind << 8 | s1 << 16 | s2 << 32`, where `bits` is how
+/// many bits the entry consumes (0: not decodable here, use the short
+/// table) and `kind` is [`ONE`] or [`TWO`] (`s1` then `s2`). The run code
+/// (whose 8-bit count follows) gets no entry: the short-table step handles
+/// it, so the fast path tests `bits` alone. Neither symbol is the run code,
+/// so both fit 16 bits. Codes are found by looking the prefix up
+/// in the short table, zero-padded: a code of `l <= PAIR_BITS` bits is
+/// decided by its first `l` bits, so the padding never changes it.
+///
+/// One lookup in this 32 KiB table decodes about 1.6 symbols of DWA's AC
+/// stream, and it stays in L1 where the 64 KiB short table did not.
+fn build_pair_table(short: &[u32; DEC_SIZE], rlc: u32, pair: &mut Vec<u64>) {
+    const PAD: u32 = DEC_BITS - PAIR_BITS;
+    pair.clear();
+    pair.resize(PAIR_SIZE, 0);
+    for (idx, p) in pair.iter_mut().enumerate() {
+        let e1 = short[idx << PAD];
+        let l1 = e1 & 0xff;
+        if l1 == 0 || l1 > PAIR_BITS {
+            continue;
+        }
+        let s1 = u64::from(e1 >> 8);
+        if e1 >> 8 == rlc {
+            continue;
+        }
+        *p = u64::from(l1) | ONE << 8 | s1 << 16;
+        let rem = PAIR_BITS - l1;
+        if rem == 0 {
+            continue;
+        }
+        let e2 = short[((idx << l1) & (PAIR_SIZE - 1)) << PAD];
+        let l2 = e2 & 0xff;
+        if l2 == 0 || l2 > rem || e2 >> 8 == rlc {
+            continue;
+        }
+        *p = u64::from(l1 + l2) | TWO << 8 | s1 << 16 | u64::from(e2 >> 8) << 32;
+    }
 }
 
 /// Decoding tables for one stream.
@@ -242,6 +291,7 @@ fn build_dec_table<'a>(
 }
 
 /// Decode a Huffman stream into exactly `out_len` u16 values.
+#[cfg(test)]
 pub(crate) fn decompress(data: &[u8], out_len: usize) -> Result<Vec<u16>> {
     let mut out = Vec::new();
     decompress_into(data, out_len, &mut out, &mut HufScratch::default())?;
@@ -318,7 +368,10 @@ fn decompress_with(
     // symbol, and the stream's end, to the checked loop.
     let whole = (n_bits / 8) as usize;
     if fast && whole >= 24 {
-        pos = fast_prefix(&dec, rlc, &mut bits, out, whole - 16)?;
+        let short: &[u32; DEC_SIZE] = dec.short.try_into().expect("full short table");
+        build_pair_table(short, rlc, &mut hs.pair);
+        let pair: &[u64; PAIR_SIZE] = hs.pair.as_slice().try_into().expect("full pair table");
+        pos = fast_prefix(&dec, pair, rlc, &mut bits, out, whole - 16)?;
     }
     // The checked loop finishes from the exact same state.
     let mut left = n_bits - (8 * bits.byte as u64 - u64::from(bits.count));
@@ -389,6 +442,7 @@ fn decompress_with(
 #[inline(never)]
 fn fast_prefix(
     dec: &DecTable<'_>,
+    pair: &[u64; PAIR_SIZE],
     rlc: u32,
     state: &mut BitIn<'_>,
     out: &mut [u16],
@@ -409,6 +463,37 @@ fn fast_prefix(
                 break;
             }
             bits.refill();
+        }
+        // One or two whole codes from the pair table (the common case).
+        let p = pair[bits.peek(PAIR_BITS) as usize];
+        let pl = (p & 0xff) as u32;
+        if pl != 0 {
+            let kind = (p >> 8) & 3;
+            let Some(d) = out.get_mut(pos..pos + 2) else {
+                // Within two of the end: the checked loop finishes.
+                break;
+            };
+            // A single symbol also writes its (unused) second slot, which
+            // the next symbol overwrites: it is before `out_len`.
+            d[0] = (p >> 16) as u16;
+            d[1] = (p >> 32) as u16;
+            bits.consume(pl);
+            pos += kind as usize;
+            // A second lookup without a refill test: at least 32 bits were
+            // there and one entry consumes at most `PAIR_BITS` (12).
+            let p = pair[bits.peek(PAIR_BITS) as usize];
+            let pl = (p & 0xff) as u32;
+            if pl != 0 {
+                let kind = (p >> 8) & 3;
+                let Some(d) = out.get_mut(pos..pos + 2) else {
+                    break;
+                };
+                d[0] = (p >> 16) as u16;
+                d[1] = (p >> 32) as u16;
+                bits.consume(pl);
+                pos += kind as usize;
+            }
+            continue;
         }
         let e = short[bits.peek(DEC_BITS) as usize];
         let (sym, l) = if e & 0xff != 0 {
