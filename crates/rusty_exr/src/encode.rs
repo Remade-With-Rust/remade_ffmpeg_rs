@@ -463,6 +463,14 @@ fn encode_channels(
         }
     }
 
+    // The file's final size is known now: one allocation, instead of the
+    // output doubling (and copying itself) while the chunks are appended.
+    let chunk_head = if tiled { 20 } else { 8 };
+    let body: usize = packed
+        .iter()
+        .map(|d| chunk_head + d.as_ref().map_or(0, Vec::len))
+        .sum();
+    out.reserve_exact(body);
     let order: Vec<usize> = match opts.line_order {
         LineOrder::Decreasing => (0..nchunks).rev().collect(),
         _ => (0..nchunks).collect(),
