@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_tiff-v0.1.9...rusty_tiff-v0.1.10) - 2026-11-28
+
+### Other
+
+- *(tiff)* enable zlib-rs runtime CPU detection for Deflate strips ([#251](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/251))
+
 ## [0.1.9](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_tiff-v0.1.8...rusty_tiff-v0.1.9) - 2026-11-25
 
 ### Added
