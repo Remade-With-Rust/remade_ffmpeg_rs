@@ -134,7 +134,7 @@ pub(crate) fn render_nodes(
     }
 }
 
-fn render_node(node: &Node, ctx: &mut Context, ts: Transform, pixmap: &mut PixmapMut) {
+pub(crate) fn render_node(node: &Node, ctx: &mut Context, ts: Transform, pixmap: &mut PixmapMut) {
     match node {
         Node::Group(g) => {
             render_group(g, ctx, ts, pixmap);

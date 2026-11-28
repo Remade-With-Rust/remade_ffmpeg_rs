@@ -59,6 +59,8 @@ pub(crate) fn convert(node: SvgNode, state: &State, cache: &mut Cache, parent: &
         bounding_box: None,
         stroke_bounding_box: None,
         flattened: None,
+        #[cfg(feature = "text")]
+        glyph_runs: None,
     };
     if text.chunks.is_empty() {
         return;

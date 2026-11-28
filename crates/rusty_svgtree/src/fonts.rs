@@ -15,14 +15,38 @@ use skrifa::prelude::{LocationRef, Size};
 use skrifa::raw::TableProvider;
 use skrifa::{FontRef, MetadataProvider, Tag};
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use crate::text::*;
 
 const OPSZ: Tag = Tag::new(b"opsz");
 
 /// Fonts loaded by the application. Documents cannot load any.
-#[derive(Clone, Debug, Default)]
+///
+/// A face's [`FontId`] is its position in load order, so it stays the same
+/// for as long as the `Fonts` lives (faces are never removed), and a clone
+/// gives the same ids.
+#[derive(Debug, Default)]
 pub struct Fonts {
     db: Database,
+    /// What [`FontProvider::font_data`] gave, so that a font file is read
+    /// once and every call shares its bytes.
+    data: Mutex<HashMap<FontId, FontData>>,
+}
+
+impl Clone for Fonts {
+    fn clone(&self) -> Fonts {
+        Fonts {
+            db: self.db.clone(),
+            data: Mutex::new(lock(&self.data).clone()),
+        }
+    }
+}
+
+/// A poisoned lock still holds a usable map (an entry is inserted whole).
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Fonts {
@@ -341,6 +365,23 @@ impl FontProvider for Fonts {
                 .ok()?;
             pen.0.finish().map(GlyphData::Outline)
         })
+    }
+
+    /// A face loaded from bytes shares them; one loaded from a file is read
+    /// on the first call, and later calls share that copy.
+    fn font_data(&self, font: FontId) -> Option<FontData> {
+        if let Some(d) = lock(&self.data).get(&font) {
+            return Some(d.clone());
+        }
+        let id = self.find(font)?;
+        let (source, index) = self.db.face_source(id)?;
+        let bytes: Arc<dyn AsRef<[u8]> + Send + Sync> = match source {
+            fontdb::Source::Binary(b) => b,
+            _ => Arc::new(self.db.with_face_data(id, |data, _| data.to_vec())?),
+        };
+        let d = FontData::new(bytes, index);
+        lock(&self.data).insert(font, d.clone());
+        Some(d)
     }
 }
 

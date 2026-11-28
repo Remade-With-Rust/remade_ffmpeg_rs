@@ -55,7 +55,7 @@ pub(crate) fn layout(
         return Outcome::Empty;
     };
     text.bounding_box = Some(bbox.to_rect());
-    let Some(mut group) = flatten(text, &spans, fonts, state, cache) else {
+    let Some((mut group, mut runs)) = flatten(text, &spans, fonts, state, cache) else {
         return Outcome::Empty;
     };
     // Paint servers take the box of the whole text.
@@ -81,6 +81,23 @@ pub(crate) fn layout(
         return Outcome::Empty;
     };
     text.stroke_bounding_box = Some(stroke_bbox.to_rect());
+    // The decorations of the runs, with their paints resolved.
+    let path_at = |i: Option<usize>| match i.and_then(|i| group.children.get(i)) {
+        Some(Node::Path(p)) => Some((**p).clone()),
+        _ => None,
+    };
+    let runs = runs
+        .iter_mut()
+        .map(|(run, [over, under, through])| GlyphRun {
+            overline: path_at(*over),
+            underline: path_at(*under),
+            line_through: path_at(*through),
+            glyphs: std::mem::take(&mut run.glyphs),
+            variations: std::mem::take(&mut run.variations),
+            ..run.clone()
+        })
+        .collect();
+    text.glyph_runs = Some(runs);
     text.flattened = Some(Box::new(group));
     Outcome::Drawn
 }
@@ -161,6 +178,8 @@ struct Positioned {
     font_size: f32,
     id: u32,
     font: FontId,
+    /// The cluster's bytes in the chunk's text.
+    text: std::ops::Range<usize>,
 }
 
 impl Positioned {
@@ -205,6 +224,8 @@ impl Positioned {
 
 /// Glyphs that share a style, placed.
 struct LaidSpan {
+    /// Where the span is in the text: chunk and span index.
+    at: (usize, usize),
     span: TextSpan,
     glyphs: Vec<Positioned>,
     underline: Option<rusty_raster::Path>,
@@ -315,7 +336,7 @@ impl Layout<'_> {
         let mut char_offset = 0;
         let (mut last_x, mut last_y) = (0.0, 0.0);
         let mut bbox = BBox::default();
-        for chunk in &text.chunks {
+        for (chunk_index, chunk) in text.chunks.iter().enumerate() {
             let linear = matches!(chunk.text_flow, TextFlow::Linear);
             let (x, y) = if linear {
                 (chunk.x.unwrap_or(last_x), chunk.y.unwrap_or(last_y))
@@ -342,7 +363,7 @@ impl Layout<'_> {
             if vertical && linear {
                 text_ts = text_ts.pre_rotate_at(90.0, x, y);
             }
-            for span in &chunk.spans {
+            for (span_index, span) in chunk.spans.iter().enumerate() {
                 let Some(font) = self.font(span) else {
                     continue;
                 };
@@ -388,6 +409,7 @@ impl Layout<'_> {
                     f.rule = rusty_raster::FillRule::Winding;
                 }
                 spans.push(LaidSpan {
+                    at: (chunk_index, span_index),
                     span,
                     glyphs,
                     underline,
@@ -633,6 +655,9 @@ fn merge_span(span: &TextSpan, new: Vec<Glyph>, glyphs: &mut Vec<Glyph>) {
 fn form_cluster(glyphs: &[Glyph], text: &str, font_size: f32) -> Cluster {
     let (mut x, mut width, mut advance) = (0.0f32, 0.0f32, 0.0f32);
     let mut positioned = Vec::with_capacity(glyphs.len());
+    // Only the last glyph of a cluster runs to the next cluster.
+    let start = glyphs.first().map_or(0, |g| g.byte);
+    let len = glyphs.iter().map(|g| g.cluster_len).max().unwrap_or(0);
     for g in glyphs {
         let sx = g.font.scale(font_size);
         // Offsets are from where the last glyph ended.
@@ -644,6 +669,7 @@ fn form_cluster(glyphs: &[Glyph], text: &str, font_size: f32) -> Cluster {
             font_size,
             font: g.font.id,
             id: g.id,
+            text: start..start + len,
         });
         x += g.width as f32;
         let w = g.width as f32 * sx;
@@ -1052,18 +1078,21 @@ fn flatten(
     fonts: &dyn FontProvider,
     state: &State,
     cache: &mut Cache,
-) -> Option<Group> {
+) -> Option<(Group, Vec<FlatRun>)> {
     let mut group = Group {
         abs_transform: text.abs_transform,
         ..Group::default()
     };
+    let mut runs = Vec::with_capacity(spans.len());
     for laid in spans {
         let span = &laid.span;
+        // Returns where the line's path is in `group`.
         let line = |path: &Option<rusty_raster::Path>,
                     style: &Option<TextDecorationStyle>,
                     group: &mut Group,
                     cache: &mut Cache| {
             if let (Some(p), Some(s)) = (path, style) {
+                let n = group.children.len();
                 push_path(
                     p.clone(),
                     text,
@@ -1073,15 +1102,39 @@ fn flatten(
                     group,
                     cache,
                 );
+                return (group.children.len() > n).then_some(n);
             }
+            None
         };
-        line(&laid.overline, &span.decoration.overline, &mut group, cache);
-        line(
+        let overline = line(&laid.overline, &span.decoration.overline, &mut group, cache);
+        let underline = line(
             &laid.underline,
             &span.decoration.underline,
             &mut group,
             cache,
         );
+        let optical_size = span.optical_sizing.then_some(span.font_size);
+        let run = GlyphRun {
+            chunk: laid.at.0,
+            span: laid.at.1,
+            variations: span.font.variations.clone(),
+            optical_size,
+            glyphs: laid
+                .glyphs
+                .iter()
+                .map(|g| PositionedGlyph {
+                    font: g.font,
+                    id: g.id,
+                    units_per_em: g.units_per_em,
+                    font_size: g.font_size,
+                    text: g.text.clone(),
+                    transform: g.outline_transform(),
+                })
+                .collect(),
+            overline: None,
+            underline: None,
+            line_through: None,
+        };
         let own = TextDecorationStyle {
             fill: span.fill.clone(),
             stroke: span.stroke.clone(),
@@ -1127,15 +1180,20 @@ fn flatten(
             }
         }
         flush(&mut outlines, text, span, &own, &mut group, cache);
-        line(
+        let line_through = line(
             &laid.line_through,
             &span.decoration.line_through,
             &mut group,
             cache,
         );
+        runs.push((run, [overline, underline, line_through]));
     }
-    Some(group)
+    Some((group, runs))
 }
+
+/// A glyph run, and where its overline, underline and line-through paths
+/// are in the flattened group (their paints are resolved after it is made).
+type FlatRun = (GlyphRun, [Option<usize>; 3]);
 
 fn push_group(transform: Transform, content: Node, parent: &mut Group) {
     let mut g = Group {
