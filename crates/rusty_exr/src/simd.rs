@@ -1986,6 +1986,8 @@ mod x86 {
 mod tests {
     use super::*;
     use crate::compression::dwa::{block_scalar, ZR_CONSTANT};
+    // Only the x86-64 twin tests compare against the scalar conversions.
+    #[cfg(target_arch = "x86_64")]
     use crate::half::{f16_to_f32, f32_to_f16};
 
     struct Rng(u64);

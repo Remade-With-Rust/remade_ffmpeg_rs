@@ -103,6 +103,16 @@ pure-Rust zlib-rs (inflate, and `Deflate::Fast`) and miniz_oxide (the
 exr-compatible writer). The pull request that introduced the crate has the
 per-file tables and the method.
 
+**Into your planes, against `exr`'s one-pass reader and writer** (1080p
+RGBA from a real photo, HALF and FLOAT, into or from four `f32` planes,
+Windows x86-64, median of 21 interleaved rounds against `exr` 1.74.2's
+custom-`ChannelsReader` reader and its `SpecificChannels` writer):
+`decode_part_into` is as fast or faster on every compression tried (None,
+RLE, ZIPS, ZIP, PXR24, B44, DWAB) single-threaded (0.34-1.00x the time) and
+with all cores (0.27-0.97x; 0.18-0.67x with `decode_bands` on a rayon
+pool); `encode_ref` takes 0.18-0.97x `exr`'s time on one core and
+0.16-0.99x on all cores, ZIP on all cores being at parity.
+
 ## Safety
 
 Malformed or hostile input returns an `Error` and never panics. Every size
@@ -126,6 +136,58 @@ std::fs::write("out.exr", rusty_exr::encode(&out, &EncodeOptions::new(Compressio
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+## Decoding into your buffers, encoding from your planes
+
+`Decoder::decode_part_into` writes every chunk straight into planes you
+own, one `ChannelSink` per channel in channel-list (name) order, in one
+pass: no `Image`, no per-chunk block, no copy afterwards. A sink can
+convert on the way (any channel into `f32`, FLOAT into `f16` bits),
+skip a channel, or use a row stride so the plane can be a window into a
+wider buffer. The planes come out exactly as `decode_part` (followed by
+`Samples::to_f32` or `f32_to_f16`, where a sink converts) would give
+them, for any thread count.
+
+```rust,no_run
+use rusty_exr::{ChannelSink, Decoder, EncodeOptions, ImageRef, SamplesRef};
+
+let bytes = std::fs::read("render.exr")?;
+let dec = Decoder::new(&bytes)?;
+let (w, h) = dec.plane_sizes(0, 0, 0)?[0];
+let [mut r, mut g, mut b, mut a] = [(); 4].map(|()| vec![0f32; w * h]);
+let mut sinks: Vec<ChannelSink> = Vec::new();
+let mut want = [("A", Some(&mut a)), ("B", Some(&mut b)), ("G", Some(&mut g)), ("R", Some(&mut r))];
+for c in dec.header(0).unwrap().channels() {
+    let plane = want.iter_mut().find(|(n, _)| *n == c.name).and_then(|(_, p)| p.take());
+    sinks.push(plane.map_or_else(ChannelSink::skip, |p| ChannelSink::f32(p)));
+}
+dec.decode_part_into(0, &mut sinks)?; // HALF, FLOAT and UINT all land as f32
+drop(sinks);
+
+// And back out, borrowing the planes: the same bytes `encode` writes.
+let image = ImageRef::new(w as u32, h as u32)
+    .with_channel("R", SamplesRef::F32(&r))
+    .with_channel("G", SamplesRef::F32(&g))
+    .with_channel("B", SamplesRef::F32(&b))
+    .with_channel("A", SamplesRef::F32(&a));
+let file = rusty_exr::encode_ref(&image, &EncodeOptions::default())?;
+# let _ = file;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+- `Decoder::threads(..)` sets the workers `decode_part_into` uses
+  (`Threads::Auto` by default).
+- An application with its own thread pool can call
+  `Decoder::decode_bands` instead. It returns one `DecodeBand` job per row
+  band, each holding its own disjoint rows of your planes; run them on the
+  pool with a `DecodeScratch` per thread, e.g. with rayon:
+  `bands.into_par_iter().try_for_each_init(DecodeScratch::default, |s, b| b.decode(s))`.
+  A persistent pool skips the thread start-up that `Threads::Auto` pays on
+  every call, which is most of the cost of the cheap codecs (None, RLE)
+  on many cores.
+- `Decoder::decode_chunk_into(part, index, sinks, scratch)` decodes one
+  chunk into sinks that cover just that chunk (`Decoder::chunk_rect` gives
+  its rectangle; `ChunkRect::channel_size` its size per channel).
+
 ## Migrating from `exr`
 
 | `exr` 1.74 | `rusty_exr` |
@@ -134,10 +196,15 @@ std::fs::write("out.exr", rusty_exr::encode(&out, &EncodeOptions::new(Compressio
 | `read_all_flat_layers_from_file(path)` / `read().no_deep_data().largest_resolution_level().all_channels().all_layers()` | `let d = Decoder::new(&bytes)?;` then `d.decode_part(i)` for `i in 0..d.part_count()`; channels keep full names (`diffuse.R`), `Image::layers()` lists the prefixes |
 | `.all_resolution_levels()` | `d.level_count(i)` and `d.decode_level(i, lx, ly)` |
 | `FlatSamples::F16(Vec<f16>)` | `Samples::F16(Vec<u16>)` — the raw half bits; `rusty_exr::f16_to_f32` converts |
-| custom `ChannelsReader` over `UncompressedBlock` | `d.decode_chunk(part, index)` → `Block { pos, x0, y0, width, height, data }`, rows via `Block::rows()` / `Block::row(channel, y)` |
+| one-pass reader into your storage: a custom `ReadChannels`/`ChannelsReader` whose `read_block` converts each `UncompressedBlock`'s rows into your planes, or `rgba_channels(create, set)` / `specific_channels()` with a per-pixel setter | `d.decode_part_into(part, &mut sinks)`: one `ChannelSink::f32(&mut plane)` (or `f16`/`u32`) per channel in name order, `ChannelSink::skip()` for the ones you do not want; rows are converted into your planes as each chunk decompresses |
+| `f16` → `f32` in `FromNativeSample` | `ChannelSink::f32` on a HALF channel (exact, SIMD) |
+| `.non_parallel()` / exr's parallel decompression (a rayon pool per read) | `d.threads(Threads::Single)` / `Threads::Auto`, or `d.decode_bands(..)` run on your own pool |
+| `.largest_resolution_level()` / `.specific_resolution_level(..)` | `decode_part_into` / `d.decode_level_into(part, lx, ly, &mut sinks)` |
+| `exr::block` raw chunks | `d.decode_chunk_into(part, index, &mut sinks, &mut scratch)` into your buffers, or `d.decode_chunk(part, index)` → `Block { pos, x0, y0, width, height, data }`, rows via `Block::rows()` / `Block::row(channel, y)` |
 | `meta::MetaData::read_from_file` | `rusty_exr::read_headers(&bytes)` |
 | `write_rgba_file(path, w, h, f)` | `Image::new(w, h).with_channel("R", ..)...`, then `rusty_exr::encode(&img, &EncodeOptions::new(Compression::Zip))` |
 | `Image::from_channels(size, SpecificChannels/AnyChannels).write().to_file(path)` with `Encoding { compression, .. }` | `Image { channels: vec![Channel::new(name, w, h, samples), ..], .. }` + `EncodeOptions { compression, line_order, threads, .. }`; byte-identical output for every compression |
+| `SpecificChannels::rgba(\|pos\| (r[i], g[i], b[i], a[i]))` reading your planes | `ImageRef::new(w, h).with_channel("R", SamplesRef::F32(&r))...` + `rusty_exr::encode_ref(&image, &opts)`: no copy of the planes, same bytes as `encode` |
 | `Compression::DWAA(Some(level))` / `DWAB(..)` | `EncodeOptions { compression: Compression::Dwaa, dwa_level: Some(level), .. }` (`None` = 45, no attribute, as `exr`) |
 | `Encoding { blocks: Blocks::Tiles(Vec2(64, 64)), line_order: LineOrder::Unspecified, .. }` | `EncodeOptions { tiles: Some((64, 64)), line_order: LineOrder::Random, .. }` |
 | `layer_attributes.other` / `shared_attributes.chromaticities` | `image.header.set("chromaticities", AttributeValue::Chromaticities(..))`; any attribute via `header.get(name)` / `header.set(name, value)` |

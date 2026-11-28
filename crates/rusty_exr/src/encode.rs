@@ -9,7 +9,7 @@ use crate::header::{
     write_attribute, AttributeValue, Box2i, Compression, LevelMode, LineOrder, RoundingMode,
     TileDesc,
 };
-use crate::image::{Image, Samples};
+use crate::image::{ChannelRef, Image, ImageRef, SamplesRef};
 
 /// Options for [`encode`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -135,6 +135,22 @@ const KNOWN: &[(&str, &str)] = &[
 /// whatever their order in `image.channels`. Header attributes other than
 /// the structural ones are copied from `image.header`.
 pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
+    let channels: Vec<ChannelRef<'_>> = image.channels.iter().map(ChannelRef::from).collect();
+    encode_channels(&image.header, image.data_window, &channels, opts)
+}
+
+/// [`encode`] from borrowed planes: the same file, byte for byte, without
+/// first copying the samples into an [`Image`].
+pub fn encode_ref(image: &ImageRef<'_>, opts: &EncodeOptions) -> Result<Vec<u8>> {
+    encode_channels(&image.header, image.data_window, &image.channels, opts)
+}
+
+fn encode_channels(
+    header: &crate::header::Header,
+    dw: Box2i,
+    image_channels: &[ChannelRef<'_>],
+    opts: &EncodeOptions,
+) -> Result<Vec<u8>> {
     let comp = opts.compression;
     if opts.tiles.is_none() && opts.line_order == LineOrder::Random {
         return Err(Error::usage(
@@ -150,30 +166,29 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
             return Err(Error::usage(format!("tile size {tw}x{th}")));
         }
     }
-    let dw = image.data_window;
     let (w, h) = (dw.width(), dw.height());
     if w <= 0 || h <= 0 || w > i64::from(i32::MAX) || h > i64::from(i32::MAX) {
         return Err(Error::usage(format!("data window {dw:?}")));
     }
     let (w, h) = (w as usize, h as usize);
-    if image.channels.is_empty() {
+    if image_channels.is_empty() {
         return Err(Error::usage("an image needs at least one channel"));
     }
-    let mut order: Vec<usize> = (0..image.channels.len()).collect();
+    let mut order: Vec<usize> = (0..image_channels.len()).collect();
     order.sort_by(|&a, &b| {
-        image.channels[a]
+        image_channels[a]
             .desc
             .name
             .as_bytes()
-            .cmp(image.channels[b].desc.name.as_bytes())
+            .cmp(image_channels[b].desc.name.as_bytes())
     });
     for k in 0..order.len() {
-        let c = &image.channels[order[k]];
+        let c = &image_channels[order[k]];
         let d = &c.desc;
         if d.name.is_empty() || d.name.len() > 255 || d.name.as_bytes().contains(&0) {
             return Err(Error::usage(format!("channel name {:?}", d.name)));
         }
-        if k > 0 && image.channels[order[k - 1]].desc.name == d.name {
+        if k > 0 && image_channels[order[k - 1]].desc.name == d.name {
             return Err(Error::usage(format!("duplicate channel {}", d.name)));
         }
         if d.sample_type != c.samples.sample_type() {
@@ -212,7 +227,7 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
             )));
         }
     }
-    let channels: Vec<&crate::image::Channel> = order.iter().map(|&i| &image.channels[i]).collect();
+    let channels: Vec<&ChannelRef<'_>> = order.iter().map(|&i| &image_channels[i]).collect();
     // Chunk grid: a scanline block is a tile as wide as the image.
     let (tw, th) = match opts.tiles {
         Some((x, y)) => (x as usize, y as usize),
@@ -225,11 +240,11 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
     }
 
     // Header.
-    let display = match image.header.get("displayWindow") {
+    let display = match header.get("displayWindow") {
         Some(AttributeValue::Box2i(b)) => *b,
         _ => dw,
     };
-    let hget = |n: &str| image.header.get(n);
+    let hget = |n: &str| header.get(n);
     let pixel_aspect = match hget("pixelAspectRatio") {
         Some(AttributeValue::Float(f)) => *f,
         _ => 1.0,
@@ -290,13 +305,13 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
             .any(|(n, t)| *n == a.name && a.value.type_name() == *t)
     };
     for (n, _) in KNOWN {
-        if let Some(a) = image.header.attributes.iter().find(|a| a.name == *n) {
+        if let Some(a) = header.attributes.iter().find(|a| a.name == *n) {
             if is_known(a) {
                 attrs.push((a.name.clone(), a.value.clone()));
             }
         }
     }
-    for a in &image.header.attributes {
+    for a in &header.attributes {
         if MANAGED.contains(&a.name.as_str()) || is_known(a) {
             continue;
         }
@@ -383,18 +398,18 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
                 let n = cw * c.desc.sample_type.bytes();
                 let dst = &mut raw[o..o + n];
                 o += n;
-                match &c.samples {
-                    Samples::F16(v) => {
+                match c.samples {
+                    SamplesRef::F16(v) => {
                         for (d, s) in dst.chunks_exact_mut(2).zip(&v[a..b]) {
                             d.copy_from_slice(&s.to_le_bytes());
                         }
                     }
-                    Samples::F32(v) => {
+                    SamplesRef::F32(v) => {
                         for (d, s) in dst.chunks_exact_mut(4).zip(&v[a..b]) {
                             d.copy_from_slice(&s.to_le_bytes());
                         }
                     }
-                    Samples::U32(v) => {
+                    SamplesRef::U32(v) => {
                         for (d, s) in dst.chunks_exact_mut(4).zip(&v[a..b]) {
                             d.copy_from_slice(&s.to_le_bytes());
                         }
@@ -411,50 +426,24 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
     };
 
     let nthreads = opts.threads.resolve().min(nchunks).max(1);
-    let mut packed: Vec<Option<Vec<u8>>> = vec![None; nchunks];
-    if nthreads == 1 {
-        let mut work = compression::Work::default();
-        for (i, slot) in packed.iter_mut().enumerate() {
-            *slot = Some(compress_one(i, &mut work)?);
-        }
-    } else {
-        let next = AtomicUsize::new(0);
-        let results: Vec<Vec<(usize, Result<Vec<u8>>)>> = std::thread::scope(|s| {
-            let handles: Vec<_> = (0..nthreads)
-                .map(|_| {
-                    s.spawn(|| {
-                        let mut v = Vec::new();
-                        let mut work = compression::Work::default();
-                        loop {
-                            let k = next.fetch_add(1, Ordering::Relaxed);
-                            if k >= nchunks {
-                                break;
-                            }
-                            v.push((k, compress_one(k, &mut work)));
-                        }
-                        v
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("encoder worker panicked"))
-                .collect()
-        });
-        let mut all: Vec<(usize, Result<Vec<u8>>)> = results.into_iter().flatten().collect();
-        all.sort_by_key(|(k, _)| *k);
-        for (k, r) in all {
-            packed[k] = Some(r?);
-        }
-    }
-
+    // Chunks in file order. Each is appended as soon as it and every chunk
+    // before it are compressed, so the copy into the file overlaps the
+    // compression of later chunks instead of following all of it.
     let order: Vec<usize> = match opts.line_order {
         LineOrder::Decreasing => (0..nchunks).rev().collect(),
         _ => (0..nchunks).collect(),
     };
+    // A stored chunk is never larger than its raw samples, so this bounds
+    // the file: one reservation, no doubling (pages are only touched as
+    // they are written).
+    let chunk_head = if tiled { 20 } else { 8 };
+    let raw_total: usize = channels
+        .iter()
+        .map(|c| c.width * c.height * c.desc.sample_type.bytes())
+        .sum();
+    out.reserve_exact(raw_total + nchunks * chunk_head);
     let mut offsets = vec![0u64; nchunks];
-    for i in order {
-        let data = packed[i].take().expect("every chunk compressed");
+    let mut emit = |out: &mut Vec<u8>, i: usize, data: &[u8]| {
         offsets[i] = out.len() as u64;
         if tiled {
             for v in [(i % ntx) as i32, (i / ntx) as i32, 0, 0] {
@@ -465,7 +454,66 @@ pub fn encode(image: &Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
             out.extend_from_slice(&y0.to_le_bytes());
         }
         out.extend_from_slice(&(data.len() as i32).to_le_bytes());
-        out.extend_from_slice(&data);
+        out.extend_from_slice(data);
+    };
+    // The error reported is the one of the lowest-numbered failing chunk,
+    // whatever the thread count or line order.
+    let mut first_err: Option<(usize, Error)> = None;
+    let mut note = |i: usize, e: Error| {
+        if first_err.as_ref().is_none_or(|(k, _)| i < *k) {
+            first_err = Some((i, e));
+        }
+    };
+    if nthreads == 1 {
+        let mut work = compression::Work::default();
+        for &i in &order {
+            match compress_one(i, &mut work) {
+                Ok(d) => emit(&mut out, i, &d),
+                Err(e) => note(i, e),
+            }
+        }
+    } else {
+        let next = AtomicUsize::new(0);
+        let order = &order;
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<Vec<u8>>)>();
+        std::thread::scope(|s| {
+            for _ in 0..nthreads {
+                let tx = tx.clone();
+                let next = &next;
+                let compress_one = &compress_one;
+                s.spawn(move || {
+                    let mut work = compression::Work::default();
+                    loop {
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+                        if k >= nchunks {
+                            break;
+                        }
+                        let r = compress_one(order[k], &mut work);
+                        if tx.send((k, r)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(tx);
+            // This thread writes: chunk `k` of the file order goes out once
+            // chunks 0..k have.
+            let mut pending: Vec<Option<Vec<u8>>> = vec![None; nchunks];
+            let mut want = 0usize;
+            for (k, r) in rx {
+                match r {
+                    Ok(d) => pending[k] = Some(d),
+                    Err(e) => note(order[k], e),
+                }
+                while let Some(d) = pending.get_mut(want).and_then(Option::take) {
+                    emit(&mut out, order[want], &d);
+                    want += 1;
+                }
+            }
+        });
+    }
+    if let Some((_, e)) = first_err {
+        return Err(e);
     }
     for (i, o) in offsets.iter().enumerate() {
         out[table_pos + i * 8..table_pos + i * 8 + 8].copy_from_slice(&o.to_le_bytes());
