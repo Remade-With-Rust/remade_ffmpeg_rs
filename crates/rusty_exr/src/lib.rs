@@ -13,11 +13,18 @@
 //! are reported as [`Error::Unsupported`]; other parts of the same file
 //! still decode.
 //!
+//! **Into your buffers:** [`Decoder::decode_part_into`] decodes straight
+//! into caller-owned planes, one [`ChannelSink`] per channel (converting
+//! HALF or UINT to `f32` on the way if asked), in one pass;
+//! [`Decoder::decode_bands`] hands the same work out as jobs for your own
+//! thread pool, and [`Decoder::decode_chunk_into`] does it chunk by chunk.
+//!
 //! **Encode:** single-part files, scanline or tiled (one resolution level),
 //! with every compression (None, RLE, ZIPS, ZIP, PIZ, PXR24, B44, B44A,
 //! DWAA, DWAB), HALF/FLOAT/UINT channels, any channel names, and header
 //! attributes. Output is byte-identical to the `exr` crate's for the same
-//! image and settings, the lossy codecs included.
+//! image and settings, the lossy codecs included. [`encode_ref`] writes the
+//! same file from borrowed planes ([`ImageRef`]), without copying them.
 //!
 //! Hostile input returns an error, never panics, and every allocation is
 //! bounded by [`Limits`] before it is made.
@@ -42,15 +49,17 @@ mod image;
 mod luts;
 mod simd;
 
-pub use decode::{Block, ChunkPos, Decoder, PartKind, Threads};
-pub use encode::{encode, window, Deflate, EncodeOptions};
+pub use decode::{
+    Block, ChannelSink, ChunkPos, ChunkRect, DecodeBand, DecodeScratch, Decoder, PartKind, Threads,
+};
+pub use encode::{encode, encode_ref, window, Deflate, EncodeOptions};
 pub use error::{Error, Limits, Result};
 pub use half::{f16_to_f32, f32_to_f16, f32_to_f16_clamped};
 pub use header::{
     Attribute, AttributeValue, Box2i, ChannelDesc, Chromaticities, Compression, Header, KeyCode,
     LevelMode, LineOrder, Preview, RoundingMode, SampleType, TileDesc, TimeCode,
 };
-pub use image::{Channel, Image, Samples};
+pub use image::{Channel, ChannelRef, Image, ImageRef, Samples, SamplesRef};
 
 /// Decode the first part of an EXR file (level 0 if tiled).
 pub fn decode(data: &[u8]) -> Result<Image> {
