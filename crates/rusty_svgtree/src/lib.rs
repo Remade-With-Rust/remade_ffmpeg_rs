@@ -325,7 +325,7 @@ pub fn render(tree: &Tree, transform: Transform, pixmap: &mut PixmapMut) {
     ) else {
         return;
     };
-    render::render_nodes(&tree.root, &mut ctx, transform, pixmap);
+    render::render_nodes(&tree.root.children, &mut ctx, transform, pixmap);
 }
 
 /// Renders one node of `tree` (or of a tree inside it: a clip path's, a
@@ -349,5 +349,5 @@ pub fn render_node(tree: &Tree, node: &Node, transform: Transform, pixmap: &mut 
     ) else {
         return;
     };
-    render::render_node(node, &mut ctx, transform, pixmap);
+    render::render_nodes(std::slice::from_ref(node), &mut ctx, transform, pixmap);
 }
