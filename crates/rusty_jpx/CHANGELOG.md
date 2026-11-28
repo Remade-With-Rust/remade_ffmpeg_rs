@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_jpx-v0.1.1...rusty_jpx-v0.1.2) - 2026-11-28
+
+### Other
+
+- lenient mode that reports what it conceals; 109-pass segments as OpenJPEG reads them ([#260](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/260))
+
 ## [0.1.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_jpx-v0.1.0...rusty_jpx-v0.1.1) - 2026-11-25
 
 ### Other
