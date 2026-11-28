@@ -42,6 +42,9 @@ pub(crate) struct State<'a> {
 pub(crate) struct Cache {
     clip_paths: HashMap<NodeId, Arc<ClipPath>>,
     masks: HashMap<NodeId, Arc<Mask>>,
+    /// Patterns that need nothing from the painted element, by element and
+    /// viewport.
+    patterns: HashMap<(NodeId, [u32; 4]), Arc<Pattern>>,
     pub(crate) filters: HashMap<NodeId, Arc<Filter>>,
     /// Clip paths / masks / patterns / filters being converted: a reference
     /// back into one of them is a cycle and is treated as `none`.
@@ -718,6 +721,7 @@ pub(crate) fn convert_doc(
         // Everything shared is only held by the tree now.
         cache.clip_paths.clear();
         cache.masks.clear();
+        cache.patterns.clear();
         cache.filters.clear();
         resolve_context_paints(&mut root, Transform::identity(), None);
     }
@@ -1602,8 +1606,39 @@ fn fit_size(s1: Size, s2: Size, expand: bool) -> Option<Size> {
 fn push_pattern_transform(root: &mut Group, transform: Transform) {
     let mut g = std::mem::take(root);
     g.transform = transform;
+    prepend_abs_transform(&mut g, transform);
     root.children.push(Node::Group(Box::new(g)));
     root.calculate_bounding_boxes();
+}
+
+/// Puts `ts` in front of the absolute transforms of a group and everything
+/// in it (a wrapper with `ts` was put around it). Clip paths, masks,
+/// patterns and filters inside keep theirs: they are relative to their own
+/// roots.
+fn prepend_abs_transform(group: &mut Group, ts: Transform) {
+    group.abs_transform = ts.pre_concat(group.abs_transform);
+    for child in &mut group.children {
+        match child {
+            Node::Group(g) => prepend_abs_transform(g, ts),
+            Node::Path(p) => p.abs_transform = ts.pre_concat(p.abs_transform),
+            Node::Image(_) => {}
+            Node::Text(t) => {
+                t.abs_transform = ts.pre_concat(t.abs_transform);
+                if let Some(g) = &mut t.flattened {
+                    prepend_abs_transform(g, ts);
+                }
+                #[cfg(feature = "text")]
+                for run in t.glyph_runs.iter_mut().flatten() {
+                    for p in [&mut run.overline, &mut run.underline, &mut run.line_through]
+                        .into_iter()
+                        .flatten()
+                    {
+                        p.abs_transform = ts.pre_concat(p.abs_transform);
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ----------------------------------------------------------------- style --
@@ -2259,6 +2294,21 @@ fn convert_pattern(node: SvgNode, state: &State, cache: &mut Cache) -> Option<Se
     if cache.active.contains(&node.id()) || cache.active.len() >= MAX_REF_DEPTH {
         return None;
     }
+    // A pattern that needs nothing from the painted element is converted
+    // once, and its uses share it. Only from outside every other reference
+    // (a cycle broken inside one would be kept for the uses outside it),
+    // without context paints, and in one viewport (percentages).
+    let vb = state.view_box;
+    let key = (
+        node.id(),
+        [vb.x(), vb.y(), vb.width(), vb.height()].map(f32::to_bits),
+    );
+    let shareable = cache.active.is_empty() && state.context.is_none();
+    if shareable {
+        if let Some(p) = cache.patterns.get(&key) {
+            return Some(ServerOrColor::Server(Paint::Pattern(p.clone()), false));
+        }
+    }
     let with_children = node
         .href_iter()
         .take_while(|l| l.tag_name() == Some(EId::Pattern))
@@ -2280,8 +2330,10 @@ fn convert_pattern(node: SvgNode, state: &State, cache: &mut Cache) -> Option<Se
     let mut root = Group::default();
     let obb = units == Units::ObjectBoundingBox || content_units == Units::ObjectBoundingBox;
     if let (Some(vb), false) = (view_box, obb) {
+        let ts = view_box_to_transform(vb, aspect, rect.size());
         let mut g = Group {
-            transform: view_box_to_transform(vb, aspect, rect.size()),
+            transform: ts,
+            abs_transform: ts,
             ..Group::default()
         };
         convert_children(with_children, state, cache, &mut g);
@@ -2302,15 +2354,16 @@ fn convert_pattern(node: SvgNode, state: &State, cache: &mut Cache) -> Option<Se
         obb_content: content_units == Units::ObjectBoundingBox,
         view_box: view_box.map(|vb| (vb, aspect)),
     });
-    Some(ServerOrColor::Server(
-        Paint::Pattern(Arc::new(Pattern {
-            transform,
-            rect,
-            root,
-            pending,
-        })),
-        obb,
-    ))
+    let pattern = Arc::new(Pattern {
+        transform,
+        rect,
+        root,
+        pending,
+    });
+    if shareable && !obb {
+        cache.patterns.insert(key, pattern.clone());
+    }
+    Some(ServerOrColor::Server(Paint::Pattern(pattern), obb))
 }
 
 // ------------------------------------------------------ clip paths, masks --
@@ -2456,8 +2509,11 @@ fn convert_mask(
         if content_units == Units::ObjectBoundingBox {
             match object_bbox {
                 Some(b) => {
+                    // The content's absolute transforms include the box
+                    // (relative to the mask's root), as usvg's do.
                     let mut g = Group {
                         transform: from_bbox(b),
+                        abs_transform: from_bbox(b),
                         ..Group::default()
                     };
                     convert_children(node, state, cache, &mut g);

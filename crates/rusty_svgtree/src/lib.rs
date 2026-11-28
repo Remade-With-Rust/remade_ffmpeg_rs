@@ -49,7 +49,7 @@ mod values;
 mod writer;
 
 #[cfg(feature = "fonts")]
-pub use fonts::Fonts;
+pub use fonts::{FaceInfo, FallbackFn, Fonts, FontsDb, SelectFn};
 pub use rusty_raster;
 pub use tree::{
     BaseGradient, ClipPath, Color, Fill, Group, Image, ImageKind, LinearGradient, Mask, Node,

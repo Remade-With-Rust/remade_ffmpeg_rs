@@ -142,6 +142,35 @@ let opt = rusty_svgtree::Options {
 };
 ```
 
+### An application's own font matching
+
+`Fonts::set_select` and `Fonts::set_fallback` replace the built-in matching
+with the application's, as usvg's `FontResolver` does. The callbacks get a
+`FontsDb`: the built-in matching (`query`, `default_fallback`), the faces
+and their names (`faces`, `face`, `has_char`, `with_face_data`), and adding
+faces while text is laid out, from a file (`add_file`, read when first used)
+or from shared memory without a copy (`add_shared`).
+
+```rust,ignore
+let mut fonts = rusty_svgtree::Fonts::new();
+fonts.set_select(|font, db| {
+    for f in &font.families {
+        if let rusty_svgtree::text::FontFamily::Named(name) = f {
+            if let Some(face) = db.faces().find(|face| {
+                face.post_script_name.eq_ignore_ascii_case(name)
+                    || face.families.iter().any(|n| n.eq_ignore_ascii_case(name))
+            }) {
+                return Some(face.id);
+            }
+            if let Some(path) = app_font_path(name) {
+                return db.add_file(path).first().copied();
+            }
+        }
+    }
+    db.query(font)
+});
+```
+
 ## Drawing the tree elsewhere (a PDF, a vector surface)
 
 The tree is a public, read-only view of the resolved document (after CSS,
@@ -169,6 +198,13 @@ de-duplicate fonts on: the same provider and id are the same face in every
 tree parsed with it (nested `ImageKind::Svg` trees included). A run's
 `variations` (plus `opsz` from `optical_size`) are the axis values its glyphs
 were shaped and drawn with.
+
+A node's `abs_transform` is the product of the transforms down from the root
+of the tree, or of the clip path, mask or pattern it is in, including the
+`objectBoundingBox` and `viewBox` wrappers of mask and pattern content (usvg
+0.48 leaves the box out in bounding-box pattern content). A pattern that
+needs nothing from the painted element is one `Arc` for all of its uses, so
+a renderer can cache its tile by address.
 
 ## Writing SVG
 
