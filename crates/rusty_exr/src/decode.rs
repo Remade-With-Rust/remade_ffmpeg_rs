@@ -1063,6 +1063,8 @@ impl<'a> Decoder<'a> {
         let tasks = Self::band_tasks(p, bands, planes, strides);
         let nthreads = self.threads.workers(tasks.len(), total);
         let errors: std::sync::Mutex<Vec<(usize, Error)>> = std::sync::Mutex::new(Vec::new());
+        // Bands not yet taken: helpers are spawned only while some remain.
+        let left = std::sync::atomic::AtomicUsize::new(tasks.len());
         let queue = std::sync::Mutex::new(tasks.into_iter());
         let work = || {
             let mut scratch = compression::Scratch::default();
@@ -1075,6 +1077,7 @@ impl<'a> Decoder<'a> {
                     q.next()
                 };
                 let Some(mut task) = task else { break };
+                left.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 let chunks = std::mem::take(&mut task.chunks);
                 for &ci in &chunks {
                     if let Err(e) = self.decode_into(p, i, ci, &mut task, &mut scratch, &mut rows) {
@@ -1090,10 +1093,19 @@ impl<'a> Decoder<'a> {
         if nthreads == 1 {
             work();
         } else {
+            // The calling thread is one of the workers. Spawning a thread
+            // costs tens of microseconds (about 1.8 ms for 24 on Windows),
+            // as much as a whole uncompressed band, so helpers are added
+            // one at a time and only while bands are left to hand out: a
+            // cheap decode stops spawning once the queue has drained.
             std::thread::scope(|s| {
-                for _ in 0..nthreads {
+                for _ in 1..nthreads {
+                    if left.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                        break;
+                    }
                     s.spawn(work);
                 }
+                work();
             });
         }
         let mut errors = errors
