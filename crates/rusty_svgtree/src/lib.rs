@@ -56,6 +56,7 @@ pub use tree::{
     Paint, PaintOrder, Path, Pattern, RadialGradient, Stop, Stroke,
 };
 
+pub use image::{ImageLoad, ImageLoader, ImageRequest, ImageSource};
 pub use writer::WriteOptions;
 
 use rusty_raster::{PixmapMut, Size, Transform};
@@ -76,6 +77,9 @@ pub enum Error {
     /// The document exceeds [`Options::max_nodes`] or
     /// [`Options::max_depth`] (after `use` expansion).
     ElementsLimitReached,
+    /// The [`Options::image_loader`] answered [`ImageLoad::Fail`] for an
+    /// image of the document (or of a document embedded in it).
+    ImageRefused,
 }
 
 impl std::fmt::Display for Error {
@@ -86,6 +90,7 @@ impl std::fmt::Display for Error {
             Error::InvalidSize => f.write_str("the SVG has an invalid size"),
             Error::MalformedGzip => f.write_str("the compressed data is not valid gzip"),
             Error::ElementsLimitReached => f.write_str("the SVG exceeds the element limits"),
+            Error::ImageRefused => f.write_str("an image of the SVG was refused"),
         }
     }
 }
@@ -108,6 +113,10 @@ pub struct Options {
     /// The size used when `width`/`height` are percentages without a
     /// `viewBox`.
     pub default_size: Size,
+    /// Loads `<image>` and `feImage` references: linked files, URLs, and
+    /// `data:` URIs under the application's rules (see [`ImageLoader`]).
+    /// With `None`, only `data:` URIs are loaded.
+    pub image_loader: Option<std::sync::Arc<dyn ImageLoader>>,
     /// Languages for `systemLanguage` matching.
     pub languages: Vec<String>,
     /// Maximum elements after `use` expansion. Bounds `use` amplification
@@ -147,6 +156,7 @@ impl Default for Options {
             #[cfg(feature = "text")]
             fonts: None,
             default_size: Size::from_wh(100.0, 100.0).unwrap_or_else(|| unreachable!()),
+            image_loader: None,
             languages: vec!["en".to_string()],
             max_nodes: 500_000,
             max_depth: 1024,
@@ -203,6 +213,7 @@ impl Tree {
         let mut limits = image::Nested {
             depth: 0,
             nodes_left: opt.max_nodes,
+            failed: false,
         };
         Tree::parse(data, opt, &mut limits)
     }
@@ -240,6 +251,9 @@ impl Tree {
         let node_count = doc.len();
         limits.nodes_left = limits.nodes_left.saturating_sub(node_count);
         let converted = convert::convert_doc(&doc, opt, limits)?;
+        if limits.failed {
+            return Err(Error::ImageRefused);
+        }
         drop(doc);
         drop(xml);
         let s = converted.size;
